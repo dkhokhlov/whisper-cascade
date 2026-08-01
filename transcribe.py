@@ -3,7 +3,9 @@
 
 The script loads the Hugging Face automatic-speech-recognition pipeline once.
 Then it transcribes each input file. It prints one JSON array to stdout.
-Each element has the keys "file", "text", and "model".
+Each element has "file", "text", "model", and a "stats" block with
+duration_s, elapsed_s, rtf, tokens, words, and chars. A one-line summary
+is printed to stderr.
 
 Usage:
     python transcribe.py [path ...]
@@ -19,6 +21,7 @@ import json
 import logging
 import os
 import sys
+import time
 import warnings
 
 # Silence transformers' noisy warnings (deprecated input name, attention mask,
@@ -84,6 +87,12 @@ def main() -> int:
 
     results = []
     had_error = False
+    # Totals for the summary line (raw, unrounded).
+    total_duration = 0.0
+    total_elapsed = 0.0
+    total_tokens = 0
+    total_words = 0
+    ok = 0
 
     for display, path in inputs:
         try:
@@ -93,14 +102,57 @@ def main() -> int:
             if data.ndim > 1:            # stereo or more: average to mono
                 data = data.mean(axis=1)
             data = data.astype(np.float32)
+            duration = len(data) / sr if sr else 0.0
+
+            t0 = time.perf_counter()
             output = pipe({"array": data, "sampling_rate": sr})
+            elapsed = time.perf_counter() - t0
             text = output["text"].strip()
-            results.append({"file": display, "text": text, "model": MODEL})
+
+            try:
+                tokens = len(pipe.tokenizer.encode(text, add_special_tokens=False))
+            except Exception:  # noqa: BLE001 - tokenizer access is not guaranteed
+                tokens = None
+            words = len(text.split())
+            chars = len(text)
+
+            total_duration += duration
+            total_elapsed += elapsed
+            total_tokens += tokens or 0
+            total_words += words
+            ok += 1
+
+            results.append({
+                "file": display,
+                "text": text,
+                "model": MODEL,
+                "stats": {
+                    "duration_s": round(duration, 3),
+                    "elapsed_s": round(elapsed, 3),
+                    "rtf": round(elapsed / duration, 3) if duration else None,
+                    "tokens": tokens,
+                    "words": words,
+                    "chars": chars,
+                },
+            })
         except Exception as exc:  # noqa: BLE001 - report, do not abort the batch
             had_error = True
             results.append({"file": display, "error": str(exc), "model": MODEL})
 
     print(json.dumps(results, ensure_ascii=False, indent=2))
+
+    # One-line summary to stderr (stdout stays pure JSON). RTF < 1 = faster
+    # than real time.
+    if ok:
+        rtf = total_elapsed / total_duration if total_duration else None
+        rtf_s = f"{rtf:.3f}" if rtf is not None else "n/a"
+        print(
+            f"[stats] files={ok} audio={total_duration:.2f}s "
+            f"elapsed={total_elapsed:.2f}s rtf={rtf_s} "
+            f"tokens={total_tokens} words={total_words}",
+            file=sys.stderr,
+        )
+
     return 1 if had_error else 0
 
 
