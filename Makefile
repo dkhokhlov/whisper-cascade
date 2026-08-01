@@ -14,6 +14,9 @@ export TEXT
 export OUTPUT
 # Translate target model (MarianMT; default multilingual -> English).
 MODEL_TRANSLATE ?= Helsinki-NLP/opus-mt-mul-en
+# Translate target language code (printed in the make en JSON as "lang").
+# A future make es sets this to "es" (with a -> Spanish MODEL_TRANSLATE).
+TARGET_LANG ?= en
 # TTS model (VITS; default English MMS).
 MODEL_TTS ?= facebook/mms-tts-eng
 
@@ -34,8 +37,9 @@ help: ## Show available targets
 	@printf '  %-52s %s\n' 'make tts TEXT="Hello"' 'synthesize speech to tts.wav'
 	@printf '  %-52s %s\n' 'make test' 'fast unit tests'
 	@echo ""
-	@echo "Pipeline (foreign speech -> English speech; needs jq):"
-	@echo "  make asr AUDIO=hf://datasets/Narsil/asr_dummy/4.flac | jq -r '.[].text' | make en | make tts OUTPUT=4_en.wav"
+	@echo "Pipeline (foreign speech -> English speech; each stage prints JSON, jq extracts text):"
+	@echo "  make asr AUDIO=hf://datasets/Narsil/asr_dummy/4.flac | jq -r '.[].text' | make en | jq -r '.text' | make tts OUTPUT=4_en.wav"
+	@echo "  make asr AUDIO=hf://datasets/Narsil/asr_dummy/4.flac | tee out.txt | jq -r '.[].text' | make en | tee -a out.txt | jq -r '.text' | make tts OUTPUT=4_en.wav >> out.txt && cat out.txt"
 	@echo ""
 
 info: ## Show current config and status
@@ -48,25 +52,32 @@ info: ## Show current config and status
 	@echo "TEXT              $${TEXT:-<stdin or built-in none>}"
 	@echo "OUTPUT            $${OUTPUT:-tts.wav}"
 
-venv: ## Create the local .venv and install deps with uv
+# Idempotent venv: uv sync only when the stamp is missing or older than
+# pyproject/uv.lock. The stamp is touched after sync so a warm .venv does not
+# re-sync on every make asr / make test (uv sync does not refresh
+# .venv/bin/python, so depending on that file re-syncs every time).
+$(VENV)/.stamp: pyproject.toml uv.lock
 	@env -u VIRTUAL_ENV uv sync
+	@touch $(VENV)/.stamp
+
+venv: $(VENV)/.stamp ## Create the local .venv and install deps with uv (idempotent)
 
 samples: ## Warm the HF sample cache for the default set - idempotent, no re-download
 	@$(PY) -c "from huggingface_hub import hf_hub_download; [hf_hub_download('Narsil/asr_dummy', f, repo_type='dataset') for f in ('mlk.flac','4.flac','hindi.ogg')]" && echo "samples cache warm"
 
-asr: venv ## Run the ASR test: transcribe the default multilingual samples (en+es+hi)
+asr: $(VENV)/.stamp ## Run the ASR test: transcribe the default multilingual samples (en+es+hi)
 	@MODEL_ASR=$(MODEL_ASR) $(PY) transcribe.py
 
-en: venv ## Translate text to English (stdin/TEXT=; pipes into make tts)
-	@MODEL_TRANSLATE=$(MODEL_TRANSLATE) $(PY) translate.py
+en: $(VENV)/.stamp ## Translate text to English (stdin/TEXT=; JSON to stdout, jq -r .text for make tts)
+	@TARGET_LANG=$(TARGET_LANG) MODEL_TRANSLATE=$(MODEL_TRANSLATE) $(PY) translate.py
 
-tts: venv ## Synthesize speech from text (stdin/TEXT=; writes tts.wav, OUTPUT= to override)
+tts: $(VENV)/.stamp ## Synthesize speech from text (stdin/TEXT=; writes tts.wav, OUTPUT= to override)
 	@MODEL_TTS=$(MODEL_TTS) $(PY) tts.py
 
-test: venv ## Run the fast unit tests (no model load, no network)
+test: $(VENV)/.stamp ## Run the fast unit tests (no model load, no network)
 	@$(PY) -m pytest
 
-test-integration: venv ## Run the integration tests (loads the real Whisper/MarianMT/VITS models)
+test-integration: $(VENV)/.stamp ## Run the integration tests (loads the real Whisper/MarianMT/VITS models)
 	@$(PY) -m pytest -m integration
 
 clean: ## Remove Python bytecode cache (__pycache__, *.pyc); keeps .venv
