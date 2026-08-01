@@ -139,6 +139,22 @@ def test_get_inputs_no_audio_no_argv_uses_default_set(monkeypatch):
     assert seen["files"] == transcribe.DEFAULT_FILES
 
 
+# --- main: an AUDIO= that matches no files is an error, not exit 0 ----------
+
+def test_main_unmatched_glob_is_an_error(monkeypatch, capsys, tmp_path):
+    # An AUDIO glob that matches nothing must not silently succeed. The empty
+    # inputs path returns before the model loads, so this needs no model stub.
+    monkeypatch.setattr(sys, "argv", ["transcribe.py"])
+    monkeypatch.setenv("AUDIO", str(tmp_path / "nope*.flac"))
+
+    rc = transcribe.main()
+    cap = capsys.readouterr()
+
+    assert rc == 1
+    assert cap.out.strip() == "[]"           # valid JSON so downstream jq gets []
+    assert "no files" in cap.err.lower()      # human-readable stderr message
+
+
 # --- integration: real model on a cached sample (opt-in) ---------------------
 
 @pytest.mark.integration

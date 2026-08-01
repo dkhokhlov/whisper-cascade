@@ -4,8 +4,7 @@
 The script loads the Hugging Face automatic-speech-recognition pipeline once.
 Then it transcribes each input file. It prints one JSON array to stdout.
 Each element has "file", "text", "model", and a "stats" block with
-duration_s, elapsed_s, rtf, tokens, words, and chars. A one-line summary
-is printed to stderr.
+duration_s, elapsed_s, rtf, tokens, words, and chars.
 
 Usage:
     python transcribe.py [path ...]
@@ -136,19 +135,20 @@ def main() -> int:
     inputs = get_inputs()
 
     if not inputs:
+        # get_inputs() only returns [] when AUDIO was set but every token
+        # expanded to nothing (an unmatched glob or an empty directory). A
+        # default run resolves the built-in samples and is never empty. Treat
+        # the no-match case as an error, not a silent success, so a typo in
+        # AUDIO= stops the pipeline (with `set -o pipefail`) instead of
+        # passing `null` through jq into the next stage.
         print("[]")
-        return 0
+        print("error: AUDIO matched no files", file=sys.stderr)
+        return 1
 
     pipe = pipeline(task="automatic-speech-recognition", model=MODEL_ASR)
 
     results = []
     had_error = False
-    # Totals for the summary line (raw, unrounded).
-    total_duration = 0.0
-    total_elapsed = 0.0
-    total_tokens = 0
-    total_words = 0
-    ok = 0
 
     for display, path in inputs:
         try:
@@ -176,12 +176,6 @@ def main() -> int:
             words = len(text.split())
             chars = len(text)
 
-            total_duration += duration
-            total_elapsed += elapsed
-            total_tokens += tokens or 0
-            total_words += words
-            ok += 1
-
             results.append({
                 "file": display,
                 "text": text,
@@ -200,18 +194,6 @@ def main() -> int:
             results.append({"file": display, "error": str(exc), "model": MODEL_ASR})
 
     print(json.dumps(results, ensure_ascii=False, indent=2))
-
-    # One-line summary to stderr (stdout stays pure JSON). RTF < 1 = faster
-    # than real time.
-    if ok:
-        rtf = total_elapsed / total_duration if total_duration else None
-        rtf_s = f"{rtf:.3f}" if rtf is not None else "n/a"
-        print(
-            f"[stats] files={ok} audio={total_duration:.2f}s "
-            f"elapsed={total_elapsed:.2f}s rtf={rtf_s} "
-            f"tokens={total_tokens} words={total_words}",
-            file=sys.stderr,
-        )
 
     return 1 if had_error else 0
 
