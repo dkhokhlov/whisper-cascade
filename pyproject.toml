@@ -36,3 +36,6 @@ markers = [
   "integration: loads the real Whisper model (slow; needs the model/cache)",
 ]
 addopts = "-m 'not integration'"
+# Make `import transcribe` resolve from the repo root for any pytest invocation
+# (direct `pytest`, IDEs), not just `python -m pytest`.
+pythonpath = "."
