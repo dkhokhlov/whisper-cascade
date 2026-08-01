@@ -1,0 +1,26 @@
+[project]
+name = "wisper-test"
+version = "0.1.0"
+description = "Whisper-tiny.en WAV/FLAC transcription (CPU)."
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "transformers==4.44.2",
+    "soundfile==0.12.1",
+    "numpy<2",
+    "torch==2.4.1",
+    "torchaudio==2.4.1",
+]
+
+# Application project: do not build or install the project as a package.
+[tool.uv]
+package = false
+
+# Pull torch and torchaudio from the CPU wheel index so the image and venv stay lean.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

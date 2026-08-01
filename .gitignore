@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# uv / virtualenv
+.venv/
+
+# Downloaded samples (fetched by download_samples.sh)
+samples/
+
+# Local caches
+.cache/
+hf_cache/
+
+# OS / editor
+.DS_Store
