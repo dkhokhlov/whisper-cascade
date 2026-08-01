@@ -1,8 +1,8 @@
 # wisper-asr
 
 A minimal, CPU-only speech-to-text tool. It transcribes audio files
-(WAV / FLAC / OGG / MP3) and prints the text to stdout as JSON, using
-OpenAI's `whisper-tiny.en` model through the Hugging Face `transformers`
+(WAV / FLAC / OGG / MP3) and prints the text to stdout as JSON, using OpenAI's
+`whisper-tiny` model (multilingual) through the Hugging Face `transformers`
 pipeline.
 
 No Docker, no ffmpeg, no GPU. Dependencies are managed with [uv](https://docs.astral.sh/uv/).
@@ -16,7 +16,7 @@ Requires Python 3.10 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 make venv     # create .venv and install deps (torch/torchaudio from the CPU index)
-make en       # transcribe the built-in English samples
+make asr      # transcribe the built-in multilingual samples (en + es + hi)
 ```
 
 Expected output on stdout (JSON):
@@ -26,8 +26,8 @@ Expected output on stdout (JSON):
   {
     "file": "mlk.flac",
     "text": "I have a dream that one day this nation will rise up ...",
-    "model": "openai/whisper-tiny.en",
-    "stats": { "duration_s": 13.0, "elapsed_s": 0.55, "rtf": 0.043, "tokens": 20, "words": 20, "chars": 91 }
+    "model": "openai/whisper-tiny",
+    "stats": { "duration_s": 13.0, "elapsed_s": 0.75, "rtf": 0.057, "tokens": 24, "words": 20, "chars": 95 }
   }
 ]
 ```
@@ -35,7 +35,7 @@ Expected output on stdout (JSON):
 A one-line summary goes to stderr:
 
 ```
-[stats] files=3 audio=26.71s elapsed=1.32s rtf=0.049 tokens=72 words=53
+[stats] files=3 audio=23.71s elapsed=1.64s rtf=0.069 tokens=68 words=43
 ```
 
 Transcribe your own file:
@@ -44,17 +44,12 @@ Transcribe your own file:
 .venv/bin/python transcribe.py path/to/audio.wav
 ```
 
-Transcribe your own file via the `AUDIO` env var (file, directory, or glob):
+Transcribe your own audio via the `AUDIO` env var (Hugging Face URL, file,
+directory, or glob):
 
 ```bash
-make en AUDIO=path/to/audio.wav
-make ml AUDIO='./clips/*.flac'   # every FLAC in clips/, with the multilingual model
-```
-
-Multilingual samples (uses `whisper-tiny`):
-
-```bash
-make ml
+make asr AUDIO=path/to/audio.wav
+make asr AUDIO='./clips/*.flac'   # every FLAC in clips/
 ```
 
 ## Make targets
@@ -65,9 +60,10 @@ Run `make` (no target) to print this help.
 | --- | --- |
 | `make info` | Show current config and status. |
 | `make venv` | Create the local `.venv` with uv. |
-| `make samples` | Warm the HF sample cache (idempotent, no re-download). |
-| `make en` | Run the English test: transcribe the EN samples with the `.venv`. |
-| `make ml` | Run the multilingual test: transcribe the ES+HI samples with `whisper-tiny`. |
+| `make samples` | Warm the HF sample cache for the default set (idempotent, no re-download). |
+| `make asr` | Run the ASR test: transcribe the default multilingual samples with the `.venv`. |
+| `make test` | Run the fast unit tests (no model load, no network). |
+| `make test-integration` | Run the integration test (loads the real Whisper model). |
 | `make clean` | Remove Python bytecode cache (`__pycache__`, `*.pyc`); keeps `.venv`. |
 | `make clean-all` | Also remove the local `.venv` (HF cache is left untouched). |
 
@@ -90,32 +86,27 @@ processed.
 
 ## Samples
 
-Samples come from the Hugging Face dataset `Narsil/asr_dummy` and are resolved
-from the HF cache on first use (`~/.cache/huggingface` by default):
+The default sample set comes from the Hugging Face dataset `Narsil/asr_dummy`
+and is resolved from the HF cache on first use (`~/.cache/huggingface` by
+default):
 
-- English (`make en`): `mlk.flac`, `1.flac`, `2.flac`.
-- Multilingual (`make ml`): `4.flac` (Spanish), `hindi.ogg` (Hindi).
+- `mlk.flac` — English.
+- `4.flac` — Spanish.
+- `hindi.ogg` — Hindi.
 
-The default model is English-only, so `make en` is the coherent default. The
-multilingual samples are used only under a multilingual model, which `make ml`
-selects automatically.
+One default set, transcribed with the multilingual `whisper-tiny`. (The
+dataset has no German sample; pull one on demand via `AUDIO=hf://...` if you
+need it.)
 
-## Models: en vs ml
+## Model
 
-The two tests use different models by default:
-
-- `make en` uses `MODEL` (default `openai/whisper-tiny.en`, English-only). This
-  is the coherent default — small, fast, best English accuracy for its size.
-- `make ml` uses `ML_MODEL` (default `openai/whisper-tiny`, multilingual),
-  because the `.en` model cannot transcribe the Spanish (`4.flac`) and Hindi
-  (`hindi.ogg`) samples.
-
-Both are overridable with the `MODEL` variable (command-line beats the
-per-target default):
+The default model is `openai/whisper-tiny` (multilingual) — one `MODEL`
+variable. Override it for English-only deployments or a bigger model:
 
 ```bash
-make en MODEL=openai/whisper-base      # English test with a bigger .en model
-make ml MODEL=openai/whisper-large-v3   # multilingual test with a bigger model
+make asr MODEL=openai/whisper-tiny.en   # English-only, slightly better English
+make asr MODEL=openai/whisper-base     # a bigger model
+MODEL=openai/whisper-base .venv/bin/python transcribe.py my.wav
 ```
 
 The model id appears in each JSON element as `"model"`.
@@ -128,11 +119,11 @@ URL, a file, a directory (its audio files are used, filtered by extension), or
 a glob.
 
 ```bash
-make en AUDIO=hf://datasets/Narsil/asr_dummy/1.flac   # pull a file from the HF Hub
-make en AUDIO=file.wav
-make en AUDIO='clip1.wav clip2.flac'
-make en AUDIO=./clips/                 # a directory
-make ml AUDIO='./clips/*.flac'         # glob, multilingual model
+make asr AUDIO=hf://datasets/Narsil/asr_dummy/1.flac   # pull a file from the HF Hub
+make asr AUDIO=file.wav
+make asr AUDIO='clip1.wav clip2.flac'
+make asr AUDIO=./clips/                # a directory
+make asr AUDIO='./clips/*.flac'        # a glob
 ```
 
 An `hf://` URL (`hf://datasets/<ns>/<repo>/<file>`, or `hf://models/...`) is
@@ -141,16 +132,7 @@ downloaded to the HF cache on first use and transcribed from there. The
 `filename`, not a URL — so no CLI upgrade is needed. A bad or missing HF URL
 becomes a per-file `error` element (the other files still process).
 
-Without `AUDIO`, the built-in sample set is used (`SAMPLES_SET`=en or ml).
-
-## Model override / samples
-
-The `SAMPLES_SET` env var selects the default sample set when no file args and
-no `AUDIO` are given: `en` (default) or `ml`.
-
-```bash
-MODEL=openai/whisper-base .venv/bin/python transcribe.py my.wav
-```
+Without `AUDIO`, the built-in default sample set (en + es + hi) is used.
 
 ## Notes
 

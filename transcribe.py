@@ -13,11 +13,10 @@ Usage:
 If no path is given, the script resolves input from the AUDIO env var when set.
 AUDIO accepts one or more whitespace-separated tokens, each a Hugging Face URL
 (hf://datasets/<ns>/<repo>/<file>), a local file, a directory, or a glob.
-Otherwise the default samples are resolved from the Hugging Face cache (dataset
-Narsil/asr_dummy) via huggingface_hub. The MODEL env var selects the model
-(default openai/whisper-tiny.en). The SAMPLES_SET env var selects the default
-sample set: "en" (English, default) or "ml" (multilingual). The input order
-becomes the output order.
+Otherwise the default multilingual samples (English, Spanish, Hindi) are
+resolved from the Hugging Face cache (dataset Narsil/asr_dummy) via
+huggingface_hub. The MODEL env var selects the model (default
+openai/whisper-tiny, multilingual). The input order becomes the output order.
 """
 
 import glob
@@ -43,10 +42,11 @@ from transformers import pipeline
 
 transformers.logging.set_verbosity_error()
 
-MODEL = os.environ.get("MODEL", "openai/whisper-tiny.en")
+MODEL = os.environ.get("MODEL", "openai/whisper-tiny")
 DATASET = "Narsil/asr_dummy"
-EN_FILES = ("mlk.flac", "1.flac", "2.flac")
-ML_FILES = ("4.flac", "hindi.ogg")
+# Default multilingual sample set: English, Spanish, Hindi. All are loose files
+# in the dataset and resolve from the HF cache via huggingface_hub.
+DEFAULT_FILES = ("mlk.flac", "4.flac", "hindi.ogg")
 # Audio extensions used when AUDIO points at a directory.
 AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg", ".m4a")
 
@@ -125,8 +125,7 @@ def get_inputs() -> list:
             out.extend(expand_audio(tok))
         return out
 
-    files = ML_FILES if os.environ.get("SAMPLES_SET") == "ml" else EN_FILES
-    return resolve_samples(files)
+    return resolve_samples(DEFAULT_FILES)
 
 
 def main() -> int:

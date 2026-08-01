@@ -1,47 +1,38 @@
 VENV  := .venv
 PY    := $(VENV)/bin/python
-# English test model (override: make en MODEL=openai/whisper-base).
-MODEL ?= openai/whisper-tiny.en
-# Multilingual test model (override: make ml MODEL=openai/whisper-base).
-# whisper-tiny is multilingual; the .en model cannot transcribe the ES/HI samples.
-ML_MODEL ?= openai/whisper-tiny
-# Custom audio input: make en AUDIO=file.wav | dir/ | '*.flac' (space-safe).
+# Whisper model (override: make asr MODEL=openai/whisper-tiny.en). The default
+# whisper-tiny is multilingual and transcribes the EN/ES/HI default samples.
+MODEL ?= openai/whisper-tiny
+# Custom audio input: make asr AUDIO=file.wav | dir/ | '*.flac' (space-safe).
 export AUDIO
 
-.PHONY: help info venv samples en ml test test-integration clean clean-all
+.PHONY: help info venv samples asr test test-integration clean clean-all
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make <target> [VAR=value]\n\nTargets:\n"} /^[a-zA-Z_-]+:.*##/ { printf "  %-18s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 	@echo ""
 	@echo "Examples:"
-	@printf '  %-52s %s\n' 'make en' 'English samples (whisper-tiny.en)'
-	@printf '  %-52s %s\n' 'make ml' 'ES+HI samples (whisper-tiny)'
-	@printf '  %-52s %s\n' 'make en MODEL=openai/whisper-base' 'override the model'
-	@printf '  %-52s %s\n' 'make en AUDIO=hf://datasets/Narsil/asr_dummy/1.flac' 'one HF Hub file'
-	@printf '  %-52s %s\n' 'make en AUDIO=./clips/' 'a directory'
-	@printf '  %-52s %s\n' "make en AUDIO='*.flac'" 'a glob'
+	@printf '  %-52s %s\n' 'make asr' 'default samples (en+es+hi, whisper-tiny)'
+	@printf '  %-52s %s\n' 'make asr MODEL=openai/whisper-tiny.en' 'English-only model'
+	@printf '  %-52s %s\n' 'make asr AUDIO=hf://datasets/Narsil/asr_dummy/1.flac' 'one HF Hub file'
+	@printf '  %-52s %s\n' 'make asr AUDIO=./clips/' 'a directory'
+	@printf '  %-52s %s\n' "make asr AUDIO='*.flac'" 'a glob'
 	@printf '  %-52s %s\n' 'make test' 'fast unit tests'
 
 info: ## Show current config and status
-	@echo "MODEL       $(MODEL) (en) / $(ML_MODEL) (ml)"
+	@echo "MODEL       $(MODEL)"
 	@echo "VENV        $(VENV) - $$([ -d $(VENV) ] && echo present || echo missing)"
-	@echo "SAMPLES     HF cache (Narsil/asr_dummy) - $${SAMPLES_SET:-en} set"
+	@echo "SAMPLES     HF cache (Narsil/asr_dummy) - en+es+hi (mlk.flac, 4.flac, hindi.ogg)"
 	@echo "AUDIO        $${AUDIO:-<built-in samples>}"
 
 venv: ## Create the local .venv and install deps with uv
 	@env -u VIRTUAL_ENV uv sync
 
-samples: ## Warm the HF sample cache (Narsil/asr_dummy) - idempotent, no re-download
-	@$(PY) -c "from huggingface_hub import hf_hub_download; [hf_hub_download('Narsil/asr_dummy', f, repo_type='dataset') for f in ('mlk.flac','1.flac','2.flac','4.flac','hindi.ogg')]" && echo "samples cache warm"
+samples: ## Warm the HF sample cache for the default set - idempotent, no re-download
+	@$(PY) -c "from huggingface_hub import hf_hub_download; [hf_hub_download('Narsil/asr_dummy', f, repo_type='dataset') for f in ('mlk.flac','4.flac','hindi.ogg')]" && echo "samples cache warm"
 
-en: venv ## Run the English test (default whisper-tiny.en)
+asr: venv ## Run the ASR test: transcribe the default multilingual samples (en+es+hi)
 	@MODEL=$(MODEL) $(PY) transcribe.py
-
-# Target-specific default so `make ml` uses whisper-tiny, but `make ml MODEL=...`
-# still overrides (command-line beats target-specific).
-ml: MODEL = $(ML_MODEL)
-ml: venv ## Run the multilingual test (default whisper-tiny)
-	@SAMPLES_SET=ml MODEL=$(MODEL) $(PY) transcribe.py
 
 test: venv ## Run the fast unit tests (no model load, no network)
 	@$(PY) -m pytest

@@ -93,29 +93,26 @@ def test_download_hf_url_repo_level_rejected():
         transcribe.download_hf_url("hf://datasets/Narsil/asr_dummy")
 
 
-# --- get_inputs: precedence argv > AUDIO > SAMPLES_SET ----------------------
+# --- get_inputs: precedence argv > AUDIO > default sample set ---------------
 
 def test_get_inputs_argv_wins(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["transcribe.py", "x.wav", "y.wav"])
     monkeypatch.setenv("AUDIO", "hf://datasets/ns/repo/z.wav")
-    monkeypatch.setenv("SAMPLES_SET", "ml")
     assert transcribe.get_inputs() == [("x.wav", "x.wav"), ("y.wav", "y.wav")]
 
 
-def test_get_inputs_audio_beats_samples(monkeypatch):
+def test_get_inputs_audio_beats_default(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["transcribe.py"])
     monkeypatch.setenv("AUDIO", "hf://datasets/ns/repo/a.flac b.wav")
-    monkeypatch.setenv("SAMPLES_SET", "ml")
     assert transcribe.get_inputs() == [
         ("hf://datasets/ns/repo/a.flac", "hf://datasets/ns/repo/a.flac"),
         ("b.wav", "b.wav"),
     ]
 
 
-def test_get_inputs_empty_audio_falls_through_to_ml(monkeypatch):
+def test_get_inputs_empty_audio_uses_default_set(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["transcribe.py"])
     monkeypatch.setenv("AUDIO", "   ")
-    monkeypatch.setenv("SAMPLES_SET", "ml")
     seen = {}
 
     def fake(files):
@@ -124,14 +121,13 @@ def test_get_inputs_empty_audio_falls_through_to_ml(monkeypatch):
 
     monkeypatch.setattr(transcribe, "resolve_samples", fake)
     got = transcribe.get_inputs()
-    assert seen["files"] == transcribe.ML_FILES
-    assert got == [(f, f"/c/{f}") for f in transcribe.ML_FILES]
+    assert seen["files"] == transcribe.DEFAULT_FILES
+    assert got == [(f, f"/c/{f}") for f in transcribe.DEFAULT_FILES]
 
 
-def test_get_inputs_default_en(monkeypatch):
+def test_get_inputs_no_audio_no_argv_uses_default_set(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["transcribe.py"])
     monkeypatch.delenv("AUDIO", raising=False)
-    monkeypatch.delenv("SAMPLES_SET", raising=False)
     seen = {}
 
     def fake(files):
@@ -140,7 +136,7 @@ def test_get_inputs_default_en(monkeypatch):
 
     monkeypatch.setattr(transcribe, "resolve_samples", fake)
     transcribe.get_inputs()
-    assert seen["files"] == transcribe.EN_FILES
+    assert seen["files"] == transcribe.DEFAULT_FILES
 
 
 # --- integration: real model on a cached sample (opt-in) ---------------------
@@ -159,7 +155,7 @@ def test_main_on_cached_sample(monkeypatch, capsys):
 
     monkeypatch.setattr(sys, "argv", ["transcribe.py"])
     monkeypatch.setenv("AUDIO", paths[0])
-    monkeypatch.delenv("MODEL", raising=False)  # default whisper-tiny.en
+    monkeypatch.delenv("MODEL", raising=False)  # default whisper-tiny
 
     rc = transcribe.main()
     out = capsys.readouterr().out
@@ -169,4 +165,4 @@ def test_main_on_cached_sample(monkeypatch, capsys):
     assert len(data) == 1
     assert data[0]["text"].strip()
     assert data[0]["stats"]["duration_s"] > 0
-    assert data[0]["model"] == "openai/whisper-tiny.en"
+    assert data[0]["model"] == "openai/whisper-tiny"
