@@ -6,11 +6,31 @@ into a cascade speech translation pipeline.
 The three stages:
 
 ```
-┌───────────────────────────────┐                   ┌───────────────────────────────┐                   ┌───────────────────────────────┐
-│              ASR              │                   │              AT               │                   │              TTS              │
-│ Automatic Speech Recognition  │── Spanish text ──>│     Automatic Translation     │── English text ──>│        Text To Speech         │
-│      openai/whisper-tiny      │                   │  Helsinki-NLP/opus-mt-mul-en  │                   │     facebook/mms-tts-eng      │
-└───────────────────────────────┘                   └───────────────────────────────┘                   └───────────────────────────────┘
+             foreign speech (audio)
+                        │
+                        ▼
+        ┌───────────────────────────────┐
+        │              ASR              │
+        │ Automatic Speech Recognition  │
+        │      openai/whisper-tiny      │
+        └───────────────┬───────────────┘
+                        │ Spanish text
+                        ▼
+        ┌───────────────────────────────┐
+        │              AT               │
+        │     Automatic Translation     │
+        │  Helsinki-NLP/opus-mt-mul-en  │
+        └───────────────┬───────────────┘
+                        │ English text
+                        ▼
+        ┌───────────────────────────────┐
+        │              TTS              │
+        │        Text To Speech         │
+        │     facebook/mms-tts-eng      │
+        └───────────────┬───────────────┘
+                        │
+                        ▼
+            English speech (out.wav)
 ```
 
 `make asr` transcribes audio files (WAV / FLAC / OGG /
