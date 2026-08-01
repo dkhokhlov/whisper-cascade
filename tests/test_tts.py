@@ -5,12 +5,29 @@ integration test (marked `integration`) loads the real VITS model.
 """
 
 import json
+import re
 import sys
 
 import numpy as np
 import pytest
 
 import tts
+
+
+# Skip an integration test only for environmental (network/cache) errors. Any
+# other exception is re-raised so a real logic bug fails the test instead of
+# being silently skipped (a broad `except: skip` masks implementation bugs).
+_ENV_ERR = re.compile(
+    r"(connection|offline|local entry|resolve|hostname|timeout|trust_remote"
+    r"|unreachable|temporarily unavailable|huggingface|hf_hub|http error)",
+    re.IGNORECASE,
+)
+
+
+def _skip_if_env(exc):
+    if _ENV_ERR.search(str(exc)) or isinstance(exc, (OSError, ConnectionError)):
+        pytest.skip(f"environment/model-load error: {exc}")
+    raise exc
 
 
 # --- fakes for the model/tokenizer ------------------------------------------
@@ -63,6 +80,17 @@ def test_tts_output_path_default(monkeypatch):
     import importlib
     importlib.reload(tts)
     assert tts.OUTPUT == "tts.wav"
+
+
+def test_tts_output_path_empty_string_falls_back(monkeypatch):
+    # `make tts` exports OUTPUT with no value. An empty string must fall back to
+    # the default (the #1 bug: os.environ.get("OUTPUT", "tts.wav") returned "").
+    monkeypatch.setenv("OUTPUT", "")
+    import importlib
+    importlib.reload(tts)
+    assert tts.OUTPUT == "tts.wav"
+    monkeypatch.delenv("OUTPUT", raising=False)
+    importlib.reload(tts)
 
 
 def test_tts_output_path_from_env(monkeypatch):
@@ -126,8 +154,8 @@ def test_tts_synthesizes_hello(monkeypatch, capsys, tmp_path):
 
     try:
         rc = tts.main()
-    except Exception as exc:  # noqa: BLE001 - network/cache failure, not a test fail
-        pytest.skip(f"could not load VITS model: {exc}")
+    except Exception as exc:  # noqa: BLE001 - re-raise unless environmental
+        _skip_if_env(exc)
 
     cap = capsys.readouterr()
     assert rc == 0

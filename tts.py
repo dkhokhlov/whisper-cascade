@@ -38,7 +38,10 @@ from transformers import AutoTokenizer, VitsModel
 transformers.logging.set_verbosity_error()
 
 MODEL_TTS = os.environ.get("MODEL_TTS", "facebook/mms-tts-eng")
-OUTPUT = os.environ.get("OUTPUT", "tts.wav")
+# Treat an empty OUTPUT the same as unset: `make tts` exports OUTPUT with no
+# value, so os.environ.get("OUTPUT", "tts.wav") would return "" and break
+# soundfile format detection. `or "tts.wav"` falls back to the default.
+OUTPUT = os.environ.get("OUTPUT") or "tts.wav"
 
 
 def main() -> int:
@@ -53,18 +56,23 @@ def main() -> int:
         print(json.dumps({"error": "no input text (set TEXT=, pass a file, or pipe stdin)", "model": MODEL_TTS}))
         return 1
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_TTS)
-    model = VitsModel.from_pretrained(MODEL_TTS)
-    inputs = tokenizer(text, return_tensors="pt")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_TTS)
+        model = VitsModel.from_pretrained(MODEL_TTS)
+        inputs = tokenizer(text, return_tensors="pt")
 
-    t0 = time.perf_counter()
-    with torch.no_grad():
-        out = model(**inputs)
-    elapsed = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            out = model(**inputs)
+        elapsed = time.perf_counter() - t0
 
-    waveform = out.waveform.squeeze().numpy().astype(np.float32)
-    sr = model.config.sampling_rate
-    sf.write(OUTPUT, waveform, sr)
+        waveform = out.waveform.squeeze().numpy().astype(np.float32)
+        sr = model.config.sampling_rate
+        sf.write(OUTPUT, waveform, sr)
+    except Exception as exc:  # noqa: BLE001 - emit a JSON error, not a traceback
+        print(json.dumps({"error": str(exc), "model": MODEL_TTS, "output": OUTPUT}))
+        return 1
+
     duration = len(waveform) / sr if sr else 0.0
 
     print(json.dumps({
