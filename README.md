@@ -123,15 +123,23 @@ The model id appears in each JSON element as `"model"`.
 ## Custom audio (AUDIO env var)
 
 Point the tool at your own audio instead of the built-in samples. `AUDIO`
-accepts one or more paths separated by spaces; each can be a file, a
-directory (its audio files are used, filtered by extension), or a glob.
+accepts one or more whitespace-separated tokens; each can be a Hugging Face
+URL, a file, a directory (its audio files are used, filtered by extension), or
+a glob.
 
 ```bash
+make en AUDIO=hf://datasets/Narsil/asr_dummy/1.flac   # pull a file from the HF Hub
 make en AUDIO=file.wav
 make en AUDIO='clip1.wav clip2.flac'
 make en AUDIO=./clips/                 # a directory
 make ml AUDIO='./clips/*.flac'         # glob, multilingual model
 ```
+
+An `hf://` URL (`hf://datasets/<ns>/<repo>/<file>`, or `hf://models/...`) is
+downloaded to the HF cache on first use and transcribed from there. The
+`hf://` scheme is parsed by this tool — `hf_hub_download` takes `repo_id` +
+`filename`, not a URL — so no CLI upgrade is needed. A bad or missing HF URL
+becomes a per-file `error` element (the other files still process).
 
 Without `AUDIO`, the built-in sample set is used (`SAMPLES_SET`=en or ml).
 

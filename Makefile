@@ -25,13 +25,13 @@ venv: ## Create the local .venv and install deps with uv
 samples: ## Warm the HF sample cache (Narsil/asr_dummy) - idempotent, no re-download
 	@$(PY) -c "from huggingface_hub import hf_hub_download; [hf_hub_download('Narsil/asr_dummy', f, repo_type='dataset') for f in ('mlk.flac','1.flac','2.flac','4.flac','hindi.ogg')]" && echo "samples cache warm"
 
-en: venv ## Run the English test (override model: make en MODEL=...; custom audio: make en AUDIO=file.wav)
+en: venv ## Run the English test (custom audio: make en AUDIO=hf://datasets/.../file.flac | file.wav | dir/ | '*.flac')
 	@MODEL=$(MODEL) $(PY) transcribe.py
 
 # Target-specific default so `make ml` uses whisper-tiny, but `make ml MODEL=...`
 # still overrides (command-line beats target-specific).
 ml: MODEL = $(ML_MODEL)
-ml: venv ## Run the multilingual test (override model: make ml MODEL=...; custom audio: make ml AUDIO=file.wav)
+ml: venv ## Run the multilingual test (custom audio: make ml AUDIO=hf://datasets/.../file.flac | file.wav | dir/ | '*.flac')
 	@SAMPLES_SET=ml MODEL=$(MODEL) $(PY) transcribe.py
 
 clean: ## Remove Python bytecode cache (__pycache__, *.pyc); keeps .venv

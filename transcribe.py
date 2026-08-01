@@ -10,12 +10,14 @@ is printed to stderr.
 Usage:
     python transcribe.py [path ...]
 
-If no path is given, the script resolves input from the AUDIO env var (file(s),
-directory, or glob) when set, otherwise the default samples from the Hugging
-Face cache (dataset Narsil/asr_dummy) via huggingface_hub. The MODEL env var
-selects the model (default openai/whisper-tiny.en). The SAMPLES_SET env var
-selects the default sample set: "en" (English, default) or "ml" (multilingual).
-The input order becomes the output order.
+If no path is given, the script resolves input from the AUDIO env var when set.
+AUDIO accepts one or more whitespace-separated tokens, each a Hugging Face URL
+(hf://datasets/<ns>/<repo>/<file>), a local file, a directory, or a glob.
+Otherwise the default samples are resolved from the Hugging Face cache (dataset
+Narsil/asr_dummy) via huggingface_hub. The MODEL env var selects the model
+(default openai/whisper-tiny.en). The SAMPLES_SET env var selects the default
+sample set: "en" (English, default) or "ml" (multilingual). The input order
+becomes the output order.
 """
 
 import glob
@@ -63,13 +65,38 @@ def resolve_samples(files: tuple) -> list:
     ]
 
 
+def download_hf_url(url: str) -> str:
+    """Download one hf:// file and return its cached local path.
+
+    hf_hub_download takes repo_id + filename + repo_type, not a URL, so this
+    parses the URL. Forms (the repo-type segment is optional; models is the
+    default):
+        hf://datasets/<ns>/<repo>/<path...>
+        hf://models/<ns>/<repo>/<path...>
+    A repo-level URL (no file path) is not a single file and is rejected.
+    """
+    parts = url[len("hf://"):].split("/")
+    repo_type = "model"
+    if parts and parts[0] in ("datasets", "models", "spaces"):
+        repo_type = {"datasets": "dataset", "models": "model", "spaces": "space"}[parts.pop(0)]
+    if len(parts) < 3:
+        raise ValueError(f"hf:// URL needs <ns>/<repo>/<file>: {url}")
+    repo_id = "/".join(parts[:2])
+    filename = "/".join(parts[2:])
+    return hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type)
+
+
 def expand_audio(spec: str) -> list:
     """Expand one AUDIO token to (display_name, path) pairs.
 
-    A directory becomes its audio files (by extension). A glob expands to its
-    matches. Anything else is treated as a literal file path (validated later
-    by the decoder, so a missing file becomes a per-file error, not a crash).
+    An hf:// URL is passed through as its own path placeholder and downloaded
+    lazily in the per-file loop (so a bad URL or a missing file becomes a
+    per-file error, not a crash). A directory becomes its audio files (by
+    extension). A glob expands to its matches. Anything else is a literal
+    file path.
     """
+    if spec.startswith("hf://"):
+        return [(spec, spec)]
     if os.path.isdir(spec):
         names = sorted(
             f for f in os.listdir(spec)
@@ -84,8 +111,9 @@ def expand_audio(spec: str) -> list:
 def get_inputs() -> list:
     """Return the list of (display_name, path) pairs to transcribe.
 
-    Precedence: command line arguments, then the AUDIO env var (file(s)/dir/
-    glob), then the default sample set from the HF cache (SAMPLES_SET).
+    Precedence: command line arguments, then the AUDIO env var (hf:// URL(s),
+    file(s), dir, glob), then the default sample set from the HF cache
+    (SAMPLES_SET).
     """
     if len(sys.argv) > 1:
         return [(a, a) for a in sys.argv[1:]]
@@ -125,6 +153,10 @@ def main() -> int:
 
     for display, path in inputs:
         try:
+            # An hf:// placeholder is downloaded here (not in get_inputs) so a
+            # bad URL or a missing file becomes a per-file error, not a crash.
+            if path.startswith("hf://"):
+                path = download_hf_url(path)
             # Load and decode with soundfile (no ffmpeg needed). The pipeline
             # resamples to 16 kHz internally via torchaudio.
             data, sr = sf.read(path)
