@@ -27,7 +27,8 @@ Run `make` (no target) to print this help.
 | `make samples` | Warm the HF sample cache (idempotent, no re-download). |
 | `make en` | Run the English test: transcribe the EN samples with the `.venv`. |
 | `make ml` | Run the multilingual test: transcribe the ES+HI samples with `whisper-tiny`. |
-| `make clean` | Remove the local `.venv`. |
+| `make clean` | Remove Python bytecode cache (`__pycache__`, `*.pyc`); keeps `.venv`. |
+| `make clean-all` | Also remove the local `.venv` (HF cache is left untouched). |
 
 ## Run
 

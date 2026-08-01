@@ -3,7 +3,7 @@ PY    := $(VENV)/bin/python
 # Override the model: make en MODEL=openai/whisper-base
 MODEL ?= openai/whisper-tiny.en
 
-.PHONY: help info venv samples en ml clean
+.PHONY: help info venv samples en ml clean clean-all
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make <target> [VAR=value]\n\nTargets:\n"} /^[a-zA-Z_-]+:.*##/ { printf "  %-12s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -25,5 +25,9 @@ en: venv ## Run the English test: transcribe the EN samples with the .venv (over
 ml: venv ## Run the multilingual test: transcribe the ES+HI samples with whisper-tiny locally
 	SAMPLES_SET=ml MODEL=openai/whisper-tiny $(PY) transcribe.py
 
-clean: ## Remove the local .venv (HF cache lives in ~/.cache/huggingface by default)
+clean: ## Remove Python bytecode cache (__pycache__, *.pyc); keeps .venv
+	@-find . -path ./.venv -prune -o \( -name '__pycache__' -o -name '*.pyc' \) -exec rm -rf {} +
+	@echo "cleaned pyc noise"
+
+clean-all: clean ## Also remove the local .venv (HF cache is left untouched)
 	rm -rf $(VENV)
