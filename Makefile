@@ -8,7 +8,7 @@ ML_MODEL ?= openai/whisper-tiny
 # Custom audio input: make en AUDIO=file.wav | dir/ | '*.flac' (space-safe).
 export AUDIO
 
-.PHONY: help info venv samples en ml clean clean-all
+.PHONY: help info venv samples en ml test test-integration clean clean-all
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make <target> [VAR=value]\n\nTargets:\n"} /^[a-zA-Z_-]+:.*##/ { printf "  %-12s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -33,6 +33,12 @@ en: venv ## Run the English test (custom audio: make en AUDIO=hf://datasets/.../
 ml: MODEL = $(ML_MODEL)
 ml: venv ## Run the multilingual test (custom audio: make ml AUDIO=hf://datasets/.../file.flac | file.wav | dir/ | '*.flac')
 	@SAMPLES_SET=ml MODEL=$(MODEL) $(PY) transcribe.py
+
+test: venv ## Run the fast unit tests (no model load, no network)
+	@$(PY) -m pytest
+
+test-integration: venv ## Run the integration test (loads the real Whisper model)
+	@$(PY) -m pytest -m integration
 
 clean: ## Remove Python bytecode cache (__pycache__, *.pyc); keeps .venv
 	@-find . -path ./.venv -prune -o \( -name '__pycache__' -o -name '*.pyc' \) -exec rm -rf {} +

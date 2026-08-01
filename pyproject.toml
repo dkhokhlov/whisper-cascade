@@ -24,3 +24,15 @@ torchaudio = { index = "pytorch-cpu" }
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+# Default run = fast unit tests only; the real-model test is opt-in.
+markers = [
+  "integration: loads the real Whisper model (slow; needs the model/cache)",
+]
+addopts = "-m 'not integration'"
