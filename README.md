@@ -8,7 +8,7 @@ The three stages:
 ```
 ┌───────────────────────────────┐                   ┌───────────────────────────────┐                   ┌───────────────────────────────┐
 │              ASR              │                   │              AT               │                   │              TTS              │
-│ Automatic Speech Recognition  │── Spanish text ──▶│     Automatic Translation     │── English text ──▶│        Text To Speech         │
+│ Automatic Speech Recognition  │── Spanish text ──>│     Automatic Translation     │── English text ──>│        Text To Speech         │
 │      openai/whisper-tiny      │                   │  Helsinki-NLP/opus-mt-mul-en  │                   │     facebook/mms-tts-eng      │
 └───────────────────────────────┘                   └───────────────────────────────┘                   └───────────────────────────────┘
 ```
