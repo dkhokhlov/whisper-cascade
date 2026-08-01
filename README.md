@@ -19,19 +19,13 @@ through the Hugging Face `transformers` library.
 
 Per-model runtime weights (single weights file loaded):
 
-```
-┌─────────────────────────────┬────────────────────────────────────┬───────────┐
-│            Model            │            Loaded file             │   Size    │
-├─────────────────────────────┼────────────────────────────────────┼───────────┤
-│ openai/whisper-tiny         │ model.safetensors                  │ 151.06 MB │
-├─────────────────────────────┼────────────────────────────────────┼───────────┤
-│ Helsinki-NLP/opus-mt-mul-en │ pytorch_model.bin (no safetensors) │ 310.39 MB │
-├─────────────────────────────┼────────────────────────────────────┼───────────┤
-│ facebook/mms-tts-eng        │ model.safetensors                  │ 145.23 MB │
-└─────────────────────────────┴────────────────────────────────────┴───────────┘
+| Model | Loaded file | Size |
+|---|---|---|
+| [`openai/whisper-tiny`](https://huggingface.co/openai/whisper-tiny) | `model.safetensors` | 151.06 MB |
+| [`Helsinki-NLP/opus-mt-mul-en`](https://huggingface.co/Helsinki-NLP/opus-mt-mul-en) | `pytorch_model.bin` (no safetensors) | 310.39 MB |
+| [`facebook/mms-tts-eng`](https://huggingface.co/facebook/mms-tts-eng) | `model.safetensors` | 145.23 MB |
 
 Combined model weights → ~607 MB (151.06 + 310.39 + 145.23 = 606.68 MB)
-```
 
 No Docker, no ffmpeg, no GPU. Dependencies are managed with [uv](https://docs.astral.sh/uv/).
 The models and the test samples are cached through the Hugging Face cache
