@@ -10,9 +10,12 @@ English speech:
 make asr AUDIO=hf://datasets/Narsil/asr_dummy/4.flac | jq -r '.[].text' | make en | jq -r '.text' | make tts OUTPUT=4_en.wav
 ```
 
-The ASR step uses OpenAI's `whisper-tiny` (multilingual); the translate step
-uses a MarianMT model; the TTS step uses a VITS model — all through the
-Hugging Face `transformers` library.
+The ASR step uses OpenAI's [`whisper-tiny`](https://huggingface.co/openai/whisper-tiny)
+(multilingual); the translate step uses a MarianMT model
+([`Helsinki-NLP/opus-mt-mul-en`](https://huggingface.co/Helsinki-NLP/opus-mt-mul-en));
+the TTS step uses a VITS model
+([`facebook/mms-tts-eng`](https://huggingface.co/facebook/mms-tts-eng)) — all
+through the Hugging Face `transformers` library.
 
 No Docker, no ffmpeg, no GPU. Dependencies are managed with [uv](https://docs.astral.sh/uv/).
 The models and the test samples are cached through the Hugging Face cache
