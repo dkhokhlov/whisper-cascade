@@ -12,6 +12,15 @@ export AUDIO
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage:\n  make <target> [VAR=value]\n\nTargets:\n"} /^[a-zA-Z_-]+:.*##/ { printf "  %-18s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@echo ""
+	@echo "Examples:"
+	@printf '  %-52s %s\n' 'make en' 'English samples (whisper-tiny.en)'
+	@printf '  %-52s %s\n' 'make ml' 'ES+HI samples (whisper-tiny)'
+	@printf '  %-52s %s\n' 'make en MODEL=openai/whisper-base' 'override the model'
+	@printf '  %-52s %s\n' 'make en AUDIO=hf://datasets/Narsil/asr_dummy/1.flac' 'one HF Hub file'
+	@printf '  %-52s %s\n' 'make en AUDIO=./clips/' 'a directory'
+	@printf '  %-52s %s\n' "make en AUDIO='*.flac'" 'a glob'
+	@printf '  %-52s %s\n' 'make test' 'fast unit tests'
 
 info: ## Show current config and status
 	@echo "MODEL       $(MODEL) (en) / $(ML_MODEL) (ml)"
@@ -25,13 +34,13 @@ venv: ## Create the local .venv and install deps with uv
 samples: ## Warm the HF sample cache (Narsil/asr_dummy) - idempotent, no re-download
 	@$(PY) -c "from huggingface_hub import hf_hub_download; [hf_hub_download('Narsil/asr_dummy', f, repo_type='dataset') for f in ('mlk.flac','1.flac','2.flac','4.flac','hindi.ogg')]" && echo "samples cache warm"
 
-en: venv ## Run the English test (override: make en MODEL=...; audio: make en AUDIO=hf://.../file.flac|file.wav|dir/|'*.flac')
+en: venv ## Run the English test (default whisper-tiny.en)
 	@MODEL=$(MODEL) $(PY) transcribe.py
 
 # Target-specific default so `make ml` uses whisper-tiny, but `make ml MODEL=...`
 # still overrides (command-line beats target-specific).
 ml: MODEL = $(ML_MODEL)
-ml: venv ## Run the multilingual test (override: make ml MODEL=...; audio: make ml AUDIO=hf://.../file.flac|file.wav|dir/|'*.flac')
+ml: venv ## Run the multilingual test (default whisper-tiny)
 	@SAMPLES_SET=ml MODEL=$(MODEL) $(PY) transcribe.py
 
 test: venv ## Run the fast unit tests (no model load, no network)
