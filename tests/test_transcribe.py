@@ -155,7 +155,7 @@ def test_main_on_cached_sample(monkeypatch, capsys):
 
     monkeypatch.setattr(sys, "argv", ["transcribe.py"])
     monkeypatch.setenv("AUDIO", paths[0])
-    monkeypatch.delenv("MODEL", raising=False)  # default whisper-tiny
+    monkeypatch.delenv("MODEL_ASR", raising=False)  # default whisper-tiny
 
     rc = transcribe.main()
     out = capsys.readouterr().out

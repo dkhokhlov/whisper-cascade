@@ -15,7 +15,7 @@ AUDIO accepts one or more whitespace-separated tokens, each a Hugging Face URL
 (hf://datasets/<ns>/<repo>/<file>), a local file, a directory, or a glob.
 Otherwise the default multilingual samples (English, Spanish, Hindi) are
 resolved from the Hugging Face cache (dataset Narsil/asr_dummy) via
-huggingface_hub. The MODEL env var selects the model (default
+huggingface_hub. The MODEL_ASR env var selects the model (default
 openai/whisper-tiny, multilingual). The input order becomes the output order.
 """
 
@@ -42,7 +42,7 @@ from transformers import pipeline
 
 transformers.logging.set_verbosity_error()
 
-MODEL = os.environ.get("MODEL", "openai/whisper-tiny")
+MODEL_ASR = os.environ.get("MODEL_ASR", "openai/whisper-tiny")
 DATASET = "Narsil/asr_dummy"
 # Default multilingual sample set: English, Spanish, Hindi. All are loose files
 # in the dataset and resolve from the HF cache via huggingface_hub.
@@ -139,7 +139,7 @@ def main() -> int:
         print("[]")
         return 0
 
-    pipe = pipeline(task="automatic-speech-recognition", model=MODEL)
+    pipe = pipeline(task="automatic-speech-recognition", model=MODEL_ASR)
 
     results = []
     had_error = False
@@ -185,7 +185,7 @@ def main() -> int:
             results.append({
                 "file": display,
                 "text": text,
-                "model": MODEL,
+                "model": MODEL_ASR,
                 "stats": {
                     "duration_s": round(duration, 3),
                     "elapsed_s": round(elapsed, 3),
@@ -197,7 +197,7 @@ def main() -> int:
             })
         except Exception as exc:  # noqa: BLE001 - report, do not abort the batch
             had_error = True
-            results.append({"file": display, "error": str(exc), "model": MODEL})
+            results.append({"file": display, "error": str(exc), "model": MODEL_ASR})
 
     print(json.dumps(results, ensure_ascii=False, indent=2))
 

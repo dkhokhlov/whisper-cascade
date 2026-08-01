@@ -1,7 +1,7 @@
 [project]
-name = "wisper-asr"
-version = "0.1.0"
-description = "Whisper-tiny.en WAV/FLAC transcription (CPU)."
+name = "whisper-cascade"
+version = "1.2.0"
+description = "Whisper ASR + MarianMT translate + VITS TTS pipeline (CPU)."
 requires-python = ">=3.10,<3.11"
 dependencies = [
     "transformers==4.44.2",
@@ -9,6 +9,8 @@ dependencies = [
     "numpy<2",
     "torch==2.4.1",
     "torchaudio==2.4.1",
+    # MarianMT (make en) uses SentencePiece tokenizers; AutoTokenizer needs this.
+    "sentencepiece==0.2.0",
 ]
 
 # Application project: do not build or install the project as a package.
@@ -31,9 +33,9 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-# Default run = fast unit tests only; the real-model test is opt-in.
+# Default run = fast unit tests only; the real-model tests are opt-in.
 markers = [
-  "integration: loads the real Whisper model (slow; needs the model/cache)",
+  "integration: loads a real model (Whisper/MarianMT/VITS; slow; needs the model/cache)",
 ]
 addopts = "-m 'not integration'"
 # Make `import transcribe` resolve from the repo root for any pytest invocation

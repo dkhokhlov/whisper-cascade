@@ -13,3 +13,5 @@ hf_cache/
 # OS / editor
 .DS_Store
 .idea/
+# Generated audio output (make tts, pipeline runs)
+*.wav
