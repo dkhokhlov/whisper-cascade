@@ -1,7 +1,19 @@
 # whisper-cascade
 
 A minimal, CPU-only speech-to-text tool, with two text helpers that compose
-into a UNIX pipeline. `make asr` transcribes audio files (WAV / FLAC / OGG /
+into a cascade speech translation pipeline.
+
+The three stages:
+
+```
+┌───────────────────────────────┐                   ┌───────────────────────────────┐                   ┌───────────────────────────────┐
+│              ASR              │                   │              AT               │                   │              TTS              │
+│ Automatic Speech Recognition  │── Spanish text ──▶│     Automatic Translation     │── English text ──▶│        Text To Speech         │
+│      openai/whisper-tiny      │                   │  Helsinki-NLP/opus-mt-mul-en  │                   │     facebook/mms-tts-eng      │
+└───────────────────────────────┘                   └───────────────────────────────┘                   └───────────────────────────────┘
+```
+
+`make asr` transcribes audio files (WAV / FLAC / OGG /
 MP3) and prints JSON. `make en` translates text to English. `make tts`
 synthesizes speech from text. Chained together they turn foreign speech into
 English speech:
