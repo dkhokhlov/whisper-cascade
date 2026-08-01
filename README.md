@@ -21,9 +21,9 @@ Per-model runtime weights (single weights file loaded):
 
 | Model | Decoder type | Stored dtype | Loaded as | Loaded file | Size |
 |---|---|---|---|---|---|
-| [`openai/whisper-tiny`](https://huggingface.co/openai/whisper-tiny) | autoregressive (enc-dec) | float32 | fp32 | `model.safetensors` | 151.06 MB |
-| [`Helsinki-NLP/opus-mt-mul-en`](https://huggingface.co/Helsinki-NLP/opus-mt-mul-en) | autoregressive (enc-dec) | fp32 (default) | fp32 | `pytorch_model.bin` (no safetensors) | 310.39 MB |
-| [`facebook/mms-tts-eng`](https://huggingface.co/facebook/mms-tts-eng) | non-autoregressive | float32 | fp32 | `model.safetensors` | 145.23 MB |
+| [`openai/whisper-tiny`](https://huggingface.co/openai/whisper-tiny) | autoregressive (enc-dec) | float32 | float32 | `model.safetensors` | 151.06 MB |
+| [`Helsinki-NLP/opus-mt-mul-en`](https://huggingface.co/Helsinki-NLP/opus-mt-mul-en) | autoregressive (enc-dec) | float32 (default) | float32 | `pytorch_model.bin` (no safetensors) | 310.39 MB |
+| [`facebook/mms-tts-eng`](https://huggingface.co/facebook/mms-tts-eng) | non-autoregressive | float32 | float32 | `model.safetensors` | 145.23 MB |
 
 Combined model weights → ~607 MB (151.06 + 310.39 + 145.23 = 606.68 MB)
 
