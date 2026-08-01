@@ -1,5 +1,5 @@
 [project]
-name = "wisper-test"
+name = "wisper-asr"
 version = "0.1.0"
 description = "Whisper-tiny.en WAV/FLAC transcription (CPU)."
 requires-python = ">=3.10,<3.11"

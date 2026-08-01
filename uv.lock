@@ -477,7 +477,7 @@ wheels = [
 ]
 
 [[package]]
-name = "wisper-test"
+name = "wisper-asr"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
