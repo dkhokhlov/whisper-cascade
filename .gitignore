@@ -6,10 +6,7 @@ __pycache__/
 # uv / virtualenv
 .venv/
 
-# Downloaded samples (fetched by download_samples.sh)
-samples/
-
-# Local caches
+# Local caches (HF model/sample cache lives in ~/.cache/huggingface by default)
 .cache/
 hf_cache/
 

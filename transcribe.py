@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Transcribe WAV files with the whisper-tiny.en model and print JSON to stdout.
+"""Transcribe audio with a Whisper model and print JSON to stdout.
 
-This script loads the Hugging Face automatic-speech-recognition pipeline once.
+The script loads the Hugging Face automatic-speech-recognition pipeline once.
 Then it transcribes each input file. It prints one JSON array to stdout.
 Each element has the keys "file", "text", and "model".
 
 Usage:
-    python transcribe.py [path.wav ...]
+    python transcribe.py [path ...]
 
-If no path is given, the script transcribes every .wav file in the samples
-directory. The samples directory comes from the SAMPLES_DIR environment variable.
-The default value is "./samples". The input order becomes the output order.
+If no path is given, the script resolves the default samples from the Hugging
+Face cache (dataset Narsil/asr_dummy) via huggingface_hub. The MODEL env var
+selects the model (default openai/whisper-tiny.en). The SAMPLES_SET env var
+selects the sample set: "en" (English, default) or "ml" (multilingual).
+The input order becomes the output order.
 """
 
-import glob
 import json
 import logging
 import os
@@ -30,27 +31,42 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import soundfile as sf
 import transformers
+from huggingface_hub import hf_hub_download
 from transformers import pipeline
 
 transformers.logging.set_verbosity_error()
 
 MODEL = os.environ.get("MODEL", "openai/whisper-tiny.en")
-SAMPLES_DIR = os.environ.get("SAMPLES_DIR", "./samples")
+DATASET = "Narsil/asr_dummy"
+EN_FILES = ("mlk.flac", "1.flac", "2.flac")
+ML_FILES = ("4.flac", "hindi.ogg")
+
+
+def resolve_samples(files: tuple) -> list:
+    """Resolve sample files from the Hugging Face cache.
+
+    Download each file on first use, then reuse the cache. This is the same
+    mechanism the model uses, so samples need no separate download step.
+    Return a list of (display_name, path) pairs: the short dataset filename for
+    display, and the cached path for reading.
+    """
+    return [
+        (f, hf_hub_download(repo_id=DATASET, filename=f, repo_type="dataset"))
+        for f in files
+    ]
 
 
 def get_inputs() -> list:
-    """Return the list of input file paths.
+    """Return the list of (display_name, path) pairs to transcribe.
 
     Use the command line arguments when the user gives them.
-    Otherwise use the audio files in the samples directory.
+    Otherwise resolve the default sample set from the HF cache.
     """
     if len(sys.argv) > 1:
-        return list(sys.argv[1:])
+        return [(a, a) for a in sys.argv[1:]]
 
-    found = []
-    for ext in ("*.wav", "*.flac", "*.mp3", "*.ogg"):
-        found.extend(glob.glob(os.path.join(SAMPLES_DIR, ext)))
-    return sorted(found)
+    files = ML_FILES if os.environ.get("SAMPLES_SET") == "ml" else EN_FILES
+    return resolve_samples(files)
 
 
 def main() -> int:
@@ -69,7 +85,7 @@ def main() -> int:
     results = []
     had_error = False
 
-    for path in inputs:
+    for display, path in inputs:
         try:
             # Load and decode with soundfile (no ffmpeg needed). The pipeline
             # resamples to 16 kHz internally via torchaudio.
@@ -79,10 +95,10 @@ def main() -> int:
             data = data.astype(np.float32)
             output = pipe({"array": data, "sampling_rate": sr})
             text = output["text"].strip()
-            results.append({"file": path, "text": text, "model": MODEL})
+            results.append({"file": display, "text": text, "model": MODEL})
         except Exception as exc:  # noqa: BLE001 - report, do not abort the batch
             had_error = True
-            results.append({"file": path, "error": str(exc), "model": MODEL})
+            results.append({"file": display, "error": str(exc), "model": MODEL})
 
     print(json.dumps(results, ensure_ascii=False, indent=2))
     return 1 if had_error else 0
