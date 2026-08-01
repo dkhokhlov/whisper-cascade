@@ -1,9 +1,11 @@
-"""Tests for translate.py (make en): stdout is pure text; model from env.
+"""Tests for translate.py (make en): stdout is JSON with text + stats.
 
 Unit tests stub the pipeline so they need no model and no network. The
 integration test (marked `integration`) loads the real MarianMT model.
 """
 
+import json
+import re
 import sys
 
 import pytest
@@ -11,9 +13,25 @@ import pytest
 import translate
 
 
-# --- unit: pure text to stdout, summary to stderr ---------------------------
+# Skip an integration test only for environmental (network/cache) errors. Any
+# other exception is re-raised so a real logic bug fails the test instead of
+# being silently skipped (a broad `except: skip` masks implementation bugs).
+_ENV_ERR = re.compile(
+    r"(connection|offline|local entry|resolve|hostname|timeout|trust_remote"
+    r"|unreachable|temporarily unavailable|huggingface|hf_hub|http error)",
+    re.IGNORECASE,
+)
 
-def test_translate_prints_translated_text_to_stdout(monkeypatch, capsys):
+
+def _skip_if_env(exc):
+    if _ENV_ERR.search(str(exc)) or isinstance(exc, (OSError, ConnectionError)):
+        pytest.skip(f"environment/model-load error: {exc}")
+    raise exc
+
+
+# --- unit: JSON object with text, model, stats ------------------------------
+
+def test_translate_prints_json_with_text_and_stats(monkeypatch, capsys):
     def fake_pipeline(task, model):
         assert task == "translation"
         return lambda text: [{"translation_text": "Hello friend"}]
@@ -27,8 +45,14 @@ def test_translate_prints_translated_text_to_stdout(monkeypatch, capsys):
     cap = capsys.readouterr()
 
     assert rc == 0
-    assert cap.out.strip() == "Hello friend"  # stdout is pure text
-    assert "[translate]" in cap.err           # summary on stderr
+    data = json.loads(cap.out)            # stdout is a JSON object
+    assert data["text"] == "Hello friend"
+    assert data["lang"] == "en"
+    assert data["model"] == "Helsinki-NLP/opus-mt-mul-en"
+    assert data["stats"]["chars"] == len("Hola amigo")
+    assert data["stats"]["out_chars"] == len("Hello friend")
+    assert data["stats"]["elapsed_s"] >= 0
+    assert cap.err == ""                   # no stderr summary; stats are in JSON
 
 
 def test_translate_empty_input_returns_1(monkeypatch, capsys):
@@ -37,7 +61,46 @@ def test_translate_empty_input_returns_1(monkeypatch, capsys):
     monkeypatch.setattr(sys, "stdin", _Stdin(""))
 
     assert translate.main() == 1
-    assert capsys.readouterr().out == ""  # nothing on stdout
+    assert json.loads(capsys.readouterr().out)["error"]  # JSON error element
+
+
+def test_translate_inference_error_emits_json_error(monkeypatch, capsys):
+    # A runtime error during model load or inference must emit a JSON error and
+    # return 1, not a traceback (consistent with asr per-file errors).
+    def fake_pipeline(task, model):
+        def call(text):
+            raise RuntimeError("boom")
+        return call
+
+    monkeypatch.setattr(translate, "pipeline", fake_pipeline)
+    monkeypatch.setattr(sys, "argv", ["translate.py"])
+    monkeypatch.setenv("TEXT", "Hola")
+    monkeypatch.setattr(sys, "stdin", _Stdin(""))
+
+    rc = translate.main()
+    cap = capsys.readouterr()
+    assert rc == 1
+    data = json.loads(cap.out)
+    assert data["error"] == "boom"
+    assert data["lang"] == "en"
+    assert data["model"] == "Helsinki-NLP/opus-mt-mul-en"
+
+
+def test_translate_target_lang_from_env(monkeypatch, capsys):
+    def fake_pipeline(task, model):
+        return lambda text: [{"translation_text": "Hallo"}]
+
+    monkeypatch.setattr(translate, "pipeline", fake_pipeline)
+    monkeypatch.setattr(sys, "argv", ["translate.py"])
+    monkeypatch.setenv("TEXT", "Hello")
+    monkeypatch.setenv("TARGET_LANG", "de")
+    monkeypatch.setattr(translate, "TARGET_LANG", "de")  # main reads module global
+    monkeypatch.setattr(sys, "stdin", _Stdin(""))
+
+    rc = translate.main()
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert data["lang"] == "de"
 
 
 def test_translate_model_from_env(monkeypatch):
@@ -67,13 +130,14 @@ def test_translate_spanish_to_english(monkeypatch, capsys):
 
     try:
         rc = translate.main()
-    except Exception as exc:  # noqa: BLE001 - network/cache failure, not a test fail
-        pytest.skip(f"could not load MarianMT model: {exc}")
+    except Exception as exc:  # noqa: BLE001 - re-raise unless environmental
+        _skip_if_env(exc)
 
     cap = capsys.readouterr()
     assert rc == 0
-    assert cap.out.strip()  # non-empty English text
-    assert "[translate]" in cap.err
+    data = json.loads(cap.out)
+    assert data["text"].strip()  # non-empty English text
+    assert data["stats"]["chars"] > 0
 
 
 class _Stdin:
