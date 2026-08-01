@@ -3,7 +3,7 @@
 Runs the same scripts the `make asr` / `make en` / `make tts` targets wrap,
 chaining stdout into stdin exactly like the documented shell pipeline:
 
-    make asr AUDIO=<mlk.flac> | jq -r '.[].text' | make en | make tts OUTPUT=<wav>
+    make asr AUDIO=<mlk.flac> | jq -r '.[].text' | make en | jq -r '.text' | make tts OUTPUT=<wav>
     make asr AUDIO=<wav> MODEL_ASR=openai/whisper-base   # verify
 
 The front ASR uses whisper-tiny; the verification ASR uses whisper-base so the
@@ -52,10 +52,10 @@ def test_pipeline_recovers_expected_text(tmp_path):
     text1 = json.loads(r1.stdout)[0]["text"]
     assert "dream" in text1.lower(), f"front asr lost 'dream': {text1!r}"
 
-    # 2. Translate to English (near-identity on English input).
+    # 2. Translate to English (near-identity on English input) -> JSON.
     r2 = _run("translate.py", {}, stdin=text1)
     assert r2.returncode == 0, f"translate failed: {r2.stderr[-400:]}"
-    text2 = r2.stdout.strip()
+    text2 = json.loads(r2.stdout)["text"]
     assert "dream" in text2.lower(), f"translate lost 'dream': {text2!r}"
 
     # 3. Synthesize English speech from the translated text.

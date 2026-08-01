@@ -7,7 +7,7 @@ synthesizes speech from text. Chained together they turn foreign speech into
 English speech:
 
 ```bash
-make asr AUDIO=hf://datasets/Narsil/asr_dummy/4.flac | jq -r '.[].text' | make en | make tts OUTPUT=4_en.wav
+make asr AUDIO=hf://datasets/Narsil/asr_dummy/4.flac | jq -r '.[].text' | make en | jq -r '.text' | make tts OUTPUT=4_en.wav
 ```
 
 The ASR step uses OpenAI's `whisper-tiny` (multilingual); the translate step
@@ -26,7 +26,7 @@ Requires Python 3.10 and [uv](https://docs.astral.sh/uv/).
 ```bash
 make venv     # create .venv and install deps (torch/torchaudio from the CPU index)
 make asr      # transcribe the built-in multilingual samples (en + es + hi)
-make en TEXT="Hola, ¿cómo estás?"          # -> English text on stdout
+make en TEXT="Hola, ¿cómo estás?"          # -> JSON with text + stats
 make tts TEXT="Hello world" OUTPUT=hi.wav  # -> hi.wav
 ```
 
@@ -43,11 +43,7 @@ Expected output on stdout (JSON):
 ]
 ```
 
-A one-line summary goes to stderr:
-
-```
-[stats] files=3 audio=23.71s elapsed=1.64s rtf=0.069 tokens=68 words=43
-```
+For multi-file totals, sum the JSON with `jq` (e.g. `make asr | jq '[.[].stats.duration_s] | add'`).
 
 Transcribe your own file:
 
@@ -73,7 +69,7 @@ Run `make` (no target) to print this help.
 | `make venv` | Create the local `.venv` with uv. |
 | `make samples` | Warm the HF sample cache for the default set (idempotent, no re-download). |
 | `make asr` | Transcribe audio to JSON (default multilingual samples, or `AUDIO=`). |
-| `make en` | Translate text to English (stdin/`TEXT=`; plain text to stdout). |
+| `make en` | Translate text to English (stdin/`TEXT=`; JSON with text + stats to stdout). |
 | `make tts` | Synthesize speech from text (stdin/`TEXT=`; writes `tts.wav`, `OUTPUT=` to override). |
 | `make test` | Run the fast unit tests (no model load, no network). |
 | `make test-integration` | Run the integration tests (load the real Whisper/MarianMT/VITS models). |
@@ -94,8 +90,9 @@ Stats (ASR-style):
 - `words` / `chars` — output word and character counts.
 
 When a file fails, its element has the key `error` instead of `text` and
-`stats`, and the script exits with status 1. The other files are still
-processed.
+`stats`, and the script exits with a non-zero status. Run directly, the
+script returns 1; run through `make`, the exit code is 2 (make uses 2 for a
+failed recipe). The other files are still processed.
 
 ## Samples
 
@@ -150,27 +147,33 @@ Without `AUDIO`, the built-in default sample set (en + es + hi) is used.
 
 ## Translate (make en)
 
-`make en` reads text (the `TEXT` env var, a file argument, or stdin) and prints
-the English translation to stdout as plain text, so it pipes into `make tts`.
-A one-line summary goes to stderr. The model is a MarianMT model selected by
-`MODEL_TRANSLATE` (default `Helsinki-NLP/opus-mt-mul-en`, multilingual to
+`make en` reads text from the `TEXT` env var or stdin and prints
+a JSON object to stdout with `text` (the English translation), `lang`
+(`"en"`), `model`, and a `stats` block (`chars`, `words` of the input,
+`out_chars`, `out_words` of the output, `elapsed_s`). Extract the text with
+`jq -r '.text'` to pipe into `make tts`. The model is a MarianMT model selected
+by `MODEL_TRANSLATE` (default `Helsinki-NLP/opus-mt-mul-en`, multilingual to
 English).
 
 ```bash
-make en TEXT="Hola, ¿cómo estás?"                       # -> "Hey, how are you?"
-echo "Ich heiße Max." | make en                         # -> "My name is Max."
-MODEL_TRANSLATE=Helsinki-NLP/opus-mt-es-en make en TEXT="Hola"   # Spanish source
+make en TEXT="Hola, ¿cómo estás?" | jq -r '.text'        # -> "Hey, how are you?"
+echo "Ich heiße Max." | make en | jq -r '.text'          # -> "My name is Max."
+MODEL_TRANSLATE=Helsinki-NLP/opus-mt-es-en make en TEXT="Hola" | jq -r '.text'   # Spanish source
 ```
+
+`make en` cannot take a file argument (make treats a bare word as a target).
+To read a file directly, run the script: `.venv/bin/python translate.py
+file.txt` (or `-` for stdin).
 
 The target is named by the target language: `make en` runs `translate.py`.
 Adding `make es` (translate to Spanish) later is one Make target that sets
-`MODEL_TRANSLATE` to a `-> Spanish` model — no code change. For a known single
-source language, a pair-specific model (e.g. `opus-mt-es-en`) gives better
-quality than the multilingual default.
+`TARGET_LANG=es` and `MODEL_TRANSLATE` to a `-> Spanish` model — no code
+change. For a known single source language, a pair-specific model (e.g.
+`opus-mt-es-en`) gives better quality than the multilingual default.
 
 ## TTS (make tts)
 
-`make tts` reads text (the `TEXT` env var, a file argument, or stdin) and
+`make tts` reads text from the `TEXT` env var or stdin and
 writes the synthesized waveform to `OUTPUT` (default `tts.wav`). A JSON summary
 goes to stdout (`output`, `model`, `text`, and a `stats` block). The model is a
 VITS model selected by `MODEL_TTS` (default `facebook/mms-tts-eng`, English).
@@ -187,18 +190,46 @@ MODEL_TTS=facebook/mms-tts-spa make tts TEXT="Hola"   # another MMS language
 ## Pipeline
 
 The three targets compose as a UNIX pipeline. `make asr` prints JSON; `jq`
-extracts the `text` fields (`jq -r '.[].text'`); `make en` translates the text
-to English; `make tts` synthesizes English speech. The tools themselves do not
-require `jq` — it is only the bridge for this example.
+extracts the `text` fields (`jq -r '.[].text'`); `make en` prints JSON (text +
+stats); `jq -r '.text'` extracts the translation; `make tts` synthesizes
+English speech. The tools themselves do not require `jq` — it is only the
+bridge for this example.
 
 ```bash
 # Spanish speech -> Spanish text -> English text -> English speech
-make asr AUDIO=hf://datasets/Narsil/asr_dummy/4.flac | jq -r '.[].text' | make en | make tts OUTPUT=4_en.wav
+make asr AUDIO=hf://datasets/Narsil/asr_dummy/4.flac | jq -r '.[].text' | make en | jq -r '.text' | make tts OUTPUT=4_en.wav
+```
+
+Run the pipeline with `set -o pipefail` so an upstream failure makes the whole
+pipeline exit non-zero. Without it, a bad `AUDIO=` (an unmatched glob, a missing
+file) lets `make asr` fail silently: `jq` turns its error element into `null`,
+which flows into `make en` and on through the cascade.
+
+```bash
+set -o pipefail
+make asr AUDIO=hf://datasets/Narsil/asr_dummy/4.flac | jq -r '.[].text' | make en | jq -r '.text' | make tts OUTPUT=4_en.wav
+echo "exit: $?"   # non-zero if any stage failed
 ```
 
 For the default sample set (three files), `jq` emits one line per file; pass a
 single file (as above, via `AUDIO=`) for a one-shot pipeline, or loop over the
 files in bash for per-file output.
+
+To inspect every stage of the cascade, write each output to one file with
+`tee` (then `tee -a` and `>>` to append), then `cat` it:
+
+```bash
+make asr AUDIO=hf://datasets/Narsil/asr_dummy/4.flac | tee out.txt | jq -r '.[].text' | make en | tee -a out.txt | jq -r '.text' | make tts OUTPUT=4_en.wav >> out.txt && cat out.txt
+```
+
+- `tee out.txt` after `make asr` writes the ASR JSON to a fresh `out.txt` and sends it to `jq`.
+- `tee -a out.txt` after `make en` appends the en JSON and sends it to `jq`.
+- `make tts ... >> out.txt` appends the tts JSON summary.
+- `cat out.txt` prints the ASR JSON, the en JSON, and the tts JSON (all with stats).
+
+The first `tee` (no `-a`) starts a fresh file each run, so the file holds only
+the latest run (no `rm -f` needed). (`jq` is a transform, not a stage, so it is
+not teed.)
 
 ## Notes
 
@@ -208,6 +239,5 @@ files in bash for per-file output.
 - The ASR pipeline resamples each input to 16 kHz internally, so no
   pre-conversion is needed.
 - `make en` needs `sentencepiece` (MarianMT tokenizers); it is in the deps.
-- Transformers warnings are silenced; ASR stdout is clean JSON, `make en`
-  stdout is plain text, `make tts` stdout is a JSON summary. stderr stays quiet
-  except the summary lines.
+- Transformers warnings are silenced; `make asr`, `make en`, and `make tts`
+  each print a JSON object/array to stdout (with stats). stderr stays quiet.
