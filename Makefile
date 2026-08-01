@@ -29,6 +29,5 @@ clean: ## Remove Python bytecode cache (__pycache__, *.pyc); keeps .venv
 	@-find . -path ./.venv -prune -o \( -name '__pycache__' -o -name '*.pyc' \) -exec rm -rf {} +
 	@echo "cleaned pyc noise"
 
-clean-all: clean ## Remove .venv and this repo's audio dataset (Narsil/asr_dummy) from the HF cache
-	@rm -rf "$${HF_HOME:-$$HOME/.cache/huggingface}/hub/datasets--Narsil--asr_dummy" && echo "removed HF dataset cache (Narsil/asr_dummy)"
+clean-all: clean ## Also remove the local .venv (HF cache is left untouched)
 	rm -rf $(VENV)

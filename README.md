@@ -28,7 +28,7 @@ Run `make` (no target) to print this help.
 | `make en` | Run the English test: transcribe the EN samples with the `.venv`. |
 | `make ml` | Run the multilingual test: transcribe the ES+HI samples with `whisper-tiny`. |
 | `make clean` | Remove Python bytecode cache (`__pycache__`, `*.pyc`); keeps `.venv`. |
-| `make clean-all` | Also remove `.venv` and this repo's audio dataset (`Narsil/asr_dummy`) from the HF cache. The model cache is left untouched. |
+| `make clean-all` | Also remove the local `.venv` (HF cache is left untouched). |
 
 ## Run
 
