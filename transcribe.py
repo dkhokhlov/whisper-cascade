@@ -10,13 +10,15 @@ is printed to stderr.
 Usage:
     python transcribe.py [path ...]
 
-If no path is given, the script resolves the default samples from the Hugging
+If no path is given, the script resolves input from the AUDIO env var (file(s),
+directory, or glob) when set, otherwise the default samples from the Hugging
 Face cache (dataset Narsil/asr_dummy) via huggingface_hub. The MODEL env var
 selects the model (default openai/whisper-tiny.en). The SAMPLES_SET env var
-selects the sample set: "en" (English, default) or "ml" (multilingual).
+selects the default sample set: "en" (English, default) or "ml" (multilingual).
 The input order becomes the output order.
 """
 
+import glob
 import json
 import logging
 import os
@@ -43,6 +45,8 @@ MODEL = os.environ.get("MODEL", "openai/whisper-tiny.en")
 DATASET = "Narsil/asr_dummy"
 EN_FILES = ("mlk.flac", "1.flac", "2.flac")
 ML_FILES = ("4.flac", "hindi.ogg")
+# Audio extensions used when AUDIO points at a directory.
+AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg", ".m4a")
 
 
 def resolve_samples(files: tuple) -> list:
@@ -59,14 +63,39 @@ def resolve_samples(files: tuple) -> list:
     ]
 
 
+def expand_audio(spec: str) -> list:
+    """Expand one AUDIO token to (display_name, path) pairs.
+
+    A directory becomes its audio files (by extension). A glob expands to its
+    matches. Anything else is treated as a literal file path (validated later
+    by the decoder, so a missing file becomes a per-file error, not a crash).
+    """
+    if os.path.isdir(spec):
+        names = sorted(
+            f for f in os.listdir(spec)
+            if os.path.splitext(f)[1].lower() in AUDIO_EXTS
+        )
+        return [(os.path.join(spec, f), os.path.join(spec, f)) for f in names]
+    if any(c in spec for c in "*?["):
+        return [(m, m) for m in sorted(glob.glob(spec))]
+    return [(spec, spec)]
+
+
 def get_inputs() -> list:
     """Return the list of (display_name, path) pairs to transcribe.
 
-    Use the command line arguments when the user gives them.
-    Otherwise resolve the default sample set from the HF cache.
+    Precedence: command line arguments, then the AUDIO env var (file(s)/dir/
+    glob), then the default sample set from the HF cache (SAMPLES_SET).
     """
     if len(sys.argv) > 1:
         return [(a, a) for a in sys.argv[1:]]
+
+    audio = os.environ.get("AUDIO", "").strip()
+    if audio:
+        out = []
+        for tok in audio.split():
+            out.extend(expand_audio(tok))
+        return out
 
     files = ML_FILES if os.environ.get("SAMPLES_SET") == "ml" else EN_FILES
     return resolve_samples(files)

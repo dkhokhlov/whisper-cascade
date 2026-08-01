@@ -44,6 +44,13 @@ Transcribe your own file:
 .venv/bin/python transcribe.py path/to/audio.wav
 ```
 
+Transcribe your own file via the `AUDIO` env var (file, directory, or glob):
+
+```bash
+make en AUDIO=path/to/audio.wav
+make ml AUDIO='./clips/*.flac'   # every FLAC in clips/, with the multilingual model
+```
+
 Multilingual samples (uses `whisper-tiny`):
 
 ```bash
@@ -93,19 +100,49 @@ The default model is English-only, so `make en` is the coherent default. The
 multilingual samples are used only under a multilingual model, which `make ml`
 selects automatically.
 
-## Model override
+## Models: en vs ml
 
-Override the model with the `MODEL` variable. The model id appears in each JSON
-element as `"model"`.
+The two tests use different models by default:
+
+- `make en` uses `MODEL` (default `openai/whisper-tiny.en`, English-only). This
+  is the coherent default — small, fast, best English accuracy for its size.
+- `make ml` uses `ML_MODEL` (default `openai/whisper-tiny`, multilingual),
+  because the `.en` model cannot transcribe the Spanish (`4.flac`) and Hindi
+  (`hindi.ogg`) samples.
+
+Both are overridable with the `MODEL` variable (command-line beats the
+per-target default):
 
 ```bash
-make en MODEL=openai/whisper-base      # English test with a different model
-make ml                                # multilingual test (always whisper-tiny)
-MODEL=openai/whisper-base .venv/bin/python transcribe.py my.wav
+make en MODEL=openai/whisper-base      # English test with a bigger .en model
+make ml MODEL=openai/whisper-large-v3   # multilingual test with a bigger model
 ```
 
-The `SAMPLES_SET` env var selects the default sample set when no file args are
-given: `en` (default) or `ml`.
+The model id appears in each JSON element as `"model"`.
+
+## Custom audio (AUDIO env var)
+
+Point the tool at your own audio instead of the built-in samples. `AUDIO`
+accepts one or more paths separated by spaces; each can be a file, a
+directory (its audio files are used, filtered by extension), or a glob.
+
+```bash
+make en AUDIO=file.wav
+make en AUDIO='clip1.wav clip2.flac'
+make en AUDIO=./clips/                 # a directory
+make ml AUDIO='./clips/*.flac'         # glob, multilingual model
+```
+
+Without `AUDIO`, the built-in sample set is used (`SAMPLES_SET`=en or ml).
+
+## Model override / samples
+
+The `SAMPLES_SET` env var selects the default sample set when no file args and
+no `AUDIO` are given: `en` (default) or `ml`.
+
+```bash
+MODEL=openai/whisper-base .venv/bin/python transcribe.py my.wav
+```
 
 ## Notes
 
