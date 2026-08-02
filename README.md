@@ -17,8 +17,8 @@ The three stages:
                         │ Spanish text
                         ▼
         ┌───────────────────────────────┐
-        │              AT               │
-        │     Automatic Translation     │
+        │              MT               │
+        │      Machine Translation      │
         │  Helsinki-NLP/opus-mt-mul-en  │
         └───────────────┬───────────────┘
                         │ English text
