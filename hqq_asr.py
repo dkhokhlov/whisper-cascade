@@ -64,13 +64,16 @@ class WhisperHQQModel(AutoHQQHFModel):
             return AutoModelForSpeechSeq2Seq.from_config(config)
 
 
-def _patch_linears(model, quant_config, device):
+def _patch_linears(model, default_cfg, protected_cfg, device, protect_patterns):
     """Replace every nn.Linear (except proj_out) with an HQQLinear on device.
 
-    Return the count of patched linears. proj_out is skipped because it is
-    tied to the embedding and is kept in fp16 (see module docstring).
+    A linear whose name contains any substring in protect_patterns uses
+    protected_cfg (e.g. 8-bit); the rest use default_cfg (e.g. 4-bit). proj_out
+    is skipped (tied to the embedding, kept fp16). Return (n_default,
+    n_protected).
     """
-    patched = 0
+    n_default = 0
+    n_protected = 0
     for name, module in list(model.named_modules()):
         if type(module) is not nn.Linear:
             continue
@@ -83,36 +86,66 @@ def _patch_linears(model, quant_config, device):
         for part in name.split(".")[:-1]:
             parent = getattr(parent, part)
         leaf = name.split(".")[-1]
-        setattr(parent, leaf, HQQLinear(
-            module, quant_config, compute_dtype=COMPUTE_DTYPE, device=device,
-        ))
-        patched += 1
-    return patched
+        if protected_cfg is not None and any(p and p in name for p in protect_patterns):
+            setattr(parent, leaf, HQQLinear(
+                module, protected_cfg, compute_dtype=COMPUTE_DTYPE, device=device,
+            ))
+            n_protected += 1
+        else:
+            setattr(parent, leaf, HQQLinear(
+                module, default_cfg, compute_dtype=COMPUTE_DTYPE, device=device,
+            ))
+            n_default += 1
+    return n_default, n_protected
 
 
-def quantize_whisper(model_id, save_dir, nbits=4, group_size=64, device="cpu"):
+def quantize_whisper(
+    model_id,
+    save_dir,
+    nbits=4,
+    group_size=32,
+    axis=1,
+    protect_nbits=None,
+    protect_patterns=(),
+    device="cpu",
+):
     """Quantize a Whisper model with HQQ and save it to save_dir.
 
-    Load the model as fp32, replace its linears with HQQLinear (nbits,
-    group_size), cast the non-quantized modules to fp16 for storage, and save
-    via hqq's save_quantized. Also save the processor so the output dir is
+    Load the model as fp32, replace its linears with HQQLinear, cast the
+    non-quantized modules to fp16 for storage, and save via hqq's
+    save_quantized. Also save the processor so the output dir is
     self-contained (AutoProcessor.from_pretrained(save_dir) works).
+
+    axis=1 groups along the input/reduction dim and measures better than axis=0
+    on whisper-tiny (0.1622 vs 0.2032 WER on fleurs en_us); axis=0 is meant for
+    GPU-optimized inference. protect_nbits/protect_patterns keep fragile linears
+    (e.g. fc1, the encoder stack) at a higher bit width.
     """
-    quant_config = BaseQuantizeConfig(nbits=nbits, group_size=group_size)
+    default_cfg = BaseQuantizeConfig(nbits=nbits, group_size=group_size, axis=axis)
+    protected_cfg = None
+    if protect_nbits is not None and protect_patterns:
+        protected_cfg = BaseQuantizeConfig(
+            nbits=protect_nbits, group_size=group_size, axis=axis
+        )
+
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         model_id, torch_dtype=COMPUTE_DTYPE
     ).to(device)
     model.eval()
 
-    patched = _patch_linears(model, quant_config, device)
+    n_default, n_protected = _patch_linears(
+        model, default_cfg, protected_cfg, device, protect_patterns
+    )
     # hqq bookkeeping so save_quantized serializes the patched model.
     AutoHQQHFModel.setup_model(model)
     model.hqq_quantized = True
     model.base_class = AutoHQQHFModel
 
     # Compact storage: cast the non-quantized float modules to fp16. The tied
-    # lm_head/embed_tokens Parameter object stays shared (nn.Module.to replaces
-    # .data in place), so the weight is stored once.
+    # proj_out/embed_tokens Parameter object stays shared (nn.Module.to replaces
+    # .data in place), so the weight is stored once. HQQLinear is skipped: it
+    # overrides .float()/.to(dtype) as a no-op and must keep its packed uint8
+    # weight and fp32 scale/zero.
     for module in model.modules():
         if not isinstance(module, HQQLinear):
             module.to(STORE_DTYPE)
@@ -120,7 +153,7 @@ def quantize_whisper(model_id, save_dir, nbits=4, group_size=64, device="cpu"):
     os.makedirs(save_dir, exist_ok=True)
     AutoHQQHFModel.save_quantized(model, save_dir)
     AutoProcessor.from_pretrained(model_id).save_pretrained(save_dir)
-    return patched
+    return {"default": n_default, "protected": n_protected}
 
 
 def load_whisper_hqq(model_id_or_dir, device="cpu"):

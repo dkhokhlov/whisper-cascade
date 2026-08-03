@@ -2,10 +2,10 @@
 """Quantize a Whisper model with HQQ 4-bit grouped quantization and save it.
 
 The script loads the source model, replaces its linear layers with HQQ
-4-bit weights (group_size=64), keeps the tied proj_out head in fp16, stores the
-non-quantized modules in fp16, and writes the result to HQQ_OUT. The output
-dir holds config.json, qmodel.pt, and the processor files, so it is
-self-contained for AutoProcessor.from_pretrained and the hqq loader.
+4-bit weights (group_size=32, axis=1), keeps the tied proj_out head in fp16,
+stores the non-quantized modules in fp16, and writes the result to HQQ_OUT.
+The output dir holds config.json, qmodel.pt, and the processor files, so it
+is self-contained for AutoProcessor.from_pretrained and the hqq loader.
 
 Set PUSH=1 to upload HQQ_OUT to the Hugging Face Hub repo HQQ_REPO (default
 dkhokhlov/whisper-tiny-hqq-4bit). The upload needs a Hugging Face token with
@@ -27,7 +27,19 @@ import hqq_asr
 MODEL_ASR = os.environ.get("MODEL_ASR", "openai/whisper-tiny")
 HQQ_OUT = os.environ.get("HQQ_OUT", "whisper-tiny-hqq-4bit")
 HQQ_NBITS = int(os.environ.get("HQQ_NBITS", "4"))
-HQQ_GROUP = int(os.environ.get("HQQ_GROUP", "64"))
+HQQ_GROUP = int(os.environ.get("HQQ_GROUP", "32"))
+# axis=1 groups along the input/reduction dim and measures better than axis=0
+# on whisper-tiny (0.1622 vs 0.2032 WER on fleurs en_us); axis=0 targets
+# GPU-optimized inference kernels.
+HQQ_AXIS = int(os.environ.get("HQQ_AXIS", "1"))
+# Fragile linears kept at a higher bit width. HQQ_PROTECT is a comma-separated
+# list of name substrings; default keeps the whole encoder stack and fc1 (the
+# GELU up-projection) at 8-bit. Measured best on fleurs en_us (WER matches the
+# fp32 baseline at ~61% size reduction).
+HQQ_PROTECT_NBITS = int(os.environ.get("HQQ_PROTECT_NBITS", "8"))
+HQQ_PROTECT = tuple(
+    p.strip() for p in os.environ.get("HQQ_PROTECT", "encoder.layers,fc1").split(",") if p.strip()
+)
 PUSH = os.environ.get("PUSH", "").strip() not in ("", "0", "false")
 HQQ_REPO = os.environ.get("HQQ_REPO", "dkhokhlov/whisper-tiny-hqq-4bit")
 
@@ -38,7 +50,8 @@ HQQ 4-bit grouped quantization of `openai/whisper-tiny` for CPU inference.
 ## Quantization
 
 - Method: HQQ (Half-Quadratic Quantization), no calibration data.
-- Linear layers: nbits=4, group_size=64 (axis=1 default).
+- Linear layers: nbits=4, group_size=32, axis=1 (group along input dim; measured best on whisper-tiny).
+- Fragile linears (whole encoder stack + fc1): kept at 8-bit.
 - proj_out (the lm_head): kept tied to the embedding in fp16 (not quantized).
   It shares the weight with the decoder embed_tokens, so quantizing it would
   store the weight twice and add error to the vocab projection.
@@ -72,11 +85,14 @@ def dir_size(path):
 def main() -> int:
     print(
         f"quantizing {MODEL_ASR} -> {HQQ_OUT} "
-        f"(nbits={HQQ_NBITS}, group_size={HQQ_GROUP})",
+        f"(nbits={HQQ_NBITS}, group_size={HQQ_GROUP}, axis={HQQ_AXIS}, "
+        f"protect={HQQ_PROTECT}@{HQQ_PROTECT_NBITS}bit)",
         file=sys.stderr,
     )
-    patched = hqq_asr.quantize_whisper(
-        MODEL_ASR, HQQ_OUT, nbits=HQQ_NBITS, group_size=HQQ_GROUP, device="cpu",
+    counts = hqq_asr.quantize_whisper(
+        MODEL_ASR, HQQ_OUT, nbits=HQQ_NBITS, group_size=HQQ_GROUP, axis=HQQ_AXIS,
+        protect_nbits=HQQ_PROTECT_NBITS if HQQ_PROTECT else None,
+        protect_patterns=HQQ_PROTECT, device="cpu",
     )
 
     # Use the quantization report as the model card when it exists (it has the
@@ -96,7 +112,11 @@ def main() -> int:
         "out_dir": HQQ_OUT,
         "nbits": HQQ_NBITS,
         "group_size": HQQ_GROUP,
-        "patched_linears": patched,
+        "axis": HQQ_AXIS,
+        "protect_patterns": list(HQQ_PROTECT),
+        "protect_nbits": HQQ_PROTECT_NBITS if HQQ_PROTECT else None,
+        "linears_default_bit": counts["default"],
+        "linears_protected_bit": counts["protected"],
         "size_bytes": size,
         "size_mb": round(size / 1e6, 2),
         "files": sorted(os.listdir(HQQ_OUT)),
