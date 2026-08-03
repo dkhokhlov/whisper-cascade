@@ -19,3 +19,14 @@ hf_cache/
 *.wav
 # Pipeline tee artifact (README Pipeline example writes ./out.txt)
 out.txt
+
+# Local HQQ quantized model output (published to Hugging Face, not in git)
+whisper-tiny-hqq-4bit/
+# Hugging Face cache dirs downloaded into the repo root
+models--*/
+# Eval run logs and intermediate local result (canonical results are
+# eval_baseline.json / eval_hqq.json, committed as evidence)
+eval_*.log
+eval_hqq_local.json
+# Misc lock dirs created during HF downloads
+.locks/

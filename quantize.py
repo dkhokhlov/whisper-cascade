@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Quantize a Whisper model with HQQ 4-bit grouped quantization and save it.
+
+The script loads the source model, replaces its linear layers with HQQ
+4-bit weights (group_size=64), keeps the tied proj_out head in fp16, stores the
+non-quantized modules in fp16, and writes the result to HQQ_OUT. The output
+dir holds config.json, qmodel.pt, and the processor files, so it is
+self-contained for AutoProcessor.from_pretrained and the hqq loader.
+
+Set PUSH=1 to upload HQQ_OUT to the Hugging Face Hub repo HQQ_REPO (default
+dkhokhlov/whisper-tiny-hqq-4bit). The upload needs a Hugging Face token with
+write access (HF_TOKEN or huggingface-cli login).
+
+Usage:
+    python quantize.py
+    PUSH=1 HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit python quantize.py
+"""
+
+import json
+import os
+import sys
+
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
+import hqq_asr
+
+MODEL_ASR = os.environ.get("MODEL_ASR", "openai/whisper-tiny")
+HQQ_OUT = os.environ.get("HQQ_OUT", "whisper-tiny-hqq-4bit")
+HQQ_NBITS = int(os.environ.get("HQQ_NBITS", "4"))
+HQQ_GROUP = int(os.environ.get("HQQ_GROUP", "64"))
+PUSH = os.environ.get("PUSH", "").strip() not in ("", "0", "false")
+HQQ_REPO = os.environ.get("HQQ_REPO", "dkhokhlov/whisper-tiny-hqq-4bit")
+
+MODEL_CARD = """# __REPO__
+
+HQQ 4-bit grouped quantization of `openai/whisper-tiny` for CPU inference.
+
+## Quantization
+
+- Method: HQQ (Half-Quadratic Quantization), no calibration data.
+- Linear layers: nbits=4, group_size=64 (axis=1 default).
+- proj_out (the lm_head): kept tied to the embedding in fp16 (not quantized).
+  It shares the weight with the decoder embed_tokens, so quantizing it would
+  store the weight twice and add error to the vocab projection.
+- Non-quantized modules (embedding, convs, layer norms): stored as fp16.
+- Compute dtype: fp32 (fp16 weights are upcast at load time).
+
+## Load
+
+```python
+import hqq_asr
+pipe = hqq_asr.build_pipeline("__REPO__", quant="hqq")
+print(pipe({"array": audio, "sampling_rate": 16000})["text"])
+```
+
+## Results
+
+See the repository README for the WER comparison against the fp32 baseline on
+google/fleurs en_us (test split).
+"""
+
+
+def dir_size(path):
+    """Return the total size in bytes of all files under path."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            total += os.path.getsize(os.path.join(root, f))
+    return total
+
+
+def main() -> int:
+    print(
+        f"quantizing {MODEL_ASR} -> {HQQ_OUT} "
+        f"(nbits={HQQ_NBITS}, group_size={HQQ_GROUP})",
+        file=sys.stderr,
+    )
+    patched = hqq_asr.quantize_whisper(
+        MODEL_ASR, HQQ_OUT, nbits=HQQ_NBITS, group_size=HQQ_GROUP, device="cpu",
+    )
+
+    # Use the quantization report as the model card when it exists (it has the
+    # measured WER results). Otherwise fall back to the minimal card below.
+    card_path = os.path.join(HQQ_OUT, "README.md")
+    if os.path.exists("hqq_report.md"):
+        import shutil
+        shutil.copyfile("hqq_report.md", card_path)
+    else:
+        with open(card_path, "w", encoding="utf-8") as fh:
+            repo = HQQ_REPO if PUSH else HQQ_OUT
+            fh.write(MODEL_CARD.replace("__REPO__", repo))
+
+    size = dir_size(HQQ_OUT)
+    summary = {
+        "source_model": MODEL_ASR,
+        "out_dir": HQQ_OUT,
+        "nbits": HQQ_NBITS,
+        "group_size": HQQ_GROUP,
+        "patched_linears": patched,
+        "size_bytes": size,
+        "size_mb": round(size / 1e6, 2),
+        "files": sorted(os.listdir(HQQ_OUT)),
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+    if PUSH:
+        from huggingface_hub import HfApi
+        tok = os.environ.get("HF_TOKEN_WRITE")
+        if not tok:
+            raise RuntimeError(
+                "HF_TOKEN_WRITE is not set. Source it first: "
+                "set -a; . ~/.api_keys; set +a"
+            )
+        api = HfApi(token=tok)
+        api.create_repo(repo_id=HQQ_REPO, exist_ok=True, private=False)
+        api.upload_folder(folder_path=HQQ_OUT, repo_id=HQQ_REPO, token=tok)
+        sha = api.repo_info(repo_id=HQQ_REPO).sha
+        # Print the HF revision sha so the code-repo commit can reference it
+        # (every upload is tagged with its HF hash).
+        print(f"pushed {HQQ_OUT} -> {HQQ_REPO} @ {sha}", file=sys.stderr)
+        summary["hf_repo"] = HQQ_REPO
+        summary["hf_sha"] = sha
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

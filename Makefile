@@ -19,8 +19,17 @@ MODEL_TRANSLATE ?= Helsinki-NLP/opus-mt-mul-en
 TARGET_LANG ?= en
 # TTS model (VITS; default English MMS).
 MODEL_TTS ?= facebook/mms-tts-eng
+# Optional HQQ 4-bit quantization mode for ASR. Set QUANT=hqq to load MODEL_ASR
+# as a saved HQQ model (local dir or HF repo). Default: fp32.
+export QUANT
+# HQQ quantization output dir, HF repo, and group_size (make quantize / push).
+HQQ_OUT ?= whisper-tiny-hqq-4bit
+HQQ_REPO ?= dkhokhlov/whisper-tiny-hqq-4bit
+HQQ_GROUP ?= 64
+# WER eval subset size on google/fleurs en_us (make eval-baseline / eval-hqq).
+EVAL_LIMIT ?= 100
 
-.PHONY: help info venv samples asr en tts test test-integration clean clean-all
+.PHONY: help info venv samples asr en tts quantize push eval-baseline eval-hqq test test-integration clean clean-all
 
 help: ## Show available targets
 	@echo "whisper-cascade v$(VERSION)"
@@ -35,6 +44,11 @@ help: ## Show available targets
 	@printf '  %-52s %s\n' "make asr AUDIO='*.flac'" 'a glob'
 	@printf '  %-52s %s\n' 'make en TEXT="Hola"' 'translate text to English'
 	@printf '  %-52s %s\n' 'make tts TEXT="Hello"' 'synthesize speech to tts.wav'
+	@printf '  %-52s %s\n' 'make asr QUANT=hqq MODEL_ASR=dkhokhlov/whisper-tiny-hqq-4bit' 'HQQ 4-bit ASR from HF'
+	@printf '  %-52s %s\n' 'make quantize' 'quantize whisper-tiny -> HQQ_OUT (local)'
+	@printf '  %-52s %s\n' 'make push' 'quantize + upload to HQQ_REPO (needs HF_TOKEN_WRITE)'
+	@printf '  %-52s %s\n' 'make eval-baseline' 'WER of fp32 MODEL_ASR on fleurs en_us'
+	@printf '  %-52s %s\n' 'make eval-hqq' 'WER of HQQ MODEL_ASR on fleurs en_us'
 	@printf '  %-52s %s\n' 'make test' 'fast unit tests'
 	@echo ""
 	@echo "Pipeline (foreign speech -> English speech; each stage prints JSON, jq extracts text):"
@@ -44,6 +58,7 @@ help: ## Show available targets
 
 info: ## Show current config and status
 	@echo "MODEL_ASR         $(MODEL_ASR)"
+	@echo "QUANT             $${QUANT:-<none (fp32)>}"
 	@echo "MODEL_TRANSLATE   $(MODEL_TRANSLATE)"
 	@echo "MODEL_TTS         $(MODEL_TTS)"
 	@echo "VENV              $(VENV) - $$([ -d $(VENV) ] && echo present || echo missing)"
@@ -66,13 +81,26 @@ samples: ## Warm the HF sample cache for the default set - idempotent, no re-dow
 	@$(PY) -c "from huggingface_hub import hf_hub_download; [hf_hub_download('Narsil/asr_dummy', f, repo_type='dataset') for f in ('mlk.flac','4.flac','hindi.ogg')]" && echo "samples cache warm"
 
 asr: $(VENV)/.stamp ## Run the ASR test: transcribe the default multilingual samples (en+es+hi)
-	@MODEL_ASR=$(MODEL_ASR) $(PY) transcribe.py
+	@MODEL_ASR=$(MODEL_ASR) QUANT=$(QUANT) $(PY) transcribe.py
 
 en: $(VENV)/.stamp ## Translate text to English (stdin/TEXT=; JSON to stdout, jq -r .text for make tts)
 	@TARGET_LANG=$(TARGET_LANG) MODEL_TRANSLATE=$(MODEL_TRANSLATE) $(PY) translate.py
 
 tts: $(VENV)/.stamp ## Synthesize speech from text (stdin/TEXT=; writes tts.wav, OUTPUT= to override)
 	@MODEL_TTS=$(MODEL_TTS) $(PY) tts.py
+
+quantize: $(VENV)/.stamp ## Quantize MODEL_ASR with HQQ 4-bit -> HQQ_OUT (local dir)
+	@MODEL_ASR=$(MODEL_ASR) HQQ_OUT=$(HQQ_OUT) HQQ_GROUP=$(HQQ_GROUP) $(PY) quantize.py
+
+push: $(VENV)/.stamp ## Quantize and upload HQQ_OUT to HQQ_REPO (needs HF_TOKEN_WRITE from ~/.api_keys)
+	@set -a; . ~/.api_keys 2>/dev/null; set +a; \
+	 MODEL_ASR=$(MODEL_ASR) HQQ_OUT=$(HQQ_OUT) HQQ_GROUP=$(HQQ_GROUP) HQQ_REPO=$(HQQ_REPO) PUSH=1 $(PY) quantize.py
+
+eval-baseline: $(VENV)/.stamp ## Measure baseline WER (fp32 MODEL_ASR) on fleurs en_us (EVAL_LIMIT)
+	@MODEL_ASR=$(MODEL_ASR) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_baseline.json $(PY) eval_wer.py
+
+eval-hqq: $(VENV)/.stamp ## Measure HQQ WER (QUANT=hqq MODEL_ASR=HQQ_REPO) on fleurs en_us (EVAL_LIMIT)
+	@QUANT=hqq MODEL_ASR=$(HQQ_REPO) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_hqq.json $(PY) eval_wer.py
 
 test: $(VENV)/.stamp ## Run the fast unit tests (no model load, no network)
 	@$(PY) -m pytest
