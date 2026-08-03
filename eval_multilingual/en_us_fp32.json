@@ -1,15 +1,15 @@
 {
-  "model": "dkhokhlov/whisper-tiny-hqq-4bit",
-  "quant": "hqq",
+  "model": "openai/whisper-tiny",
+  "quant": null,
   "dataset": "google/fleurs",
   "config": "en_us",
   "split": "test",
   "n": 100,
   "n_fail": 0,
-  "wer": 0.1367,
+  "wer": 0.1381,
   "total_duration_s": 953.88,
-  "total_elapsed_s": 70.906,
-  "avg_rtf": 0.074,
+  "total_elapsed_s": 48.71,
+  "avg_rtf": 0.051,
   "samples": [
     {
       "ref": "however due to the slow communication channels styles in the west could lag behind by 25 to 30 year",
@@ -21,7 +21,7 @@
     },
     {
       "ref": "to the north and within easy reach is the romantic and fascinating town of sintra and which was made famous to foreigners after a glowing account of its splendours recorded by lord byron",
-      "hyp": "To the north and within easy reach is the romantic and fascinating town of Sinatra in which was made famous to foreigners after a glowing account of its splendrous recorded by Lord Byron."
+      "hyp": "To the north and with an easy reach is a romantic and fascinating town of Sinatra, which was made famous. To foreigners after a glowing account of its splendrous recorded by Lord Byron."
     },
     {
       "ref": "the cabbage juice changes color depending on how acidic or basic alkaline the chemical is",
