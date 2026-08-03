@@ -14,7 +14,7 @@ hf_cache/
 .DS_Store
 .idea/
 # OpenCode codebase index (local, regenerated)
-.codebase-index/
+.opencode/
 # Generated audio output (make tts, pipeline runs)
 *.wav
 # Pipeline tee artifact (README Pipeline example writes ./out.txt)
