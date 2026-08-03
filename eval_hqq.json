@@ -1,0 +1,35 @@
+{
+  "model": "dkhokhlov/whisper-tiny-hqq-4bit",
+  "quant": "hqq",
+  "dataset": "google/fleurs",
+  "config": "en_us",
+  "split": "test",
+  "n": 100,
+  "n_fail": 0,
+  "wer": 0.1622,
+  "total_duration_s": 953.88,
+  "total_elapsed_s": 126.986,
+  "avg_rtf": 0.133,
+  "samples": [
+    {
+      "ref": "however due to the slow communication channels styles in the west could lag behind by 25 to 30 year",
+      "hyp": "However, due to the slow communication channels, the styles in the West could lag behind by 25 to 30 years."
+    },
+    {
+      "ref": "all nouns alongside the word sie for you always begin with a capital letter even in the middle of a sentence",
+      "hyp": "All now is alongside the world's safe for you, always begin with a capital letter, even the middle of a sentence."
+    },
+    {
+      "ref": "to the north and within easy reach is the romantic and fascinating town of sintra and which was made famous to foreigners after a glowing account of its splendours recorded by lord byron",
+      "hyp": "To the north and the east is a romantic and fascinating town of Sinatra, which was made famous to foreigners after a glowing account of the splenters recorded by Lord Byron."
+    },
+    {
+      "ref": "the cabbage juice changes color depending on how acidic or basic alkaline the chemical is",
+      "hyp": "The cabbage juice change is colored depending on how acidic, basic alkaline the chemical is."
+    },
+    {
+      "ref": "many people don't think about them as dinosaurs because they have feathers and can fly",
+      "hyp": "Maybe people don't think about them as an illustrious because they have feathers and can fly."
+    }
+  ]
+}

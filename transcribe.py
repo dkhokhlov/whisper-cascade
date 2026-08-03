@@ -33,15 +33,19 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 logging.getLogger().setLevel(logging.ERROR)
 warnings.filterwarnings("ignore")
 
+import hqq_asr
 import numpy as np
 import soundfile as sf
 import transformers
 from huggingface_hub import hf_hub_download
-from transformers import pipeline
 
 transformers.logging.set_verbosity_error()
 
 MODEL_ASR = os.environ.get("MODEL_ASR", "openai/whisper-tiny")
+# Optional quantization. Set QUANT=hqq to load MODEL_ASR as a saved HQQ 4-bit
+# model (local dir or Hugging Face repo). When unset, the model loads as fp32,
+# or loads an already-quantized model when MODEL_ASR points at one.
+QUANT = os.environ.get("QUANT", "").strip().lower()
 DATASET = "Narsil/asr_dummy"
 # Default multilingual sample set: English, Spanish, Hindi. All are loose files
 # in the dataset and resolve from the HF cache via huggingface_hub.
@@ -145,7 +149,7 @@ def main() -> int:
         print("error: AUDIO matched no files", file=sys.stderr)
         return 1
 
-    pipe = pipeline(task="automatic-speech-recognition", model=MODEL_ASR)
+    pipe = hqq_asr.build_pipeline(MODEL_ASR, QUANT)
 
     results = []
     had_error = False
