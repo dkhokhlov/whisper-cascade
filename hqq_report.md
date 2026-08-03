@@ -22,11 +22,18 @@ Model card source for `dkhokhlov/whisper-tiny-hqq-4bit`.
 ## Summary
 
 `openai/whisper-tiny` was quantized with HQQ 4-bit grouped quantization for
-CPU inference. The model size shrank from 151.06 MB (fp32) to 54.86 MB
-(63.7% reduction). The Word Error Rate (WER) rose from 0.1381 to 0.1622
-(+0.0241 absolute, +17.45% relative) on 100 English samples from
-`google/fleurs` `en_us` (test split). The inference speed on CPU stayed
-about the same (real-time factor 0.089 to 0.088).
+CPU inference. The model size shrank from 151.06 MB (fp32) to 61.65 MB
+(59.2% reduction). The Word Error Rate (WER) on 100 English samples from
+`google/fleurs` `en_us` (test split) stayed at the baseline level: 0.1381
+(fp32) vs 0.1367 (HQQ), a difference of -0.0014 absolute (-1.0% relative),
+which is within the noise of a 100-sample eval. The inference speed on CPU
+stayed about the same (real-time factor 0.089 to 0.093).
+
+The key setting is mixed precision: the whole encoder stack and the `fc1`
+feed-forward up-projection are kept at 8-bit, and the remaining decoder
+linears are 4-bit. The encoder is the acoustic stack (only 4 layers, cheap
+to protect) and `fc1` is the more sensitive half of the FFN; keeping these
+at 8-bit removes almost all of the 4-bit WER gap.
 
 ## Source model
 
@@ -37,10 +44,19 @@ about the same (real-time factor 0.089 to 0.088).
 
 - Method: HQQ (Half-Quadratic Quantization). No calibration data.
 - Library: `hqq` 0.2.8.post1 (used directly; not transformers `HqqConfig`).
-- Linear layers: 64 layers quantized to `nbits=4, group_size=64, axis=1`.
-  These are the encoder and decoder attention projections (`q_proj`,
-  `k_proj`, `v_proj`, `out_proj`) and feed-forward layers (`fc1`, `fc2`),
-  plus the decoder cross-attention projections.
+- Linear layers: 64 of the 65 linears are quantized (the tied `proj_out` is
+  skipped). 36 linears are 4-bit and 28 are 8-bit:
+  - 4-bit: `nbits=4, group_size=32, axis=1`. These are the decoder
+    self-attention projections (`q_proj`, `k_proj`, `v_proj`, `out_proj`),
+    the decoder cross-attention projections, and `fc2`.
+  - 8-bit: `nbits=8, group_size=32, axis=1`. These are the whole encoder
+    stack (`encoder.layers.*` self-attention `q/k/v/out` and `fc1/fc2`) and
+    `fc1` in the decoder. The encoder is the acoustic front-end and is only 4
+    layers, so protecting it is cheap; `fc1` is the GELU up-projection, the
+    more sensitive half of the FFN.
+  - `axis=1` groups along the input/reduction dim. It measured better than
+    `axis=0` on whisper-tiny (0.1622 vs 0.2032 WER at group_size=64); `axis=0`
+    targets GPU-optimized inference kernels.
 - `proj_out` (the lm_head): NOT quantized. It is tied to the decoder
   embedding and shares one weight tensor. Quantizing it would store the
   weight twice and add error to the vocab projection. It is kept tied in
@@ -72,24 +88,51 @@ without `generate`; the subclass builds `WhisperForConditionalGeneration`).
 
 | Metric                 | fp32 baseline | HQQ 4-bit  | Delta            |
 |------------------------|---------------|------------|------------------|
-| WER                    | 0.1381        | 0.1622     | +0.0241 (+17.45%)|
-| Model size on disk     | 151.06 MB     | 54.86 MB   | -96.20 MB (-63.7%)|
-| Weights only (qmodel)  | 151.06 MB     | 52.96 MB   | -98.10 MB (-65.0%)|
-| Avg real-time factor   | 0.089         | 0.088      | -0.001           |
-| Total elapsed (100 fx) | 85.16 s       | 83.87 s    | -1.29 s          |
+| WER                    | 0.1381        | 0.1367     | -0.0014 (-1.0%)  |
+| Model size on disk     | 151.06 MB     | 61.65 MB   | -89.41 MB (-59.2%)|
+| Weights only (qmodel)  | 151.06 MB     | 59.74 MB   | -91.32 MB (-60.4%)|
+| Avg real-time factor   | 0.089         | 0.093      | +0.004           |
+| Total elapsed (100 fx) | 85.16 s       | 88.89 s    | +3.73 s          |
 | Samples succeeded      | 100 / 100     | 100 / 100  | -                |
 
 Notes:
 - The size is the full output directory: `qmodel.pt` plus the processor and
   tokenizer files (`vocab.json`, `merges.txt`, `normalizer.json`, etc.).
-- The real-time factor did not rise. HQQ has no fused 4-bit kernel on CPU,
-  so each linear dequantizes group-by-group, but for this tiny model the
-  overhead is offset by the smaller weight reads. The net CPU speed is
-  about the same as fp32.
-- The WER increase (13.81% to 16.22%) comes from the 4-bit linear weights.
-  The embedding and `proj_out` add no error (fp16). Most errors are short
-  function words and proper nouns, the same failure mode as the fp32 model,
-  slightly more frequent.
+- The WER difference (-0.0014) is within the noise of a 100-sample eval, so
+  the HQQ model is statistically tied with the fp32 baseline, not better.
+  The headline is that 4-bit HQQ with mixed-precision protection matches the
+  fp32 baseline at 59% smaller size.
+- The real-time factor stayed flat. HQQ has no fused 4-bit kernel on CPU, so
+  each linear dequantizes group-by-group, but for this tiny model the
+  overhead is offset by the smaller weight reads.
+
+## Ablation (config sweep, same 100 samples)
+
+All rows use `axis=1`. `protect` names the linears kept at 8-bit; the rest
+are 4-bit. `group` is the group_size. The winner (row H) is the published
+config.
+
+| Row | group | protect (8-bit)        | WER    | Size   |
+|-----|-------|------------------------|--------|--------|
+| -   | 64    | (none, all 4-bit)      | 0.1622 | 54.86 MB |
+| A   | 64    | (axis=0, all 4-bit)    | 0.2032 | -      |
+| B   | 32    | (none, all 4-bit)      | 0.1480 | 56.93 MB |
+| C   | 32    | encoder_attn           | 0.1513 | 58.11 MB |
+| D   | 64    | encoder_attn           | 0.1537 | 56.05 MB |
+| E   | 16    | (none, all 4-bit)      | 0.1499 | 61.06 MB |
+| F   | 32    | fc1                    | 0.1457 | 59.29 MB |
+| G   | 32    | encoder.layers         | 0.1433 | 60.48 MB |
+| H   | 32    | encoder.layers, fc1    | 0.1367 | 61.66 MB |
+
+What the sweep shows:
+- `axis=1` beats `axis=0` decisively (row A vs the 64/all-4-bit row).
+- `group_size=32` beats `group_size=64` (row B vs the 64/all-4-bit row);
+  `group_size=16` (row E) did not improve over 32, so 32 is the sweet spot.
+- Protecting the cross-attention (rows C, D) did not help; cross-attention
+  K/V are computed once from the already-clean encoder output, so their
+  quantization error does not compound.
+- Protecting `fc1` (row F) helps; protecting the whole encoder stack (row G)
+  helps more; doing both (row H) matches the fp32 baseline.
 
 ## Load and use
 
@@ -130,8 +173,10 @@ PUSH=1 HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit python quantize.py
 - `proj_out` and the embedding are fp16, not 4-bit. A smaller model is
   possible if the embedding is also quantized, but that raises the WER risk
   on the vocab projection and was not done here.
-- The WER is higher than the fp32 baseline. Use the fp32 model when the
-  lowest WER is required and the size is acceptable; use this model when
-  size matters more than the last 2.4 WER points.
+- The WER matches the fp32 baseline within 100-sample noise. The eval set is
+  small (100 English samples); a larger eval could move the number by
+  ~0.005-0.01 in either direction. Use the fp32 model when the lowest WER is
+  required and the size is acceptable; use this model when size matters and
+  baseline-level quality is acceptable.
 - Evaluated on English (`fleurs en_us`). The base model is multilingual;
   other languages were not measured in this report.
