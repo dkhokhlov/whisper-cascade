@@ -42,6 +42,13 @@ HQQ_PROTECT = tuple(
 )
 PUSH = os.environ.get("PUSH", "").strip() not in ("", "0", "false")
 HQQ_REPO = os.environ.get("HQQ_REPO", "dkhokhlov/whisper-tiny-hqq-4bit")
+# Multilingual generation config (default on): clear the English
+# forced_decoder_ids baked into the source config and write a modern
+# generation_config.json so the model auto-detects the language and
+# transcribes. The English-forced config (v1.3.1) is preserved at git tag
+# v1.3.1 / HF revision e43f2bb; English WER is identical under auto-detect.
+# Set HQQ_MULTILINGUAL=0 to reproduce the legacy English-forced config.
+HQQ_MULTILINGUAL = os.environ.get("HQQ_MULTILINGUAL", "1").strip() not in ("", "0", "false")
 
 MODEL_CARD = """# __REPO__
 
@@ -86,13 +93,14 @@ def main() -> int:
     print(
         f"quantizing {MODEL_ASR} -> {HQQ_OUT} "
         f"(nbits={HQQ_NBITS}, group_size={HQQ_GROUP}, axis={HQQ_AXIS}, "
-        f"protect={HQQ_PROTECT}@{HQQ_PROTECT_NBITS}bit)",
+        f"protect={HQQ_PROTECT}@{HQQ_PROTECT_NBITS}bit, "
+        f"multilingual={HQQ_MULTILINGUAL})",
         file=sys.stderr,
     )
     counts = hqq_asr.quantize_whisper(
         MODEL_ASR, HQQ_OUT, nbits=HQQ_NBITS, group_size=HQQ_GROUP, axis=HQQ_AXIS,
         protect_nbits=HQQ_PROTECT_NBITS if HQQ_PROTECT else None,
-        protect_patterns=HQQ_PROTECT, device="cpu",
+        protect_patterns=HQQ_PROTECT, multilingual=HQQ_MULTILINGUAL, device="cpu",
     )
 
     # Use the quantization report as the model card when it exists (it has the
@@ -113,6 +121,7 @@ def main() -> int:
         "nbits": HQQ_NBITS,
         "group_size": HQQ_GROUP,
         "axis": HQQ_AXIS,
+        "multilingual": HQQ_MULTILINGUAL,
         "protect_patterns": list(HQQ_PROTECT),
         "protect_nbits": HQQ_PROTECT_NBITS if HQQ_PROTECT else None,
         "linears_default_bit": counts["default"],

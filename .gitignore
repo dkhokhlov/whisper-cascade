@@ -30,5 +30,7 @@ models--*/
 # eval_baseline.json / eval_hqq.json, committed as evidence)
 eval_*.log
 eval_hqq_local.json
+# Per-language multilingual eval logs (the .json results are committed)
+eval_multilingual/*.log
 # Misc lock dirs created during HF downloads
 .locks/

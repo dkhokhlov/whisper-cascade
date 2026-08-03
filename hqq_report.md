@@ -35,6 +35,20 @@ linears are 4-bit. The encoder is the acoustic stack (only 4 layers, cheap
 to protect) and `fc1` is the more sensitive half of the FFN; keeping these
 at 8-bit removes almost all of the 4-bit WER gap.
 
+The same weights are evaluated across five languages below. The quantization
+config was tuned on English; it matches the fp32 baseline on English and
+German, is within noise on French, and degrades on Spanish and Hindi (the
+base model is itself weak on the latter two).
+
+Generation config: this revision (v1.3.2) clears the English `forced_decoder_ids`
+that the source `config.json` ships with and writes a modern
+`generation_config.json`, so the model auto-detects the language and
+transcribes (the standard multilingual Whisper behavior). The earlier
+v1.3.1 revision kept the English-forced config; its weights are byte-identical
+to this revision (`qmodel.pt` sha256 `0e183ee00b1cdd71`), and English WER is
+identical under either config. v1.3.1 is preserved at git tag `v1.3.1` / HF
+revision `e43f2bb`.
+
 ## Source model
 
 - Base: `openai/whisper-tiny` (multilingual).
@@ -78,13 +92,16 @@ without `generate`; the subclass builds `WhisperForConditionalGeneration`).
 
 ## Evaluation
 
-- Dataset: `google/fleurs`, config `en_us`, split `test`.
-- Samples: 100 (the first 100 of the test split, streamed).
+- Dataset: `google/fleurs`, split `test`.
+- Configs: `en_us`, `es_419` (Spanish), `fr_fr` (French), `de_de` (German),
+  `hi_in` (Hindi).
+- Samples: 100 per config (the first 100 of the test split, streamed).
 - Metric: WER via `jiwer`. Both reference and hypothesis are normalized
   (lowercase, remove punctuation, collapse spaces) before alignment.
-- Hardware: CPU only. Same 100 samples for both runs.
+- Hardware: CPU only. The fp32 baseline and the HQQ model run the same 100
+  samples per config, both with auto-detected language and `task=transcribe`.
 
-## Results
+## Results (English, en_us)
 
 | Metric                 | fp32 baseline | HQQ 4-bit  | Delta            |
 |------------------------|---------------|------------|------------------|
@@ -105,6 +122,30 @@ Notes:
 - The real-time factor stayed flat. HQQ has no fused 4-bit kernel on CPU, so
   each linear dequantizes group-by-group, but for this tiny model the
   overhead is offset by the smaller weight reads.
+
+## Results (multilingual, n=100 per language)
+
+The same HQQ weights (`qmodel.pt` sha256 `0e183ee00b1cdd71`) evaluated across
+five `fleurs` configs, fp32 vs HQQ, both with auto-detected language.
+
+| Language | Config | fp32 WER | HQQ WER | Delta abs   | Delta rel |
+|----------|--------|----------|---------|-------------|-----------|
+| English  | en_us  | 0.1381   | 0.1367  | -0.0014     | -1.0%     |
+| German   | de_de  | 0.3019   | 0.2946  | -0.0073     | -2.4%     |
+| French   | fr_fr  | 0.5156   | 0.5276  | +0.0120     | +2.3%     |
+| Spanish  | es_419 | 0.1899   | 0.4235  | +0.2336     | +123.0%   |
+| Hindi    | hi_in  | 1.7599   | 2.4145  | +0.6546     | +37.2%    |
+
+Notes:
+- The quantization config was tuned on English. It matches the fp32 baseline
+  on English and German and is within noise on French. Spanish and Hindi
+  degrade; the base model is itself weak on French and Hindi (fp32 WER 0.52
+  and 1.76), and the 4-bit decoder amplifies that on Spanish.
+- A WER above 1.0 (Hindi) means more edit operations than reference words;
+  `whisper-tiny` is not usable for Hindi at either precision. This is a
+  property of the base model, not of the quantization.
+- Per-language evidence is committed under `eval_multilingual/` in the
+  benchmark repository (see "Benchmarked with" below).
 
 ## Ablation (config sweep, same 100 samples)
 
@@ -136,10 +177,15 @@ What the sweep shows:
 
 ## Load and use
 
+The model auto-detects the spoken language and transcribes (multilingual
+Whisper behavior). Pass `language` to force a language when it is known.
+
 ```python
 import hqq_asr
 pipe = hqq_asr.build_pipeline("dkhokhlov/whisper-tiny-hqq-4bit", quant="hqq")
-text = pipe({"array": audio, "sampling_rate": 16000})["text"]
+text = pipe({"array": audio, "sampling_rate": 16000})["text"]                       # auto-detect
+text = pipe({"array": audio, "sampling_rate": 16000},
+             generate_kwargs={"language": "spanish", "task": "transcribe"})["text"]   # force
 ```
 
 Command line (this repository):
@@ -154,17 +200,25 @@ make asr MODEL_ASR=dkhokhlov/whisper-tiny-hqq-4bit QUANT=hqq AUDIO=clip.wav
 # 1. Quantize locally (writes whisper-tiny-hqq-4bit/).
 python quantize.py
 
-# 2. Measure baseline WER (fp32).
-EVAL_LIMIT=100 MODEL_ASR=openai/whisper-tiny EVAL_OUT=eval_baseline.json \
-  python eval_wer.py
+# 2. Measure baseline WER (fp32) per language.
+EVAL_LIMIT=100 MODEL_ASR=openai/whisper-tiny EVAL_CONFIG=en_us \
+  EVAL_OUT=eval_baseline.json python eval_wer.py
 
-# 3. Measure HQQ WER.
-EVAL_LIMIT=100 QUANT=hqq MODEL_ASR=./whisper-tiny-hqq-4bit \
+# 3. Measure HQQ WER per language.
+EVAL_LIMIT=100 QUANT=hqq MODEL_ASR=./whisper-tiny-hqq-4bit EVAL_CONFIG=en_us \
   EVAL_OUT=eval_hqq.json python eval_wer.py
 
 # 4. Publish (needs a Hugging Face write token).
 PUSH=1 HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit python quantize.py
 ```
+
+## Benchmarked with
+
+The quantization, eval harness, and per-language WER evidence live in the
+benchmark repository: [dkhokhlov/whisper-cascade](https://github.com/dkhokhlov/whisper-cascade)
+(branch `hqq-4bit`, tag `v1.3.2`). Per-language results are committed under
+`eval_multilingual/`; the English evidence is `eval_baseline.json` and
+`eval_hqq.json`.
 
 ## Limitations
 
@@ -173,10 +227,10 @@ PUSH=1 HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit python quantize.py
 - `proj_out` and the embedding are fp16, not 4-bit. A smaller model is
   possible if the embedding is also quantized, but that raises the WER risk
   on the vocab projection and was not done here.
-- The WER matches the fp32 baseline within 100-sample noise. The eval set is
-  small (100 English samples); a larger eval could move the number by
-  ~0.005-0.01 in either direction. Use the fp32 model when the lowest WER is
-  required and the size is acceptable; use this model when size matters and
-  baseline-level quality is acceptable.
-- Evaluated on English (`fleurs en_us`). The base model is multilingual;
-  other languages were not measured in this report.
+- The quantization config was tuned on English. English and German match the
+  fp32 baseline within 100-sample noise; French is within noise; Spanish and
+  Hindi degrade (see the multilingual table). Use the fp32 model when the
+  lowest WER is required on a language this model degrades on, and the size
+  is acceptable.
+- Evaluated on five `fleurs` configs (en, es, fr, de, hi), 100 samples each.
+  The base model is multilingual; other languages were not measured.

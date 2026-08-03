@@ -34,6 +34,8 @@ HQQ_PROTECT ?= encoder.layers,fc1
 HQQ_PROTECT_NBITS ?= 8
 # WER eval subset size on google/fleurs en_us (make eval-baseline / eval-hqq).
 EVAL_LIMIT ?= 100
+# WER eval fleurs config / language code (make eval-baseline / eval-hqq).
+EVAL_CONFIG ?= en_us
 
 .PHONY: help info venv samples asr en tts quantize push eval-baseline eval-hqq test test-integration clean clean-all
 
@@ -53,8 +55,8 @@ help: ## Show available targets
 	@printf '  %-52s %s\n' 'make asr QUANT=hqq MODEL_ASR=dkhokhlov/whisper-tiny-hqq-4bit' 'HQQ 4-bit ASR from HF'
 	@printf '  %-52s %s\n' 'make quantize' 'quantize whisper-tiny -> HQQ_OUT (local)'
 	@printf '  %-52s %s\n' 'make push' 'quantize + upload to HQQ_REPO (needs HF_TOKEN_WRITE)'
-	@printf '  %-52s %s\n' 'make eval-baseline' 'WER of fp32 MODEL_ASR on fleurs en_us'
-	@printf '  %-52s %s\n' 'make eval-hqq' 'WER of HQQ MODEL_ASR on fleurs en_us'
+	@printf '  %-52s %s\n' 'make eval-baseline EVAL_CONFIG=en_us' 'WER of fp32 MODEL_ASR on a fleurs config'
+	@printf '  %-52s %s\n' 'make eval-hqq EVAL_CONFIG=es_419' 'WER of HQQ MODEL_ASR on a fleurs config'
 	@printf '  %-52s %s\n' 'make test' 'fast unit tests'
 	@echo ""
 	@echo "Pipeline (foreign speech -> English speech; each stage prints JSON, jq extracts text):"
@@ -105,10 +107,10 @@ push: $(VENV)/.stamp ## Quantize and upload HQQ_OUT to HQQ_REPO (needs HF_TOKEN_
 	 HQQ_PROTECT=$(HQQ_PROTECT) HQQ_PROTECT_NBITS=$(HQQ_PROTECT_NBITS) HQQ_REPO=$(HQQ_REPO) PUSH=1 $(PY) quantize.py
 
 eval-baseline: $(VENV)/.stamp ## Measure baseline WER (fp32 MODEL_ASR) on fleurs en_us (EVAL_LIMIT)
-	@MODEL_ASR=$(MODEL_ASR) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_baseline.json $(PY) eval_wer.py
+	@MODEL_ASR=$(MODEL_ASR) EVAL_CONFIG=$(EVAL_CONFIG) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_baseline.json $(PY) eval_wer.py
 
-eval-hqq: $(VENV)/.stamp ## Measure HQQ WER (QUANT=hqq MODEL_ASR=HQQ_REPO) on fleurs en_us (EVAL_LIMIT)
-	@QUANT=hqq MODEL_ASR=$(HQQ_REPO) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_hqq.json $(PY) eval_wer.py
+eval-hqq: $(VENV)/.stamp ## Measure HQQ WER on a fleurs config (EVAL_CONFIG, default en_us; QUANT=hqq MODEL_ASR=HQQ_REPO)
+	@QUANT=hqq MODEL_ASR=$(HQQ_REPO) EVAL_CONFIG=$(EVAL_CONFIG) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_hqq.json $(PY) eval_wer.py
 
 test: $(VENV)/.stamp ## Run the fast unit tests (no model load, no network)
 	@$(PY) -m pytest

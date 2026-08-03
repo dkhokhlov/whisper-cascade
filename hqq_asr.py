@@ -107,6 +107,7 @@ def quantize_whisper(
     axis=1,
     protect_nbits=None,
     protect_patterns=(),
+    multilingual=True,
     device="cpu",
 ):
     """Quantize a Whisper model with HQQ and save it to save_dir.
@@ -120,6 +121,14 @@ def quantize_whisper(
     on whisper-tiny (0.1622 vs 0.2032 WER on fleurs en_us); axis=0 is meant for
     GPU-optimized inference. protect_nbits/protect_patterns keep fragile linears
     (e.g. fc1, the encoder stack) at a higher bit width.
+
+    multilingual: whisper-tiny's config.json ships with forced_decoder_ids that
+    hardcode the output language to English (the English track). When True,
+    clear those before saving and write a modern generation_config.json (with
+    lang_to_id/task_to_id/is_multilingual) so the model auto-detects the
+    language and transcribes, and accepts language=/task= overrides. This is
+    the multilingual flavor; it is published under a separate name so the
+    English track is preserved.
     """
     default_cfg = BaseQuantizeConfig(nbits=nbits, group_size=group_size, axis=axis)
     protected_cfg = None
@@ -141,6 +150,13 @@ def quantize_whisper(
     model.hqq_quantized = True
     model.base_class = AutoHQQHFModel
 
+    # Multilingual flavor: drop the English forced_decoder_ids baked into the
+    # source config so the saved config.json does not hardcode the output
+    # language. The modern generation_config.json written below drives
+    # auto-detect + transcribe at load time.
+    if multilingual:
+        model.config.forced_decoder_ids = None
+
     # Compact storage: cast the non-quantized float modules to fp16. The tied
     # proj_out/embed_tokens Parameter object stays shared (nn.Module.to replaces
     # .data in place), so the weight is stored once. HQQLinear is skipped: it
@@ -153,14 +169,39 @@ def quantize_whisper(
     os.makedirs(save_dir, exist_ok=True)
     AutoHQQHFModel.save_quantized(model, save_dir)
     AutoProcessor.from_pretrained(model_id).save_pretrained(save_dir)
+    if multilingual:
+        from transformers import GenerationConfig
+        gc = GenerationConfig.from_pretrained(model_id)
+        gc.forced_decoder_ids = None
+        gc.language = None
+        gc.task = "transcribe"
+        gc.save_pretrained(save_dir)
     return {"default": n_default, "protected": n_protected}
 
 
 def load_whisper_hqq(model_id_or_dir, device="cpu"):
-    """Load a saved HQQ Whisper model on CPU and return it."""
-    return WhisperHQQModel.from_quantized(
+    """Load a saved HQQ Whisper model on CPU and return it.
+
+    If the model ships a modern generation_config.json (the multilingual
+    flavor), adopt it: it carries lang_to_id/task_to_id/is_multilingual so the
+    model auto-detects the language and transcribes, and language=/task=
+    overrides are accepted. Without it (the English track) the model keeps the
+    forced_decoder_ids built from config.json (English) so that track is
+    preserved unchanged.
+    """
+    model = WhisperHQQModel.from_quantized(
         model_id_or_dir, compute_dtype=COMPUTE_DTYPE, device=device,
     )
+    try:
+        from transformers import GenerationConfig
+        gc = GenerationConfig.from_pretrained(model_id_or_dir)
+        # Only adopt the modern multilingual form; the English track's
+        # config.json-based config has no lang_to_id, so it is left as-is.
+        if getattr(gc, "lang_to_id", None):
+            model.generation_config = gc
+    except Exception:
+        pass
+    return model
 
 
 def build_pipeline(model_id, quant, device="cpu"):
