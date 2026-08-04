@@ -49,15 +49,23 @@ the TTS step uses a VITS model
 ([`facebook/mms-tts-eng`](https://huggingface.co/facebook/mms-tts-eng)) — all
 through the Hugging Face `transformers` library.
 
-Per-model runtime weights (single weights file loaded):
+Per-model runtime weights (resident weight RAM: the weight memory a host
+holds at run time; for the fp32 models this equals the weights file size):
 
-| Model | Decoder type | Stored dtype | Loaded as | Loaded file | Size |
+| Model | Decoder type | Stored dtype | Loaded as | Loaded file | Resident RAM |
 |---|---|---|---|---|---|
 | [`openai/whisper-tiny`](https://huggingface.co/openai/whisper-tiny) | autoregressive (enc-dec) | float32 | float32 | `model.safetensors` | 151.06 MB |
+| [`dkhokhlov/whisper-tiny-hqq-4bit`](https://huggingface.co/dkhokhlov/whisper-tiny-hqq-4bit) | autoregressive (enc-dec) | 4-bit HQQ + fp16 | fp16 | `qmodel.pt` | 57.53 MB |
 | [`Helsinki-NLP/opus-mt-mul-en`](https://huggingface.co/Helsinki-NLP/opus-mt-mul-en) | autoregressive (enc-dec) | float32 (default) | float32 | `pytorch_model.bin` (no safetensors) | 310.39 MB |
 | [`facebook/mms-tts-eng`](https://huggingface.co/facebook/mms-tts-eng) | non-autoregressive | float32 | float32 | `model.safetensors` | 145.23 MB |
 
-Combined model weights → ~607 MB (151.06 + 310.39 + 145.23 = 606.68 MB)
+Combined (fp32 ASR cascade) → ~607 MB (151.06 + 310.39 + 145.23 = 606.68 MB)
+Combined (HQQ ASR cascade) → ~513 MB (57.53 + 310.39 + 145.23 = 513.15 MB)
+
+The default cascade loads the fp32 ASR model. Set `QUANT=hqq` to load the
+HQQ 4-bit ASR model instead; the translate and TTS stages are not quantized.
+HQQ 4-bit is also published for `whisper-base` and `whisper-small` (see the
+size analysis below).
 
 No Docker, no ffmpeg, no GPU. Dependencies are managed with [uv](https://docs.astral.sh/uv/).
 The models and the test samples are cached through the Hugging Face cache
@@ -282,6 +290,8 @@ not teed.)
 
 ## Evaluation
 
+### WER
+
 `eval_wer.py` measures the Word Error Rate (WER) of an ASR model on a HF
 audio dataset. It supports two dataset sources (dispatched by `EVAL_DATASET`):
 
@@ -336,35 +346,169 @@ HQQ 4-bit is within 5% relative of fp32 for all three models on every
 config. `whisper-base` beats `whisper-tiny` on every config except Hindi
 (both are not usable); `whisper-small` beats `whisper-base` on every config.
 
-Model size is reported by use. The deployment RAM is the weight memory a
-host holds at run time in the fp16-compute deployment mode (packed 4-bit
-weights, fp16 non-quantized modules). It equals the on-disk `qmodel.pt`
-size because fp16 compute keeps the non-quantized weights in fp16 (no
-upcast). fp16 compute is WER-neutral (measured within n=100 noise), so the
-deployment mode is accuracy-equivalent. The published WER benchmark uses
-fp32 compute; its resident RAM is larger because the non-quantized fp16
-weights upcast to fp32 at load time. The `proj_out` head and the decoder
-embedding are tied (one shared weight), and the loader restores that tie
-after load so the embedding is held once.
-
-| model  | fp32 file | deployment RAM (fp16 compute) | benchmark RAM (fp32 compute) |
-|--------|-----------|-------------------------------|------------------------------|
-| tiny   | 151.06 MB | 59.7 MB (-60.4%)              | 102.1 MB (-32.4%)            |
-| base   | 290.38 MB | 103.0 MB (-64.5%)             | 159.8 MB (-45.0%)            |
-| small  | 966.94 MB | 293.0 MB (-69.7%)             | 379.5 MB (-60.7%)            |
-
-The fp32 file is the `openai/whisper-*` `model.safetensors` size (the
-parameter count multiplied by 4 bytes). The deployment-RAM and
-benchmark-RAM reductions are versus that fp32 baseline. Deployment RAM
-equals the on-disk `qmodel.pt` weight file (59.74 / 102.97 / 292.99 MB);
-the benchmark-RAM reduction is the quantization-only gain, and the gap to
-deployment RAM is the fp16-storage gain (the embedding is most of it).
 Per-eval runtime, the relative Delta % columns, and the full quantization
 reports are in [`hqq_report.md`](hqq_report.md) (the `whisper-tiny` card),
 [`hqq_report_base.md`](hqq_report_base.md) (the `whisper-base` card), and
 [`hqq_report_small.md`](hqq_report_small.md) (the `whisper-small` card).
 Evidence JSONs are committed under `eval_multilingual/` and `eval_telephone/`
 (base files are prefixed `base_`, small files are prefixed `small_`).
+
+### Size
+
+Model size is resident weight RAM: the weight memory a host holds at run
+time. Both the unquantized original and the HQQ 4-bit model are measured
+in fp16 storage + fp16 compute (the deployment mode). fp16 compute is
+WER-neutral (measured within n=100 noise), so the deployment mode matches
+the published WER. The unquantized original is `openai/whisper-*` (fp32 on
+Hugging Face) loaded as fp16 (`torch_dtype=fp16`); whisper is trained in
+fp16, so this is near-lossless. The `proj_out` head and the decoder
+embedding are tied (one shared weight), held once.
+
+| model  | unquantized fp16 | HQQ 4-bit fp16 | reduction vs fp16 original |
+|--------|------------------|----------------|----------------------------|
+| tiny   | 75.52 MB         | 57.53 MB       | -23.8%                     |
+| base   | 145.19 MB        | 97.22 MB       | -33.0%                     |
+| small  | 483.47 MB        | 267.59 MB      | -44.6%                     |
+
+HQQ 4-bit quantizes only the linear weights (packed uint8 `W_q` plus a
+per-group scale and zero, both fp16 in RAM). The embedding, convs, layer
+norms, and positional embedding stay fp16. The embedding is the largest
+resident component and is not quantized, so the quantization gain is
+bounded by the linear-weight share (larger for the deeper small model).
+
+Resident weight RAM by component (HQQ 4-bit, fp16 storage + fp16 compute,
+MB, measured after load, deduplicated by storage pointer so the tied
+embedding counts once):
+
+| Component (dtype in RAM) | tiny | base | small |
+|---|---:|---:|---:|
+| Embedding, tied `embed_tokens`=`proj_out` (fp16) | 39.83 | 53.11 | 79.66 |
+| HQQ packed weights `W_q` (uint8) | 12.98 | 34.60 | 155.71 |
+| HQQ scale (fp16) | 1.03 | 2.75 | 12.39 |
+| HQQ zero (fp16) | 1.03 | 2.75 | 12.39 |
+| Positional embedding (fp16) | 1.50 | 1.99 | 2.99 |
+| Conv `conv1`/`conv2` (fp16) | 1.07 | 1.82 | 3.91 |
+| HQQ bias (fp16) | 0.06 | 0.12 | 0.35 |
+| LayerNorm (fp16) | 0.03 | 0.07 | 0.19 |
+| Resident weight RAM (total) | 57.53 | 97.22 | 267.59 |
+
+The published WER benchmark runs fp32 compute (for cross-model
+comparability); its resident RAM is larger because the fp16 non-quantized
+weights upcast to fp32 at load time. fp16 compute is the deployment mode
+and is WER-neutral.
+
+## Quantization config
+
+All three models use the same mixed-precision HQQ config, tuned once on
+`whisper-tiny` (see [Ablation](#ablation)) and applied to `whisper-base` and
+`whisper-small` without a separate sweep. No calibration data; the
+quantization is direct (grouped, `axis=1`).
+
+- 4-bit linears (`nbits=4, group_size=32, axis=1`): the decoder self-attention
+  projections (`q_proj`, `k_proj`, `v_proj`, `out_proj`), the decoder
+  cross-attention projections, and `fc2`.
+- 8-bit linears (`nbits=8, group_size=32, axis=1`): the whole encoder stack
+  (`encoder.layers.*` self-attention `q/k/v/out` and `fc1/fc2`) and `fc1` in
+  the decoder. The encoder is the acoustic front-end (cheap to protect); `fc1`
+  is the GELU up-projection, the more sensitive half of the FFN. Keeping these
+  at 8-bit removes almost all of the 4-bit WER gap.
+- `proj_out` (the lm_head): NOT quantized. It is tied to the decoder embedding
+  and shares one weight tensor; it is kept tied in fp16, so the weight is
+  stored once with no quantization error.
+- Non-quantized modules (embedding, `conv1`, `conv2`, layer norms, positional
+  embedding): stored as fp16. Whisper is trained in fp16, so this is
+  near-lossless.
+- Compute dtype: fp32 for the published WER benchmark (cross-model
+  comparability); fp16 for deployment (WER-neutral). See [Size](#size).
+- `axis=1` groups along the input/reduction dim. It measured better than
+  `axis=0` on `whisper-tiny` (0.1622 vs 0.2032 WER at `group_size=64`);
+  `axis=0` targets GPU-optimized inference kernels. `axis=1` is kept for all
+  three so the WER is directly comparable.
+
+The protect config (`encoder.layers,fc1` substring patterns, 8-bit) scales
+automatically to the deeper stack; no per-model change.
+
+| model | linears quantized | 4-bit | 8-bit | skipped (tied) |
+|---|---:|---:|---:|---|
+| whisper-tiny  | 64  | 36  | 28  | `proj_out` |
+| whisper-base  | 96  | 54  | 42  | `proj_out` |
+| whisper-small | 192 | 108 | 84  | `proj_out` |
+
+### Why not transformers `HqqConfig`
+
+transformers `HqqConfig` needs a GPU for both quantization and loading, and it
+writes a `quantization_config` to `config.json` that triggers a GPU check on
+every `from_pretrained`, which breaks CPU loading. `whisper-tiny` and
+`whisper-base` are CPU-only, so the [`hqq`](https://github.com/mobiusml/hqq)
+library is used directly instead: linear layers are replaced with
+`HQQLinear` on CPU, the model is saved with `save_quantized`, and a small
+subclass of `AutoHQQHFModel` loads it on CPU (the base loader builds
+`WhisperModel` without `generate`; the subclass builds
+`WhisperForConditionalGeneration`). `whisper-small` uses the same `hqq`-lib
+path (not `HqqConfig`) on the A10 (`ASR_DEVICE=cuda`), so the saved
+`qmodel.pt` is the same CPU-loadable format as tiny/base.
+
+### Ablation
+
+Config sweep on `whisper-tiny`, same 100 English (`fleurs` `en_us`) samples.
+All rows use `axis=1` except row A. `protect` names the linears kept at 8-bit;
+the rest are 4-bit. `group` is the `group_size`. The winner (row H) is the
+published config. These runs predate the repetition-loop guard; English
+`en_us` does not loop, so the guard does not change these values.
+
+| Row | group | protect (8-bit)        | WER    | Size (on-disk) |
+|-----|-------|------------------------|--------|----------------|
+| -   | 64    | (none, all 4-bit)      | 0.1622 | 54.86 MB       |
+| A   | 64    | (axis=0, all 4-bit)    | 0.2032 | -              |
+| B   | 32    | (none, all 4-bit)      | 0.1480 | 56.93 MB       |
+| C   | 32    | encoder_attn           | 0.1513 | 58.11 MB       |
+| D   | 64    | encoder_attn           | 0.1537 | 56.05 MB       |
+| E   | 16    | (none, all 4-bit)      | 0.1499 | 61.06 MB       |
+| F   | 32    | fc1                    | 0.1457 | 59.29 MB       |
+| G   | 32    | encoder.layers         | 0.1433 | 60.48 MB       |
+| H   | 32    | encoder.layers, fc1    | 0.1367 | 61.66 MB       |
+
+What the sweep shows:
+- `axis=1` beats `axis=0` decisively (row A vs the 64/all-4-bit row).
+- `group_size=32` beats `group_size=64` (row B vs the 64/all-4-bit row);
+  `group_size=16` (row E) did not improve over 32, so 32 is the sweet spot.
+- Protecting the cross-attention (rows C, D) did not help; cross-attention
+  K/V are computed once from the already-clean encoder output, so their
+  quantization error does not compound.
+- Protecting `fc1` (row F) helps; protecting the whole encoder stack (row G)
+  helps more; doing both (row H) matches the fp32 baseline.
+
+## safetensors format
+
+Each published HQQ repo ships `model.safetensors` next to `qmodel.pt`.
+`qmodel.pt` is a torch pickle (zip archive) and the default loader target.
+`model.safetensors` is an alternative single file: a flat
+8-byte-JSON-header + raw-tensor-bytes format with no pickle, zero-mappable,
+and parseable from C/C++/Rust. Use it for host tooling that cannot read a
+torch pickle (for example a deployment loader).
+
+Safetensors stores tensors only, so the per-linear HQQ config scalars
+(`nbits`, `group_size`, `axis`, the packing string, the bools) are encoded as
+tensors via the `HQQLinear` `encoded_state_dict` path.
+`HQQLinear.load_state_dict` detects the `encoded_state_dict` key and decodes
+them back, so the round-trip needs no extra metadata file. The export keeps
+the non-quantized modules (embedding, convs, norms, `proj_out`) at fp16 and
+`HQQLinear` overrides `.to()` as a no-op so it keeps its scale/zero/bias;
+loading either format upcasts the fp16 weights to the compute dtype
+identically. The two formats give the same WER (lossless round-trip).
+
+Load the safetensors with `HQQ_FORMAT=safetensors`; the default (no
+`HQQ_FORMAT`) loads `qmodel.pt`.
+
+```python
+import os, hqq_asr
+os.environ["HQQ_FORMAT"] = "safetensors"
+pipe = hqq_asr.build_pipeline("dkhokhlov/whisper-tiny-hqq-4bit", quant="hqq")
+```
+
+Export it from a local quantized dir with `python export_safetensors.py` (set
+`HQQ_OUT=` for base/small). The export loads on CPU; the saved `qmodel.pt` is
+device-independent, so no GPU is needed.
 
 ## Notes
 
@@ -374,11 +518,22 @@ Evidence JSONs are committed under `eval_multilingual/` and `eval_telephone/`
   device-independent and loads on CPU or GPU. See
   [`hqq_report_small.md`](hqq_report_small.md).
 - Each published HQQ repo ships `qmodel.pt` (torch pickle, the default loader
-  target) and `model.safetensors` (a flat tensor map, no pickle, parseable from
-  C/C++/Rust for host tooling such as a deployment loader). Set `HQQ_FORMAT=safetensors`
-  to load the safetensors; both formats give the same WER. `export_safetensors.py`
-  writes `model.safetensors` from a local quantized dir. See the "safetensors
-  format" section of each report card.
+  target) and `model.safetensors` (a flat tensor map, no pickle, parseable
+  from C/C++/Rust for host tooling such as a deployment loader). Set
+  `HQQ_FORMAT=safetensors` to load the safetensors; both formats give the same
+  WER. See [safetensors format](#safetensors-format).
+- `proj_out` and the embedding are fp16, not 4-bit. A smaller model is
+  possible if the embedding is also quantized, but that raises the WER risk
+  on the vocab projection and was not done here.
+- The quantization config was tuned on English (`whisper-tiny`) and applied
+  to base/small without a separate sweep. Under the repetition-loop guard,
+  HQQ is within 5% relative of fp32 on every tested config. Use the fp32
+  model when the lowest WER is required and the size is acceptable.
+- Evaluated on `fleurs` (en, es, fr, de, hi) and `talkbank_4_stt` (en, es, fr,
+  de). Other languages and datasets were not measured. WER on conversational
+  telephone speech is high because the domain is hard; this is a base-model
+  property. Use a larger Whisper model for this domain when lower WER is
+  needed. Hindi is not production-quality at any model size.
 - Audio is decoded with `soundfile` (no ffmpeg required). WAV, FLAC, OGG, and
   MP3 are accepted.
 - The ASR pipeline resamples each input to 16 kHz internally, so no
@@ -386,3 +541,23 @@ Evidence JSONs are committed under `eval_multilingual/` and `eval_telephone/`
 - `make en` needs `sentencepiece` (MarianMT tokenizers); it is in the deps.
 - Transformers warnings are silenced; `make asr`, `make en`, and `make tts`
   each print a JSON object/array to stdout (with stats). stderr stays quiet.
+
+## Citation
+
+If you use these HQQ models or the benchmark, cite this repository:
+
+```bibtex
+@misc{khokhlov_whisper_cascade,
+  author       = {Dmitri Khokhlov},
+  title        = {whisper-cascade: CPU speech-to-text cascade with HQQ 4-bit Whisper},
+  year         = {2026},
+  url          = {https://github.com/dkhokhlov/whisper-cascade},
+  note         = {HQQ 4-bit quantized Whisper (tiny/base/small) for deployment},
+}
+```
+
+Upstream:
+- Whisper: Radford et al., "Robust Speech Recognition via Large-Scale Weak
+  Supervision", 2022. <https://cdn.openai.com/papers/whisper.pdf>
+- HQQ: Mobius Labs, "HQQ: Half-Quadratic Quantization".
+  <https://github.com/mobiusml/hqq>
