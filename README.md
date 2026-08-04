@@ -371,8 +371,14 @@ embedding are tied (one shared weight), held once.
 | base   | 145.19 MB        | 97.22 MB       | -33.0%                     |
 | small  | 483.47 MB        | 267.59 MB      | -44.6%                     |
 
-HQQ 4-bit quantizes only the linear weights (packed uint8 `W_q` plus a
-per-group scale and zero, both fp16 in RAM). The embedding, convs, layer
+The HQQ model quantizes only the linear weights (the 4-bit and 8-bit
+tiers; see [Quantization config](#quantization-config)). Each quantized
+linear stores packed weights `W_q` plus a per-group scale and zero (both
+fp16 in RAM). PyTorch has no native 4-bit or 8-bit integer dtype, so HQQ
+packs the weights into `uint8` — the container dtype, not the precision:
+the 4-bit tier packs two values per byte, the 8-bit tier stores one value
+per byte. Both are dequantized per group at compute time; the `uint8`
+bytes are only how the weights sit in RAM. The embedding, convs, layer
 norms, and positional embedding stay fp16. The embedding is the largest
 resident component and is not quantized, so the quantization gain is
 bounded by the linear-weight share (larger for the deeper small model).
@@ -384,7 +390,7 @@ embedding counts once):
 | Component (dtype in RAM) | tiny | base | small |
 |---|---:|---:|---:|
 | Embedding, tied `embed_tokens`=`proj_out` (fp16) | 39.83 | 53.11 | 79.66 |
-| HQQ packed weights `W_q` (uint8) | 12.98 | 34.60 | 155.71 |
+| HQQ packed weights `W_q` (4/8-bit, `uint8`) | 12.98 | 34.60 | 155.71 |
 | HQQ scale (fp16) | 1.03 | 2.75 | 12.39 |
 | HQQ zero (fp16) | 1.03 | 2.75 | 12.39 |
 | Positional embedding (fp16) | 1.50 | 1.99 | 2.99 |
