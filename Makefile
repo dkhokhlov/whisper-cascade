@@ -5,6 +5,11 @@ PY    := $(VENV)/bin/python
 # whisper-small eval (make gpu-venv, then run scripts with $(PYGPU)).
 VENV_GPU := .venv-gpu
 PYGPU    := $(VENV_GPU)/bin/python
+# ONNX export/eval venv (CPU). Separate from the CPU .venv so the strict CPU contract and
+# pyproject.toml stay untouched, and from .venv-gpu (CUDA). Holds optimum/onnxruntime/onnx
+# pinned against transformers 4.44.2 / torch 2.4.1. Used by make onnx / eval-onnx.
+VENV_ONNX := .venv-onnx
+PYONNX    := $(VENV_ONNX)/bin/python
 # Semantic version, sourced from pyproject.toml so it stays in sync.
 VERSION := $(shell awk -F'"' '/^version =/ {print $$2; exit}' pyproject.toml)
 # Whisper ASR model (override: make asr MODEL_ASR=openai/whisper-tiny.en). The
@@ -38,6 +43,10 @@ export ASR_DEVICE
 # fc1 assigned to the 8-bit tier.
 HQQ_OUT ?= whisper-tiny-hqq-4bit
 HQQ_REPO ?= dkhokhlov/whisper-tiny-hqq-4bit
+# ONNX export output dir. Separate from HQQ_OUT: the optimum exporter may overwrite
+# config.json/processor/index files, so it must not write into the canonical HQQ source dir.
+# eval-onnx points MODEL_ASR here (not HQQ_OUT).
+ONNX_OUT ?= whisper-tiny-hqq-onnx
 HQQ_GROUP ?= 32
 HQQ_AXIS ?= 1
 HQQ_8BIT_PATTERNS ?= encoder.layers,fc1
@@ -52,7 +61,7 @@ EVAL_LIMIT ?= 100
 # WER eval config / language code (make eval-baseline / eval-hqq).
 EVAL_CONFIG ?= en_us
 
-.PHONY: help info venv gpu-venv samples asr en tts quantize push eval-baseline eval-hqq test test-integration clean clean-all
+.PHONY: help info venv gpu-venv onnx-venv samples asr en tts quantize push eval-baseline eval-hqq eval-onnx onnx hqq-reference test test-integration clean clean-all
 
 help: ## Show available targets
 	@echo "whisper-cascade v$(VERSION)"
@@ -117,6 +126,21 @@ $(VENV_GPU)/.stamp:
 
 gpu-venv: $(VENV_GPU)/.stamp ## Create the CUDA .venv-gpu for A10 GPU runs (small model)
 
+# ONNX export/eval venv (CPU). Pinned against transformers 4.44.2 / torch 2.4.1 so the
+# exported graph matches the HQQ compute path. Stamp depends on the Makefile so a pin
+# change rebuilds the env. torch/torchaudio from the CPU wheel index (like the main .venv).
+$(VENV_ONNX)/.stamp: Makefile
+	@uv venv $(VENV_ONNX) --python 3.10
+	@uv pip install --python $(PYONNX) --index-url https://download.pytorch.org/whl/cpu \
+	    torch==2.4.1 torchaudio==2.4.1
+	@uv pip install --python $(PYONNX) \
+	    transformers==4.44.2 soundfile==0.12.1 "numpy<2" sentencepiece==0.2.0 \
+	    hqq==0.2.8.post1 jiwer datasets onnx==1.16.2 onnxruntime==1.19.2 \
+	    optimum==2.0.0 "optimum-onnx[onnxruntime]==0.0.3" "pytest>=9.1.1"
+	@touch $(VENV_ONNX)/.stamp
+
+onnx-venv: $(VENV_ONNX)/.stamp ## Create the CPU .venv-onnx for ONNX export/eval (Path B)
+
 samples: ## Warm the HF sample cache for the default set - idempotent, no re-download
 	@$(PY) -c "from huggingface_hub import hf_hub_download; [hf_hub_download('Narsil/asr_dummy', f, repo_type='dataset') for f in ('mlk.flac','4.flac','hindi.ogg')]" && echo "samples cache warm"
 
@@ -145,6 +169,21 @@ eval-baseline: $(VENV)/.stamp ## Measure baseline WER (fp32 MODEL_ASR) on EVAL_D
 eval-hqq: $(VENV)/.stamp ## Measure HQQ WER (QUANT=hqq MODEL_ASR=HQQ_REPO) on EVAL_DATASET/EVAL_CONFIG/EVAL_SPLIT (EVAL_LIMIT)
 	@QUANT=hqq MODEL_ASR=$(HQQ_REPO) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
 	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_hqq.json $(PY) eval_wer.py
+
+# ONNX (Path B) targets. Runs in .venv-onnx (optimum/onnxruntime). Export reads HQQ_OUT
+# (read-only) and writes the 3 .onnx + config/processor into ONNX_OUT. eval-onnx points
+# MODEL_ASR at ONNX_OUT, not HQQ_OUT.
+onnx: $(VENV_ONNX)/.stamp ## Export HQQ_OUT to ONNX (3 graphs) -> ONNX_OUT (.venv-onnx)
+	@HQQ_OUT=$(HQQ_OUT) ONNX_OUT=$(ONNX_OUT) $(PYONNX) export_onnx.py
+
+hqq-reference: $(VENV_ONNX)/.stamp ## Write the full 100-sample HQQ reference manifest (the exact-text gate oracle)
+	@QUANT=hqq MODEL_ASR=$(HQQ_REPO) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
+	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=hqq_reference.json \
+	 HQQ_REFERENCE=1 $(PYONNX) eval_wer.py
+
+eval-onnx: $(VENV_ONNX)/.stamp ## Measure ONNX WER (QUANT=onnx MODEL_ASR=ONNX_OUT) on EVAL_DATASET/EVAL_CONFIG/EVAL_SPLIT (EVAL_LIMIT)
+	@QUANT=onnx MODEL_ASR=$(ONNX_OUT) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
+	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_onnx.json $(PYONNX) eval_wer.py
 
 test: $(VENV)/.stamp ## Run the fast unit tests (no model load, no network)
 	@$(PY) -m pytest
