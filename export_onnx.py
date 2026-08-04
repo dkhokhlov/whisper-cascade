@@ -132,7 +132,66 @@ def swap_hqq_linears(model):
     return n_default, n_tier8
 
 
+def _copy_meta_files(hqq_out, onnx_out):
+    """Copy config.json + generation_config.json + processor/tokenizer files from the HQQ
+    source dir into the ONNX dir (ORtModelForSpeechSeq2Seq.from_pretrained needs them). Skips
+    the weight files (qmodel.pt, model.safetensors) and the model card (README.md)."""
+    import shutil
+
+    skip = {"qmodel.pt", "model.safetensors", "README.md"}
+    n = 0
+    for name in sorted(os.listdir(hqq_out)):
+        if name in skip or name.endswith(".onnx") or name.endswith(".onnx_data"):
+            continue
+        src = os.path.join(hqq_out, name)
+        if os.path.isfile(src):
+            shutil.copyfile(src, os.path.join(onnx_out, name))
+            n += 1
+    return n
+
+
+def _gate1_structural_check(onnx_out):
+    """Gate 1 (Path B graph proof): inspect the raw .onnx protobuf before any ORT session.
+
+    Every exported subgraph must keep a packed uint8 W_q initializer and the dequant chain
+    (Cast/Sub/Mul/Reshape/Transpose/MatMul); at least one subgraph (a decoder, which holds
+    4-bit linears) must keep the 4-bit unpack ops (BitwiseAnd/BitShift or Div/Mod). If the
+    dequant was folded to dense at export time, these are absent -> not Path B.
+    """
+    import onnx
+
+    onnx_files = sorted(f for f in os.listdir(onnx_out) if f.endswith(".onnx"))
+    if not onnx_files:
+        return {"pass": False, "reason": "no .onnx files written", "files": []}
+    dequant_chain = {"Cast", "Sub", "Mul", "Reshape", "Transpose", "MatMul"}
+    all_ops = set()
+    all_init_dtypes = set()
+    per_file = {}
+    for fn in onnx_files:
+        m = onnx.load(os.path.join(onnx_out, fn))
+        ops = {n.op_type for n in m.graph.node}
+        dtypes = {init.data_type for init in m.graph.initializer}
+        per_file[fn] = {"has_uint8_init": 2 in dtypes, "n_nodes": len(m.graph.node)}
+        all_ops |= ops
+        all_init_dtypes |= dtypes
+    uint8_present = 2 in all_init_dtypes
+    dequant_present = dequant_chain <= all_ops
+    unpack_present = bool(all_ops & {"BitwiseAnd", "BitShift", "Mod", "Div"})
+    return {
+        "pass": uint8_present and dequant_present and unpack_present,
+        "uint8_init": uint8_present,
+        "dequant_chain": dequant_present,
+        "unpack_ops": unpack_present,
+        "files": per_file,
+        "onnx_files": onnx_files,
+    }
+
+
 def main() -> int:
+    import json
+
+    from optimum.exporters.onnx import onnx_export_from_model
+
     print(f"loading HQQ model {HQQ_OUT} (device={ASR_DEVICE})", file=sys.stderr)
     model = hqq_asr.load_whisper_hqq(HQQ_OUT, device=ASR_DEVICE)
     model.eval()
@@ -141,20 +200,34 @@ def main() -> int:
         f"swapped: 4-bit tier={n_default}, 8-bit tier={n_tier8} (HQQLinear -> HQQLinearONNX)",
         file=sys.stderr,
     )
-    # TODO(onnx): call onnx_export_from_model(model, ..., fn_get_submodels=...,
-    # custom_onnx_configs=...) with the Whisper encoder / decoder / decoder-with-past configs
-    # (dynamo=False, do_constant_folding=False, opset=18, canonical filenames), then copy
-    # config.json + processor files + generation_config.json from HQQ_OUT into ONNX_OUT. The
-    # exact optimum-onnx 0.0.3 API is verified against the installed package before this is
-    # filled in; until then this only loads + swaps + reports.
+
+    os.makedirs(ONNX_OUT, exist_ok=True)
+    print(f"exporting ONNX -> {ONNX_OUT} (opset=18, do_constant_folding=False)", file=sys.stderr)
+    onnx_export_from_model(
+        model,
+        ONNX_OUT,
+        opset=18,
+        do_constant_folding=False,
+        task="automatic-speech-recognition-with-past",
+        device=ASR_DEVICE,
+        atol=1e-3,
+    )
+    n_meta = _copy_meta_files(HQQ_OUT, ONNX_OUT)
+    print(f"copied {n_meta} config/processor files from {HQQ_OUT} -> {ONNX_OUT}", file=sys.stderr)
+
+    gate1 = _gate1_structural_check(ONNX_OUT)
     summary = {
         "hqq_out": HQQ_OUT,
         "onnx_out": ONNX_OUT,
         "linears_default_bit": n_default,
         "linears_8bit": n_tier8,
-        "status": "swapped (ONNX serialization not yet implemented)",
+        "gate1_structural": gate1,
+        "files": sorted(os.listdir(ONNX_OUT)),
     }
-    print(__import__("json").dumps(summary, indent=2))
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if not gate1["pass"]:
+        print("GATE 1 FAILED: dequant was folded to dense or W_q not packed", file=sys.stderr)
+        return 1
     return 0
 
 

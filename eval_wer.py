@@ -87,6 +87,17 @@ EVAL_CONFIG = os.environ.get("EVAL_CONFIG", "en_us")
 EVAL_SPLIT = os.environ.get("EVAL_SPLIT", "test")
 EVAL_LIMIT = int(os.environ.get("EVAL_LIMIT", "50"))
 EVAL_OUT = os.environ.get("EVAL_OUT", "").strip()
+# HQQ reference manifest (the exact-text gate oracle for the ONNX export).
+# HQQ_REFERENCE=1: collect EVERY sample's post-loop-guard text into "samples"
+# (not just the first 5) so EVAL_OUT is a full manifest that the ONNX run can
+# compare against. HQQ_REFERENCE_MANIFEST=<path>: load that manifest and, after
+# the run, compare this run's post-loop-guard text to it sample-by-sample;
+# add exact_match / n_mismatch / first_diff to the result JSON. Set both the
+# fleurs order/limit identical to the manifest run so the i-th successful
+# sample is the same audio in both runs.
+HQQ_REFERENCE = bool(os.environ.get("HQQ_REFERENCE", "").strip())
+HQQ_REFERENCE_MANIFEST = os.environ.get("HQQ_REFERENCE_MANIFEST", "").strip()
+MANIFEST_MODE = HQQ_REFERENCE or bool(HQQ_REFERENCE_MANIFEST)
 # Optional forced language (e.g. "spanish"). When set, the pipeline is told
 # language + task=transcribe so the model does not auto-detect. Leave unset
 # for auto-detect (the default multilingual Whisper behavior).
@@ -253,8 +264,10 @@ def main() -> int:
             refs.append(ref)
             hyps.append(hyp)
             n_ok += 1
-            if len(details) < 5:
-                details.append({"ref": ref, "hyp": hyp})
+            # In manifest mode collect every sample (the gate oracle / the run
+            # to compare); otherwise keep the first 5 for the result summary.
+            if MANIFEST_MODE or len(details) < 5:
+                details.append({"index": n_ok, "ref": ref, "hyp": hyp})
             print(
                 f"[{n_ok}] wer={jiwer_wer([ref], [hyp], WER_NORM, WER_NORM):.3f} "
                 f"rtf={elapsed / duration:.2f}",
@@ -271,6 +284,40 @@ def main() -> int:
     corpus_wer = jiwer_wer(refs, hyps, WER_NORM, WER_NORM)
     avg_rtf = total_elapsed / total_duration if total_duration else None
 
+    # Exact-text gate: compare this run's post-loop-guard text to the HQQ
+    # reference manifest, sample by sample (i-th successful sample in each run
+    # is the same audio, since both iterate the dataset in the same order).
+    gate = None
+    if HQQ_REFERENCE_MANIFEST:
+        with open(HQQ_REFERENCE_MANIFEST, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        manifest_hyps = [s["hyp"] for s in manifest.get("samples", [])]
+        onnx_hyps = [s["hyp"] for s in details]
+        n_cmp = min(len(manifest_hyps), len(onnx_hyps))
+        first_diff = None
+        n_mismatch = 0
+        for i in range(n_cmp):
+            if manifest_hyps[i] != onnx_hyps[i]:
+                n_mismatch += 1
+                if first_diff is None:
+                    first_diff = {
+                        "index": details[i]["index"],
+                        "ref": details[i]["ref"],
+                        "hqq": manifest_hyps[i],
+                        "onnx": onnx_hyps[i],
+                    }
+        exact_match = (
+            n_mismatch == 0 and len(onnx_hyps) == len(manifest_hyps)
+        )
+        gate = {
+            "manifest": HQQ_REFERENCE_MANIFEST,
+            "exact_match": exact_match,
+            "n_manifest_samples": len(manifest_hyps),
+            "n_onnx_samples": len(onnx_hyps),
+            "n_mismatch": n_mismatch,
+            "first_diff": first_diff,
+        }
+
     result = {
         "model": MODEL_ASR,
         "quant": QUANT or None,
@@ -285,6 +332,7 @@ def main() -> int:
         "total_elapsed_s": round(total_elapsed, 3),
         "avg_rtf": round(avg_rtf, 3) if avg_rtf is not None else None,
         "samples": details,
+        "exact_text_gate": gate,
     }
 
     out = json.dumps(result, ensure_ascii=False, indent=2)

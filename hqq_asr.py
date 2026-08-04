@@ -251,6 +251,23 @@ def build_pipeline(model_id, quant, device="cpu"):
     inputs are moved to the model. HQQ weights are dequantized in COMPUTE_DTYPE
     (fp32) on the chosen device.
     """
+    if quant == "onnx":
+        # Path B: load the exported ONNX subgraphs (encoder/decoder/decoder_with_past
+        # in model_id == ONNX_OUT) via ORTModelForSpeechSeq2Seq on CPU ONNX Runtime,
+        # wrapped in the standard ASR pipeline. ORTModelForSpeechSeq2Seq runs the
+        # generation loop outside ONNX. The processor (config/processor/tokenizer
+        # files) was copied into ONNX_OUT by export_onnx.py. Import is lazy so the
+        # CPU .venv (no onnxruntime) keeps working for make asr / make test.
+        from optimum.onnxruntime import ORTModelForSpeechSeq2Seq
+
+        model = ORTModelForSpeechSeq2Seq.from_pretrained(model_id, provider="CPUExecutionProvider")
+        processor = AutoProcessor.from_pretrained(model_id)
+        return pipeline(
+            task="automatic-speech-recognition",
+            model=model,
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+        )
     if quant == "hqq":
         model = load_whisper_hqq(model_id, device=device)
         model.eval()

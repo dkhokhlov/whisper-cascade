@@ -130,7 +130,7 @@ gpu-venv: $(VENV_GPU)/.stamp ## Create the CUDA .venv-gpu for A10 GPU runs (smal
 # exported graph matches the HQQ compute path. Stamp depends on the Makefile so a pin
 # change rebuilds the env. torch/torchaudio from the CPU wheel index (like the main .venv).
 $(VENV_ONNX)/.stamp: Makefile
-	@uv venv $(VENV_ONNX) --python 3.10
+	@test -d $(VENV_ONNX) || uv venv $(VENV_ONNX) --python 3.10
 	@uv pip install --python $(PYONNX) --index-url https://download.pytorch.org/whl/cpu \
 	    torch==2.4.1 torchaudio==2.4.1
 	@uv pip install --python $(PYONNX) \
@@ -177,13 +177,14 @@ onnx: $(VENV_ONNX)/.stamp ## Export HQQ_OUT to ONNX (3 graphs) -> ONNX_OUT (.ven
 	@HQQ_OUT=$(HQQ_OUT) ONNX_OUT=$(ONNX_OUT) $(PYONNX) export_onnx.py
 
 hqq-reference: $(VENV_ONNX)/.stamp ## Write the full 100-sample HQQ reference manifest (the exact-text gate oracle)
-	@QUANT=hqq MODEL_ASR=$(HQQ_REPO) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
+	@QUANT=hqq MODEL_ASR=$(HQQ_OUT) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
 	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=hqq_reference.json \
 	 HQQ_REFERENCE=1 $(PYONNX) eval_wer.py
 
-eval-onnx: $(VENV_ONNX)/.stamp ## Measure ONNX WER (QUANT=onnx MODEL_ASR=ONNX_OUT) on EVAL_DATASET/EVAL_CONFIG/EVAL_SPLIT (EVAL_LIMIT)
+eval-onnx: $(VENV_ONNX)/.stamp ## Measure ONNX WER + exact-text gate vs hqq_reference.json (QUANT=onnx MODEL_ASR=ONNX_OUT)
 	@QUANT=onnx MODEL_ASR=$(ONNX_OUT) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
-	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_onnx.json $(PYONNX) eval_wer.py
+	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_onnx.json \
+	 HQQ_REFERENCE_MANIFEST=hqq_reference.json $(PYONNX) eval_wer.py
 
 test: $(VENV)/.stamp ## Run the fast unit tests (no model load, no network)
 	@$(PY) -m pytest

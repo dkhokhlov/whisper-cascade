@@ -25,6 +25,12 @@ out.txt
 whisper-tiny-hqq-4bit/
 whisper-base-hqq-4bit/
 whisper-small-hqq-4bit/
+# Local ONNX export output (regenerable via make onnx; published to HF only
+# after the user approves, never committed to git)
+whisper-tiny-hqq-onnx/
+whisper-base-hqq-onnx/
+whisper-small-hqq-onnx/
+.venv-onnx/
 # Transient WER-sweep model dirs
 sweep_*/
 # Hugging Face cache dirs downloaded into the repo root
