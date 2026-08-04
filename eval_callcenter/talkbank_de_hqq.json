@@ -1,0 +1,36 @@
+{
+  "model": "./whisper-tiny-hqq-4bit",
+  "quant": "hqq",
+  "dataset": "diabolocom/talkbank_4_stt",
+  "config": "de",
+  "split": "segment",
+  "language": null,
+  "n": 100,
+  "n_fail": 0,
+  "wer": 0.6425,
+  "total_duration_s": 202.033,
+  "total_elapsed_s": 44.844,
+  "avg_rtf": 0.222,
+  "samples": [
+    {
+      "ref": "ich unterrichte nachher Französisch, Englisch und Deutsch .",
+      "hyp": "Die und richten nach erfreundzühe sich eigentlich und teuer."
+    },
+    {
+      "ref": "&=laugh und aber .",
+      "hyp": "On-"
+    },
+    {
+      "ref": "was, was viel wichtiger ist, ist daß der ganze Campus, die ganze Uni ist &+ähm .",
+      "hyp": "Was viel wichtiger ist, ist das ganze Campus ganze Unie."
+    },
+    {
+      "ref": "+, und gehen in die Entwicklungshilfe also ist es ist eine Schule, die mulit- wirklich multinational ausgerichtet ist, wir haben viele &+aus +/.  ausländische Studenten dort, inklusive ich .",
+      "hyp": "und genen die Entwicklung viel verasset ist in der Schule die möglichen multinational ausgerichtet wird. Wir haben viele ausline für Studenten, das inklusive ich."
+    },
+    {
+      "ref": "&+äh wir lernen unheimlich viel über interkulturelle Kommunikation, wir haben viele .",
+      "hyp": "Wir lernen uns auch nicht viel über interkulturelle Kommunikation."
+    }
+  ]
+}

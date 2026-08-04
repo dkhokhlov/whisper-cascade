@@ -32,5 +32,10 @@ eval_*.log
 eval_hqq_local.json
 # Per-language multilingual eval logs (the .json results are committed)
 eval_multilingual/*.log
+# Call-center benchmark: commit the .json results, ignore the run logs.
+# mu-bench JSON results hold only aggregate metrics (no transcripts), per its
+# CC-BY-NC-4.0 license; the audio/transcripts are never committed.
+eval_callcenter/*.log
+eval_callcenter/run_bench.sh
 # Misc lock dirs created during HF downloads
 .locks/

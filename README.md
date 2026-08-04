@@ -276,6 +276,60 @@ The first `tee` (no `-a`) starts a fresh file each run, so the file holds only
 the latest run (no `rm -f` needed). (`jq` is a transform, not a stage, so it is
 not teed.)
 
+## Evaluation
+
+`eval_wer.py` measures the Word Error Rate (WER) of an ASR model on a HF
+audio dataset. It supports three dataset sources (dispatched by `EVAL_DATASET`):
+
+- `google/fleurs`: read speech, 16 kHz wav. Configs `en_us`, `es_419`,
+  `fr_fr`, `de_de`, `hi_in`. Split `test`. Public.
+- `diabolocom/talkbank_4_stt`: spontaneous telephone conversation, 16 kHz
+  mp3. Configs `en`, `es`, `fr`, `de`, `jp`, `zh`. Split `segment` (the
+  `switch` split has long silences and a much higher WER, so it is not used).
+- `sierra-research/mu-bench`: customer-service telephone calls to a banking
+  AI agent, 8 kHz mono wav. Gated, CC-BY-NC-4.0. Locales `en-US`, `es-MX`,
+  `tr-TR`, `vi-VN`, `zh-CN`. The `datasets` builder forces the `torchcodec`
+  encoder for this dataset, which this CPU project does not depend on, so
+  the manifest and per-utterance wav files are downloaded directly with
+  `huggingface_hub`, decoded with `soundfile`, and resampled 8 kHz to 16 kHz
+  with `torchaudio.functional.resample`. Only aggregate metrics (WER, n,
+  runtime) are reported for `mu-bench`; no audio or transcripts are
+  redistributed.
+
+A post-hoc repetition-loop guard (gzip compression ratio > 2.4, the openai
+whisper CLI default) is applied to every hypothesis. On short or noisy
+telephone segments greedy decoding can loop and emit hundreds of repeated
+words, which would dominate corpus WER via insertions. The guard is applied
+identically to fp32 and HQQ. (transformers 4.44.2 raises `UnboundLocalError`
+from its in-generation `compression_ratio_threshold` fallback when
+`return_timestamps` is `False`, so the guard is applied post-hoc.)
+
+Hardware: Intel Xeon W-1290 @ 3.20 GHz, 20 cores, CPU only. WER is
+host-independent; runtime is host-specific.
+
+Benchmark for `openai/whisper-tiny` fp32 vs `dkhokhlov/whisper-tiny-hqq-4bit`
+(n=100 fleurs, n=100 talkbank, n=200 mu-bench; WER, lower is better):
+
+| Dataset        | Lang | fp32 WER | HQQ WER | Delta   |
+|---------------|------|----------|---------|---------|
+| fleurs         | en   | 0.1381   | 0.1367  | -0.0014 |
+| fleurs         | de   | 0.3019   | 0.2946  | -0.0073 |
+| fleurs         | fr   | 0.4451   | 0.4572  | +0.0121 |
+| fleurs         | es   | 0.1899   | 0.2149  | +0.0250 |
+| fleurs         | hi   | 1.0579   | 1.0579  | 0.0000  |
+| mu-bench       | en-US| 0.2777   | 0.2994  | +0.0217 |
+| mu-bench       | es-MX| 0.6884   | 0.6647  | -0.0237 |
+| talkbank       | en   | 0.4108   | 0.4073  | -0.0035 |
+| talkbank       | es   | 0.5246   | 0.5170  | -0.0076 |
+| talkbank       | fr   | 0.7531   | 0.7256  | -0.0275 |
+| talkbank       | de   | 0.6354   | 0.6425  | +0.0071 |
+
+HQQ 4-bit is within 0.025 absolute of fp32 on every config (61.65 MB vs
+151.06 MB, -59.2%). Per-eval runtime and the full quantization report are in
+[`hqq_report.md`](hqq_report.md) (the model card for
+`dkhokhlov/whisper-tiny-hqq-4bit`). Evidence JSONs are committed under
+`eval_multilingual/` and `eval_callcenter/`.
+
 ## Notes
 
 - CPU only. No GPU dependency.

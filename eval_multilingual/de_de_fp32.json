@@ -4,11 +4,12 @@
   "dataset": "google/fleurs",
   "config": "de_de",
   "split": "test",
+  "language": null,
   "n": 100,
   "n_fail": 0,
   "wer": 0.3019,
   "total_duration_s": 1496.22,
-  "total_elapsed_s": 71.093,
+  "total_elapsed_s": 72.273,
   "avg_rtf": 0.048,
   "samples": [
     {

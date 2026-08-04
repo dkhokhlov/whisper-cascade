@@ -1,0 +1,36 @@
+{
+  "model": "openai/whisper-tiny",
+  "quant": null,
+  "dataset": "diabolocom/talkbank_4_stt",
+  "config": "fr",
+  "split": "segment",
+  "language": null,
+  "n": 100,
+  "n_fail": 0,
+  "wer": 0.7531,
+  "total_duration_s": 659.47,
+  "total_elapsed_s": 97.61,
+  "avg_rtf": 0.148,
+  "samples": [
+    {
+      "ref": "Et voilà .  Ben , oui , on me paye pour t'appeler .  C'est pas pire , non certain .  Ils paye la communication .  Mais en plus de ça , je jeje vais recevoir dix dollar .",
+      "hyp": "Et voilà. On paye pour te tapler, je ne peux pas filer. Non, je ne peux pas filer la communication. Mais en plus de ce que je ne vais pas voir."
+    },
+    {
+      "ref": "Moi , quand la fille me demandait ça , tu vas me payer pour parler .  Pas de problème .  C'est ce que je fais le mieux .  Ah .",
+      "hyp": "On peut pas aller."
+    },
+    {
+      "ref": "Parce que c'est une université américaine .",
+      "hyp": "Varskade sig till en universitet i NERIGEN."
+    },
+    {
+      "ref": "Fait l'étude des langues hautes que l'anglais dans qui étudie soit le français , l'allemand , ces choses-là .  Mais ils veulent faire une étude .  Ils regardent voir le niveau de scolarité des gens et le niveau de français utilisé parce .",
+      "hyp": "Il fait les secs des langues autres que l'anglais. Il a tout dit qu'il se whelfe français, l'almante, et je vous donne. Mais il va le faire les secs. Le niveau de ce collecte est déjà et le niveau de français utilisé."
+    },
+    {
+      "ref": "Entre autres , ça se parle souvent que même les ceux qui sortent des universités ici cou .  Donc français , c'est massacré .  C'est pas possible là .",
+      "hyp": "entre autres, ils n'aient pas oublié de la souverte, même les succès des universités, si c'est quoi-t-on ni fait ces mathackers, c'est pas possible."
+    }
+  ]
+}

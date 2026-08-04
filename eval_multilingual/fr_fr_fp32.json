@@ -4,12 +4,13 @@
   "dataset": "google/fleurs",
   "config": "fr_fr",
   "split": "test",
+  "language": null,
   "n": 100,
   "n_fail": 0,
-  "wer": 0.5156,
+  "wer": 0.4451,
   "total_duration_s": 1073.7,
-  "total_elapsed_s": 75.168,
-  "avg_rtf": 0.07,
+  "total_elapsed_s": 75.948,
+  "avg_rtf": 0.071,
   "samples": [
     {
       "ref": "l'accident a eu lieu en terrain montagneux et il semblerait que cela ait été causé par un incendie malveillant",

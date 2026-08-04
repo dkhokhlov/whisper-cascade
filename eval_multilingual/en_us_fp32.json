@@ -4,12 +4,13 @@
   "dataset": "google/fleurs",
   "config": "en_us",
   "split": "test",
+  "language": null,
   "n": 100,
   "n_fail": 0,
   "wer": 0.1381,
   "total_duration_s": 953.88,
-  "total_elapsed_s": 48.71,
-  "avg_rtf": 0.051,
+  "total_elapsed_s": 51.511,
+  "avg_rtf": 0.054,
   "samples": [
     {
       "ref": "however due to the slow communication channels styles in the west could lag behind by 25 to 30 year",
