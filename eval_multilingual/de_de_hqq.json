@@ -1,15 +1,16 @@
 {
-  "model": "./whisper-tiny-hqq-4bit-ml",
+  "model": "./whisper-tiny-hqq-4bit",
   "quant": "hqq",
   "dataset": "google/fleurs",
   "config": "de_de",
   "split": "test",
+  "language": null,
   "n": 100,
   "n_fail": 0,
   "wer": 0.2946,
   "total_duration_s": 1496.22,
-  "total_elapsed_s": 102.445,
-  "avg_rtf": 0.068,
+  "total_elapsed_s": 103.742,
+  "avg_rtf": 0.069,
   "samples": [
     {
       "ref": "für die besten aussichten auf hongkong sollten sie die insel verlassen und zum gegenüberliegenden ufer von kowloon fahren",

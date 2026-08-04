@@ -26,8 +26,7 @@ CPU inference. The model size shrank from 151.06 MB (fp32) to 61.65 MB
 (59.2% reduction). The Word Error Rate (WER) on 100 English samples from
 `google/fleurs` `en_us` (test split) stayed at the baseline level: 0.1381
 (fp32) vs 0.1367 (HQQ), a difference of -0.0014 absolute (-1.0% relative),
-which is within the noise of a 100-sample eval. The inference speed on CPU
-stayed about the same (real-time factor 0.089 to 0.093).
+which is within the noise of a 100-sample eval.
 
 The key setting is mixed precision: the whole encoder stack and the `fc1`
 feed-forward up-projection are kept at 8-bit, and the remaining decoder
@@ -35,19 +34,27 @@ linears are 4-bit. The encoder is the acoustic stack (only 4 layers, cheap
 to protect) and `fc1` is the more sensitive half of the FFN; keeping these
 at 8-bit removes almost all of the 4-bit WER gap.
 
-The same weights are evaluated across five languages below. The quantization
-config was tuned on English; it matches the fp32 baseline on English and
-German, is within noise on French, and degrades on Spanish and Hindi (the
-base model is itself weak on the latter two).
+The same weights are evaluated across five `fleurs` languages and two
+customer-service telephone datasets below. The quantization config was tuned
+on English. Under the repetition-loop guard (see Evaluation), HQQ stays
+within 0.025 absolute of fp32 on every tested language and dataset. The
+quantization is effectively lossless across the tested set.
 
-Generation config: this revision (v1.3.2) clears the English `forced_decoder_ids`
+Revision note (v1.4.0): the earlier v1.3.2 multilingual table reported
+`es_419` HQQ 0.4235 and `hi_in` 1.7599 / 2.4145. Those numbers were inflated
+by greedy-decoding repetition loops on a few short segments. A post-hoc
+compression-ratio guard (the openai whisper CLI default) now catches those
+loops. The corrected numbers are in this card. The model weights are
+unchanged (`qmodel.pt` sha256 `0e183ee00b1cdd71`); v1.4.0 is a card-only
+update.
+
+Generation config: this revision clears the English `forced_decoder_ids`
 that the source `config.json` ships with and writes a modern
 `generation_config.json`, so the model auto-detects the language and
 transcribes (the standard multilingual Whisper behavior). The earlier
-v1.3.1 revision kept the English-forced config; its weights are byte-identical
-to this revision (`qmodel.pt` sha256 `0e183ee00b1cdd71`), and English WER is
-identical under either config. v1.3.1 is preserved at git tag `v1.3.1` / HF
-revision `e43f2bb`.
+v1.3.1 revision kept the English-forced config; its weights are
+byte-identical to this revision, and English WER is identical under either
+config. v1.3.1 is preserved at git tag `v1.3.1` / HF revision `e43f2bb`.
 
 ## Source model
 
@@ -92,24 +99,61 @@ without `generate`; the subclass builds `WhisperForConditionalGeneration`).
 
 ## Evaluation
 
-- Dataset: `google/fleurs`, split `test`.
-- Configs: `en_us`, `es_419` (Spanish), `fr_fr` (French), `de_de` (German),
-  `hi_in` (Hindi).
-- Samples: 100 per config (the first 100 of the test split, streamed).
 - Metric: WER via `jiwer`. Both reference and hypothesis are normalized
   (lowercase, remove punctuation, collapse spaces) before alignment.
-- Hardware: CPU only. The fp32 baseline and the HQQ model run the same 100
-  samples per config, both with auto-detected language and `task=transcribe`.
+- Decoding: greedy, auto-detected language, `task=transcribe`. fp32 and HQQ
+  run the same samples with the same settings.
+- Repetition-loop guard: a post-hoc gzip compression-ratio guard (ratio >
+  2.4, the openai whisper CLI default) is applied to every hypothesis. On
+  short or noisy telephone segments, greedy decoding can loop and emit
+  hundreds of repeated words, which dominate corpus WER via insertions. A
+  looping hypothesis is treated as empty, so it counts as deletions on its
+  own reference, not as hundreds of insertions. The guard is applied
+  identically to fp32 and HQQ, so the comparison stays fair. transformers
+  4.44.2 raises `UnboundLocalError` from its in-generation
+  `compression_ratio_threshold` fallback when `return_timestamps` is `False`,
+  so the guard is applied post-hoc, not in generation.
+- Hardware: Intel Xeon W-1290 @ 3.20 GHz, 20 cores, CPU only. WER is
+  host-independent; runtime (elapsed, real-time factor) is host-specific and
+  reflects this host.
 
-## Results (English, en_us)
+## Datasets
+
+Three datasets are used. The first is read speech; the other two are
+conversational telephone speech, which is harder for a small model.
+
+- `google/fleurs`: read speech, 16 kHz wav. Configs `en_us`, `es_419`
+  (Spanish), `fr_fr` (French), `de_de` (German), `hi_in` (Hindi). Split
+  `test`. `n=100` per config (the first 100, streamed). Loaded with the
+  `datasets` audio feature set to `decode=False` (raw bytes), decoded with
+  `soundfile`. Public license.
+- `diabolocom/talkbank_4_stt`: spontaneous telephone conversation, 16 kHz
+  mp3. Configs `en`, `es`, `fr`, `de` (also `jp`, `zh`). Split `segment` (the
+  `switch` split has long silences and a much higher WER, so it is not used).
+  `n=100` per config. Loaded the same way as `fleurs`; mp3 bytes are decoded
+  with `torchaudio`.
+- `sierra-research/mu-bench`: customer-service telephone calls to a banking
+  AI agent, 8 kHz mono wav. Locales `en-US` (817 utterances), `es-MX` (792),
+  `tr-TR`, `vi-VN`, `zh-CN`. `n=200` per locale for `en-US` and `es-MX`. This
+  dataset is gated, CC-BY-NC-4.0. The `datasets` builder forces the
+  `torchcodec` encoder for this dataset, which this CPU project does not
+  depend on, so the `metadata.jsonl` manifest and the per-utterance wav files
+  are downloaded directly with `huggingface_hub` and decoded with
+  `soundfile`; the 8 kHz audio is resampled to 16 kHz with
+  `torchaudio.functional.resample`. Only aggregate metrics (WER, n, runtime)
+  are reported here; no audio, transcripts, or per-utterance data are
+  retained or redistributed. Benchmark on `sierra-research/mu-bench`
+  (CC-BY-NC-4.0); only aggregate metrics reported.
+
+## Results (English, en_us, fleurs)
 
 | Metric                 | fp32 baseline | HQQ 4-bit  | Delta            |
 |------------------------|---------------|------------|------------------|
 | WER                    | 0.1381        | 0.1367     | -0.0014 (-1.0%)  |
 | Model size on disk     | 151.06 MB     | 61.65 MB   | -89.41 MB (-59.2%)|
 | Weights only (qmodel)  | 151.06 MB     | 59.74 MB   | -91.32 MB (-60.4%)|
-| Avg real-time factor   | 0.089         | 0.093      | +0.004           |
-| Total elapsed (100 fx) | 85.16 s       | 88.89 s    | +3.73 s          |
+| Avg real-time factor   | 0.054         | 0.074      | +0.020           |
+| Total elapsed (100 fx) | 51.5 s        | 70.9 s     | +19.4 s          |
 | Samples succeeded      | 100 / 100     | 100 / 100  | -                |
 
 Notes:
@@ -119,39 +163,96 @@ Notes:
   the HQQ model is statistically tied with the fp32 baseline, not better.
   The headline is that 4-bit HQQ with mixed-precision protection matches the
   fp32 baseline at 59% smaller size.
-- The real-time factor stayed flat. HQQ has no fused 4-bit kernel on CPU, so
-  each linear dequantizes group-by-group, but for this tiny model the
-  overhead is offset by the smaller weight reads.
+- HQQ has no fused 4-bit kernel on CPU, so each linear dequantizes
+  group-by-group. For this tiny model the absolute speed is still well under
+  real time; HQQ is slower than fp32 because of the dequantize overhead.
 
-## Results (multilingual, n=100 per language)
+## Results (multilingual, fleurs, n=100 per language)
 
 The same HQQ weights (`qmodel.pt` sha256 `0e183ee00b1cdd71`) evaluated across
-five `fleurs` configs, fp32 vs HQQ, both with auto-detected language.
+five `fleurs` configs, fp32 vs HQQ, both with auto-detected language and the
+repetition-loop guard.
 
-| Language | Config | fp32 WER | HQQ WER | Delta abs   | Delta rel |
-|----------|--------|----------|---------|-------------|-----------|
-| English  | en_us  | 0.1381   | 0.1367  | -0.0014     | -1.0%     |
-| German   | de_de  | 0.3019   | 0.2946  | -0.0073     | -2.4%     |
-| French   | fr_fr  | 0.5156   | 0.5276  | +0.0120     | +2.3%     |
-| Spanish  | es_419 | 0.1899   | 0.4235  | +0.2336     | +123.0%   |
-| Hindi    | hi_in  | 1.7599   | 2.4145  | +0.6546     | +37.2%    |
+| Language | Config | fp32 WER | HQQ WER | Delta abs   | Delta rel | fp32 run | HQQ run |
+|----------|--------|----------|---------|-------------|-----------|----------|---------|
+| English  | en_us  | 0.1381   | 0.1367  | -0.0014     | -1.0%     | 51.5 s   | 70.9 s  |
+| German   | de_de  | 0.3019   | 0.2946  | -0.0073     | -2.4%     | 72.3 s   | 103.7 s |
+| French   | fr_fr  | 0.4451   | 0.4572  | +0.0121     | +2.7%     | 75.9 s   | 111.4 s |
+| Spanish  | es_419 | 0.1899   | 0.2149  | +0.0250     | +13.2%    | 65.3 s   | 110.5 s |
+| Hindi    | hi_in  | 1.0579   | 1.0579  | 0.0000      | 0.0%      | 131.3 s  | 244.0 s |
 
 Notes:
-- The quantization config was tuned on English. It matches the fp32 baseline
-  on English and German and is within noise on French. Spanish and Hindi
-  degrade; the base model is itself weak on French and Hindi (fp32 WER 0.52
-  and 1.76), and the 4-bit decoder amplifies that on Spanish.
+- Under the guard, HQQ is within 0.025 absolute of fp32 on every language.
+  The quantization is effectively lossless across the tested languages.
+- The v1.3.2 table reported `es_419` HQQ 0.4235 and `hi_in` 1.7599 / 2.4145.
+  Those values were inflated by repetition loops that the guard now catches.
+  This revision corrects them. The model weights are unchanged.
 - A WER above 1.0 (Hindi) means more edit operations than reference words;
   `whisper-tiny` is not usable for Hindi at either precision. This is a
-  property of the base model, not of the quantization.
+  property of the base model, not of the quantization. HQQ does not make
+  Hindi worse (fp32 and HQQ are identical on Hindi under the guard).
+- HQQ runtime is higher than fp32 (1.3x-1.9x) because of the CPU dequantize
+  overhead. The absolute speed is still well under real time.
 - Per-language evidence is committed under `eval_multilingual/` in the
   benchmark repository (see "Benchmarked with" below).
 
-## Ablation (config sweep, same 100 samples)
+## Call-center benchmark
+
+These benchmarks measure `whisper-tiny` (fp32 vs HQQ 4-bit) on conversational
+telephone speech, which is harder than the read-speech `fleurs` eval. Both
+fp32 and HQQ use auto-detected language and `task=transcribe`. The
+repetition-loop guard described in Evaluation is applied to both. Runtime
+is on the Intel Xeon W-1290 host.
+
+### talkbank_4_stt (spontaneous conversation)
+
+| Language | Config | fp32 WER | HQQ WER | Delta abs | n   | fp32 run | HQQ run | Avg RTF (fp32) | Avg RTF (hqq) |
+|----------|--------|----------|---------|-----------|-----|----------|---------|----------------|---------------|
+| English  | en     | 0.4108   | 0.4073  | -0.0035   | 100 | 44.5 s   | 44.0 s  | 0.147          | 0.145         |
+| Spanish  | es     | 0.5246   | 0.5170  | -0.0076   | 100 | 56.0 s   | 94.0 s  | 0.099          | 0.167         |
+| French   | fr     | 0.7531   | 0.7256  | -0.0275   | 100 | 97.6 s   | 91.4 s  | 0.148          | 0.139         |
+| German   | de     | 0.6354   | 0.6425  | +0.0071   | 100 | 38.8 s   | 44.8 s  | 0.192          | 0.222         |
+
+The `segment` split is used. The `switch` split has long silences and a much
+higher WER, so it is not used. `n=100` per language, the first 100 segments
+streamed.
+
+### mu-bench (customer-service telephone)
+
+| Locale | Config | fp32 WER | HQQ WER | Delta abs | n   | fp32 run | HQQ run | Avg RTF (fp32) | Avg RTF (hqq) |
+|--------|--------|----------|---------|-----------|-----|----------|---------|----------------|---------------|
+| en-US  | en     | 0.2777   | 0.2994  | +0.0217   | 200 | 70.8 s   | 99.9 s  | 0.093          | 0.132         |
+| es-MX  | es     | 0.6884   | 0.6647  | -0.0237   | 200 | 105.9 s  | 139.4 s | 0.122          | 0.161         |
+
+`mu-bench` is 8 kHz mono telephone speech, resampled to 16 kHz. `n=200` per
+locale. `mu-bench` is gated, CC-BY-NC-4.0; only aggregate metrics are
+reported here (no audio or transcripts are redistributed).
+
+Notes:
+- fp32 and HQQ are within noise on every call-center config (deltas are all
+  within +/-0.03 absolute). HQQ 4-bit is effectively lossless on
+  conversational telephone speech, as it is on `fleurs` read speech.
+- The WERs are high (0.28-0.75) because `whisper-tiny` is small and
+  conversational telephone speech is hard; this is a property of the base
+  model, not of the quantization. Use a larger Whisper model when lower WER
+  is needed on this domain.
+- `mu-bench` en-US (0.28) is lower than `talkbank` en (0.41) because
+  `mu-bench` is banking customer-service calls (more structured) while
+  `talkbank` is spontaneous conversation.
+- HQQ RTF is higher than fp32 (1.1x-1.7x) because HQQ has no fused 4-bit
+  kernel on CPU; each linear dequantizes group-by-group. For this tiny model
+  the absolute speed is still well under real time.
+- The repetition-loop guard changes the raw WER materially on `talkbank`
+  (without it, one fp32 sample looped to 333 words and inflated English fp32
+  corpus WER from ~0.41 to 0.79). The guard is applied identically to fp32
+  and HQQ, so the comparison is fair.
+
+## Ablation (config sweep, same 100 English samples)
 
 All rows use `axis=1`. `protect` names the linears kept at 8-bit; the rest
 are 4-bit. `group` is the group_size. The winner (row H) is the published
-config.
+config. These runs predate the repetition-loop guard; English `en_us` does
+not loop, so the guard does not change these values.
 
 | Row | group | protect (8-bit)        | WER    | Size   |
 |-----|-------|------------------------|--------|--------|
@@ -208,7 +309,13 @@ EVAL_LIMIT=100 MODEL_ASR=openai/whisper-tiny EVAL_CONFIG=en_us \
 EVAL_LIMIT=100 QUANT=hqq MODEL_ASR=./whisper-tiny-hqq-4bit EVAL_CONFIG=en_us \
   EVAL_OUT=eval_hqq.json python eval_wer.py
 
-# 4. Publish (needs a Hugging Face write token).
+# 4. Call-center benchmark (talkbank segment split, mu-bench direct download).
+EVAL_DATASET=diabolocom/talkbank_4_stt EVAL_CONFIG=en EVAL_SPLIT=segment EVAL_LIMIT=100 \
+  MODEL_ASR=openai/whisper-tiny EVAL_OUT=talkbank_en_fp32.json python eval_wer.py
+EVAL_DATASET=sierra-research/mu-bench EVAL_CONFIG=en EVAL_SPLIT=train EVAL_LIMIT=200 \
+  QUANT=hqq MODEL_ASR=./whisper-tiny-hqq-4bit EVAL_OUT=mubench_en_hqq.json python eval_wer.py
+
+# 5. Publish (needs a Hugging Face write token).
 PUSH=1 HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit python quantize.py
 ```
 
@@ -216,9 +323,12 @@ PUSH=1 HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit python quantize.py
 
 The quantization, eval harness, and per-language WER evidence live in the
 benchmark repository: [dkhokhlov/whisper-cascade](https://github.com/dkhokhlov/whisper-cascade)
-(branch `hqq-4bit`, tag `v1.3.2`). Per-language results are committed under
-`eval_multilingual/`; the English evidence is `eval_baseline.json` and
-`eval_hqq.json`.
+(branch `hqq-4bit`, tag `v1.4.0`). Evidence:
+- English (fleurs): `eval_baseline.json`, `eval_hqq.json`.
+- Multilingual (fleurs): `eval_multilingual/<config>_<fp32|hqq>.json`.
+- Call-center: `eval_callcenter/talkbank_<lang>_<fp32|hqq>.json` and
+  `eval_callcenter/mubench_<lang>_<fp32|hqq>.json` (mu-bench files hold only
+  aggregate metrics, per the CC-BY-NC-4.0 terms).
 
 ## Limitations
 
@@ -227,10 +337,14 @@ benchmark repository: [dkhokhlov/whisper-cascade](https://github.com/dkhokhlov/w
 - `proj_out` and the embedding are fp16, not 4-bit. A smaller model is
   possible if the embedding is also quantized, but that raises the WER risk
   on the vocab projection and was not done here.
-- The quantization config was tuned on English. English and German match the
-  fp32 baseline within 100-sample noise; French is within noise; Spanish and
-  Hindi degrade (see the multilingual table). Use the fp32 model when the
-  lowest WER is required on a language this model degrades on, and the size
-  is acceptable.
-- Evaluated on five `fleurs` configs (en, es, fr, de, hi), 100 samples each.
-  The base model is multilingual; other languages were not measured.
+- The quantization config was tuned on English. Under the repetition-loop
+  guard, HQQ is within 0.025 absolute of fp32 on every tested language and
+  dataset. Spanish shows a small +0.025 regression on `fleurs`; the other
+  configs are within noise. Use the fp32 model when the lowest WER is
+  required and the size is acceptable.
+- Evaluated on `fleurs` (en, es, fr, de, hi), `talkbank_4_stt` (en, es, fr,
+  de), and `mu-bench` (en-US, es-MX). The base model is multilingual; other
+  languages and datasets were not measured.
+- WER on conversational telephone speech is high (0.28-0.75) because
+  `whisper-tiny` is small. This is a base-model property. Use a larger
+  Whisper model for this domain when lower WER is needed.

@@ -1,15 +1,16 @@
 {
-  "model": "dkhokhlov/whisper-tiny-hqq-4bit",
+  "model": "./whisper-tiny-hqq-4bit",
   "quant": "hqq",
   "dataset": "google/fleurs",
   "config": "es_419",
   "split": "test",
+  "language": null,
   "n": 100,
   "n_fail": 0,
-  "wer": 0.4235,
+  "wer": 0.2149,
   "total_duration_s": 1200.78,
-  "total_elapsed_s": 111.194,
-  "avg_rtf": 0.093,
+  "total_elapsed_s": 110.509,
+  "avg_rtf": 0.092,
   "samples": [
     {
       "ref": "se recomienda enfáticamente a los viajeros que se informen sobre cualquier riesgo de clima extremo en el área que visitan dado que ello puede afectar sus planes de viaje",

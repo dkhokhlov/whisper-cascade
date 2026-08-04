@@ -1,0 +1,14 @@
+{
+  "model": "openai/whisper-tiny",
+  "quant": null,
+  "dataset": "sierra-research/mu-bench",
+  "config": "es",
+  "split": "train",
+  "language": null,
+  "n": 200,
+  "n_fail": 0,
+  "wer": 0.6884,
+  "total_duration_s": 865.032,
+  "total_elapsed_s": 105.918,
+  "avg_rtf": 0.122
+}

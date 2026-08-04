@@ -1,0 +1,36 @@
+{
+  "model": "./whisper-tiny-hqq-4bit",
+  "quant": "hqq",
+  "dataset": "diabolocom/talkbank_4_stt",
+  "config": "en",
+  "split": "segment",
+  "language": null,
+  "n": 100,
+  "n_fail": 0,
+  "wer": 0.4073,
+  "total_duration_s": 303.539,
+  "total_elapsed_s": 44.045,
+  "avg_rtf": 0.145,
+  "samples": [
+    {
+      "ref": "hey pretty girl",
+      "hyp": "Hey pretty girl"
+    },
+    {
+      "ref": "uhhh hh",
+      "hyp": "Yeah."
+    },
+    {
+      "ref": "what you doin",
+      "hyp": "What are you doing?"
+    },
+    {
+      "ref": "hi::",
+      "hyp": "Hi!"
+    },
+    {
+      "ref": "you wanna see me",
+      "hyp": "Do you want to say me?"
+    }
+  ]
+}

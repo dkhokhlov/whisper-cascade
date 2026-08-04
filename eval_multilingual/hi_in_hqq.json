@@ -1,19 +1,20 @@
 {
-  "model": "./whisper-tiny-hqq-4bit-ml",
+  "model": "./whisper-tiny-hqq-4bit",
   "quant": "hqq",
   "dataset": "google/fleurs",
   "config": "hi_in",
   "split": "test",
+  "language": null,
   "n": 100,
   "n_fail": 0,
-  "wer": 2.4145,
+  "wer": 1.0579,
   "total_duration_s": 1218.18,
-  "total_elapsed_s": 243.677,
+  "total_elapsed_s": 243.986,
   "avg_rtf": 0.2,
   "samples": [
     {
       "ref": "कुछ अणुओं में अस्थिर केंद्रक होता है जिसका मतलब यह है कि उनमें थोड़े या बिना किसी झटके से टूटने की प्रवृत्ति होती है",
-      "hyp": "Kochi Arangu mein arste kendra kota, jiska matla biaa ki unme thode yaa bina kizi jit kese tutni kiprava tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho tiho"
+      "hyp": ""
     },
     {
       "ref": "ग्रीनलैंड को बहुत कम जगह बसाया गया था नॉर्स सगास में वे कहते हैं कि एरिक रेड हत्या के लिए आइसलैंड से निर्वासित किया गया था और आगे पश्चिम की यात्रा करते समय ग्रीनलैंड मिला जिसे ग्रीनलैंड नाम दिया गया",

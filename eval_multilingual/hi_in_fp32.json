@@ -4,12 +4,13 @@
   "dataset": "google/fleurs",
   "config": "hi_in",
   "split": "test",
+  "language": null,
   "n": 100,
   "n_fail": 0,
-  "wer": 1.7599,
+  "wer": 1.0579,
   "total_duration_s": 1218.18,
-  "total_elapsed_s": 130.922,
-  "avg_rtf": 0.107,
+  "total_elapsed_s": 131.285,
+  "avg_rtf": 0.108,
   "samples": [
     {
       "ref": "कुछ अणुओं में अस्थिर केंद्रक होता है जिसका मतलब यह है कि उनमें थोड़े या बिना किसी झटके से टूटने की प्रवृत्ति होती है",

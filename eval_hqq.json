@@ -1,14 +1,15 @@
 {
-  "model": "dkhokhlov/whisper-tiny-hqq-4bit",
+  "model": "./whisper-tiny-hqq-4bit",
   "quant": "hqq",
   "dataset": "google/fleurs",
   "config": "en_us",
   "split": "test",
+  "language": null,
   "n": 100,
   "n_fail": 0,
   "wer": 0.1367,
   "total_duration_s": 953.88,
-  "total_elapsed_s": 70.906,
+  "total_elapsed_s": 70.889,
   "avg_rtf": 0.074,
   "samples": [
     {
