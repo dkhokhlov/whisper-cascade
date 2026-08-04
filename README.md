@@ -116,6 +116,10 @@ Run `make` (no target) to print this help.
 | `make asr` | Transcribe audio to JSON (default multilingual samples, or `AUDIO=`). |
 | `make en` | Translate text to English (stdin/`TEXT=`; JSON with text + stats to stdout). |
 | `make tts` | Synthesize speech from text (stdin/`TEXT=`; writes `tts.wav`, `OUTPUT=` to override). |
+| `make quantize` | Quantize `MODEL_ASR` with HQQ 4-bit to `HQQ_OUT` (local dir). |
+| `make push` | Quantize and upload `HQQ_OUT` to `HQQ_REPO` (needs `HF_TOKEN_WRITE`). |
+| `make eval-baseline` | Measure baseline WER (fp32 `MODEL_ASR`) on `EVAL_DATASET`/`EVAL_CONFIG`/`EVAL_SPLIT` (`EVAL_LIMIT`). |
+| `make eval-hqq` | Measure HQQ WER (`QUANT=hqq MODEL_ASR=HQQ_REPO`) on `EVAL_DATASET`/`EVAL_CONFIG`/`EVAL_SPLIT` (`EVAL_LIMIT`). |
 | `make test` | Run the fast unit tests (no model load, no network). |
 | `make test-integration` | Run the integration tests (load the real Whisper/MarianMT/VITS models). |
 | `make clean` | Remove Python bytecode cache (`__pycache__`, `*.pyc`); keeps `.venv`. |

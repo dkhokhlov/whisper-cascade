@@ -32,9 +32,15 @@ HQQ_GROUP ?= 32
 HQQ_AXIS ?= 1
 HQQ_PROTECT ?= encoder.layers,fc1
 HQQ_PROTECT_NBITS ?= 8
-# WER eval subset size on google/fleurs en_us (make eval-baseline / eval-hqq).
+# WER eval dataset (make eval-baseline / eval-hqq). fleurs (read speech),
+# diabolocom/talkbank_4_stt (telephone, split=segment), or
+# sierra-research/mu-bench (call-center, split=train; gated CC-BY-NC-4.0).
+EVAL_DATASET ?= google/fleurs
+# WER eval split (fleurs test, talkbank segment, mu-bench train).
+EVAL_SPLIT ?= test
+# WER eval subset size (make eval-baseline / eval-hqq).
 EVAL_LIMIT ?= 100
-# WER eval fleurs config / language code (make eval-baseline / eval-hqq).
+# WER eval config / language code (make eval-baseline / eval-hqq).
 EVAL_CONFIG ?= en_us
 
 .PHONY: help info venv samples asr en tts quantize push eval-baseline eval-hqq test test-integration clean clean-all
@@ -57,6 +63,8 @@ help: ## Show available targets
 	@printf '  %-52s %s\n' 'make push' 'quantize + upload to HQQ_REPO (needs HF_TOKEN_WRITE)'
 	@printf '  %-52s %s\n' 'make eval-baseline EVAL_CONFIG=en_us' 'WER of fp32 MODEL_ASR on a fleurs config'
 	@printf '  %-52s %s\n' 'make eval-hqq EVAL_CONFIG=es_419' 'WER of HQQ MODEL_ASR on a fleurs config'
+	@printf '  %-52s %s\n' 'make eval-baseline EVAL_DATASET=diabolocom/talkbank_4_stt EVAL_CONFIG=es EVAL_SPLIT=segment' 'talkbank telephone Spanish'
+	@printf '  %-52s %s\n' 'make eval-hqq EVAL_DATASET=sierra-research/mu-bench EVAL_CONFIG=en EVAL_SPLIT=train' 'mu-bench call-center English (gated)'
 	@printf '  %-52s %s\n' 'make test' 'fast unit tests'
 	@echo ""
 	@echo "Pipeline (foreign speech -> English speech; each stage prints JSON, jq extracts text):"
@@ -69,6 +77,8 @@ info: ## Show current config and status
 	@echo "QUANT             $${QUANT:-<none (fp32)>}"
 	@echo "MODEL_TRANSLATE   $(MODEL_TRANSLATE)"
 	@echo "MODEL_TTS         $(MODEL_TTS)"
+	@echo "EVAL_DATASET      $(EVAL_DATASET)"
+	@echo "EVAL_CONFIG       $(EVAL_CONFIG)   EVAL_SPLIT $(EVAL_SPLIT)   EVAL_LIMIT $(EVAL_LIMIT)"
 	@echo "VENV              $(VENV) - $$([ -d $(VENV) ] && echo present || echo missing)"
 	@echo "SAMPLES           HF cache (Narsil/asr_dummy) - en+es+hi (mlk.flac, 4.flac, hindi.ogg)"
 	@echo "AUDIO             $${AUDIO:-<built-in samples>}"
@@ -106,11 +116,13 @@ push: $(VENV)/.stamp ## Quantize and upload HQQ_OUT to HQQ_REPO (needs HF_TOKEN_
 	 MODEL_ASR=$(MODEL_ASR) HQQ_OUT=$(HQQ_OUT) HQQ_GROUP=$(HQQ_GROUP) HQQ_AXIS=$(HQQ_AXIS) \
 	 HQQ_PROTECT=$(HQQ_PROTECT) HQQ_PROTECT_NBITS=$(HQQ_PROTECT_NBITS) HQQ_REPO=$(HQQ_REPO) PUSH=1 $(PY) quantize.py
 
-eval-baseline: $(VENV)/.stamp ## Measure baseline WER (fp32 MODEL_ASR) on fleurs en_us (EVAL_LIMIT)
-	@MODEL_ASR=$(MODEL_ASR) EVAL_CONFIG=$(EVAL_CONFIG) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_baseline.json $(PY) eval_wer.py
+eval-baseline: $(VENV)/.stamp ## Measure baseline WER (fp32 MODEL_ASR) on EVAL_DATASET/EVAL_CONFIG/EVAL_SPLIT (EVAL_LIMIT)
+	@MODEL_ASR=$(MODEL_ASR) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
+	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_baseline.json $(PY) eval_wer.py
 
-eval-hqq: $(VENV)/.stamp ## Measure HQQ WER on a fleurs config (EVAL_CONFIG, default en_us; QUANT=hqq MODEL_ASR=HQQ_REPO)
-	@QUANT=hqq MODEL_ASR=$(HQQ_REPO) EVAL_CONFIG=$(EVAL_CONFIG) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_hqq.json $(PY) eval_wer.py
+eval-hqq: $(VENV)/.stamp ## Measure HQQ WER (QUANT=hqq MODEL_ASR=HQQ_REPO) on EVAL_DATASET/EVAL_CONFIG/EVAL_SPLIT (EVAL_LIMIT)
+	@QUANT=hqq MODEL_ASR=$(HQQ_REPO) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
+	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_hqq.json $(PY) eval_wer.py
 
 test: $(VENV)/.stamp ## Run the fast unit tests (no model load, no network)
 	@$(PY) -m pytest
