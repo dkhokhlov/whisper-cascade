@@ -1,6 +1,7 @@
 # whisper-cascade
 
-A minimal, CPU-only speech-to-text tool, with two text helpers that compose
+A minimal speech-to-text tool that runs on CPU by default (an optional GPU
+path speeds up the larger ASR model), with two text helpers that compose
 into a cascade speech translation pipeline.
 
 The three stages:
@@ -67,7 +68,7 @@ HQQ 4-bit ASR model instead; the translate and TTS stages are not quantized.
 HQQ 4-bit is also published for `whisper-base` and `whisper-small` (see the
 size analysis below).
 
-No Docker, no ffmpeg, no GPU. Dependencies are managed with [uv](https://docs.astral.sh/uv/).
+No Docker, no ffmpeg, no GPU required. Dependencies are managed with [uv](https://docs.astral.sh/uv/).
 The models and the test samples are cached through the Hugging Face cache
 (`huggingface_hub`) — the same mechanism used for models and datasets — so
 nothing is re-downloaded after the first run.
