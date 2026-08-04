@@ -1,0 +1,36 @@
+{
+  "model": "openai/whisper-base",
+  "quant": null,
+  "dataset": "google/fleurs",
+  "config": "fr_fr",
+  "split": "test",
+  "language": null,
+  "n": 100,
+  "n_fail": 0,
+  "wer": 0.296,
+  "total_duration_s": 1073.7,
+  "total_elapsed_s": 122.443,
+  "avg_rtf": 0.114,
+  "samples": [
+    {
+      "ref": "l'accident a eu lieu en terrain montagneux et il semblerait que cela ait été causé par un incendie malveillant",
+      "hyp": "L'accident a eu lieu en terrement à lieu, et il sembleraient que cela était causé par un 110 malveillants."
+    },
+    {
+      "ref": "nous sommes d'accord avec la déclaration de l'usoc comité olympique des états-unis selon laquelle les intérêts de nos athlètes et de nos clubs ainsi que de leur sport pourraient être mieux servis. cela peut être fait en allant de l'avant et en procédant plutôt à des changements significatifs au sein de notre organisation qu'à la révocation d'accréditation",
+      "hyp": "Nous sommes d'accord avec la déclaration de Lussock, comité au Limpic des États-Unis, selon laquelle les intérêts de nos atletes et de nos clubs ainsi que de leur sport pour t'attetent au mieux servi. Cela peut être fait en allant de l'avant et en procédant plutôt à des changements significatifs au sein de notre organisation, qu'à la révocation de la créditation."
+    },
+    {
+      "ref": "il a ajouté qu’« on ne devrait cependant pas leur demander d’assumer des obligations qui dépassent leur stade de développement leur responsabilité et leurs capacités. »",
+      "hyp": "Il a ajouté qu'on ne devrait se pendant pas leur demander d'assumer des obligations qui n'est pas sur stade de développement, de responsabilité et leur capacité."
+    },
+    {
+      "ref": "le rugissement du tigre ne ressemble pas au rugissement ample du lion mais plutôt à une phrase dont les mots seraient des cris et des grondements",
+      "hyp": "Votre jugement du tingue n'en ressemble pas au jugement en plus du diam. Mais plutôt à une phrase dans les mots serait décriée et dégonne de mots."
+    },
+    {
+      "ref": "le même mois un autre avion de ligne a fait une sortie de piste à mashhad et a heurté un mur tuant ainsi dix-sept personnes",
+      "hyp": "De même mois, un autre agent de ligne a fait une sortie de piste à machade et horté un mur, tu en as ainsi 17 personnes."
+    }
+  ]
+}

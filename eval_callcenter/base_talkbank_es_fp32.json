@@ -1,0 +1,36 @@
+{
+  "model": "openai/whisper-base",
+  "quant": null,
+  "dataset": "diabolocom/talkbank_4_stt",
+  "config": "es",
+  "split": "segment",
+  "language": null,
+  "n": 100,
+  "n_fail": 0,
+  "wer": 0.3653,
+  "total_duration_s": 564.14,
+  "total_elapsed_s": 83.854,
+  "avg_rtf": 0.149,
+  "samples": [
+    {
+      "ref": "aló .",
+      "hyp": "¡Alo!"
+    },
+    {
+      "ref": "qué más ve, cómo te ha ido ?",
+      "hyp": "¿Qué me va a ver como te hayos?"
+    },
+    {
+      "ref": "ah, Mi madre, ya casi .",
+      "hyp": "Ah, vai marar a arrejaca."
+    },
+    {
+      "ref": "sí .",
+      "hyp": "See"
+    },
+    {
+      "ref": "me voy el once, pedí día, pues yo iba a pedir día libre el, el Al otro día Del examen, o sea el trece .  &=lips:smack pero pues la supervisora me dijo que me aconsejaba mejor que pidiera el día anterior para que me fuera temprano .  eh, reconociera el sitio, viera cuanto me demoraba, etcétera, etcétera .",
+      "hyp": "Me voy el 11, pedí, pues yo pedí a libre al otro día del examen o sea el 13, pero pues la supervisora me dijo que me aconsejaba mejor que pedir el día anterior para que me fuera temprano, reconociera el sitio, o era cuanto me demoraba, etcétera, etcétera."
+    }
+  ]
+}

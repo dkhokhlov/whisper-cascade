@@ -281,20 +281,23 @@ not teed.)
 `eval_wer.py` measures the Word Error Rate (WER) of an ASR model on a HF
 audio dataset. It supports three dataset sources (dispatched by `EVAL_DATASET`):
 
-- `google/fleurs`: read speech, 16 kHz wav. Configs `en_us`, `es_419`,
-  `fr_fr`, `de_de`, `hi_in`. Split `test`. Public.
-- `diabolocom/talkbank_4_stt`: spontaneous telephone conversation, 16 kHz
-  mp3. Configs `en`, `es`, `fr`, `de`, `jp`, `zh`. Split `segment` (the
-  `switch` split has long silences and a much higher WER, so it is not used).
-- `sierra-research/mu-bench`: customer-service telephone calls to a banking
-  AI agent, 8 kHz mono wav. Gated, CC-BY-NC-4.0. Locales `en-US`, `es-MX`,
-  `tr-TR`, `vi-VN`, `zh-CN`. The `datasets` builder forces the `torchcodec`
-  encoder for this dataset, which this CPU project does not depend on, so
-  the manifest and per-utterance wav files are downloaded directly with
-  `huggingface_hub`, decoded with `soundfile`, and resampled 8 kHz to 16 kHz
-  with `torchaudio.functional.resample`. Only aggregate metrics (WER, n,
-  runtime) are reported for `mu-bench`; no audio or transcripts are
-  redistributed.
+- [`google/fleurs`](https://huggingface.co/datasets/google/fleurs): read
+  speech, 16 kHz wav. Configs `en_us`, `es_419`, `fr_fr`, `de_de`, `hi_in`.
+  Split `test`. Public.
+- [`diabolocom/talkbank_4_stt`](https://huggingface.co/datasets/diabolocom/talkbank_4_stt):
+  spontaneous telephone conversation, 16 kHz mp3. Configs `en`, `es`, `fr`,
+  `de`, `jp`, `zh`. Split `segment` (the `switch` split has long silences
+  and a much higher WER, so it is not used).
+- [`sierra-research/mu-bench`](https://huggingface.co/datasets/sierra-research/mu-bench):
+  customer-service telephone calls to a banking AI agent, 8 kHz mono wav.
+  Gated, CC-BY-NC-4.0. Locales `en-US`, `es-MX`, `tr-TR`, `vi-VN`, `zh-CN`.
+  The `datasets` builder forces the `torchcodec` encoder for this dataset,
+  which this CPU project does not depend on, so the manifest and
+  per-utterance wav files are downloaded directly with
+  [huggingface_hub](https://github.com/huggingface/huggingface_hub), decoded
+  with `soundfile`, and resampled 8 kHz to 16 kHz with
+  `torchaudio.functional.resample`. Only aggregate metrics (WER, n, runtime)
+  are reported for `mu-bench`; no audio or transcripts are redistributed.
 
 A post-hoc repetition-loop guard (gzip compression ratio > 2.4, the openai
 whisper CLI default) is applied to every hypothesis. On short or noisy
@@ -307,28 +310,37 @@ from its in-generation `compression_ratio_threshold` fallback when
 Hardware: Intel Xeon W-1290 @ 3.20 GHz, 20 cores, CPU only. WER is
 host-independent; runtime is host-specific.
 
-Benchmark for `openai/whisper-tiny` fp32 vs `dkhokhlov/whisper-tiny-hqq-4bit`
-(n=100 fleurs, n=100 talkbank, n=200 mu-bench; WER, lower is better):
+Benchmark for [`openai/whisper-tiny`](https://huggingface.co/openai/whisper-tiny)
+and [`openai/whisper-base`](https://huggingface.co/openai/whisper-base), fp32
+vs the published HQQ 4-bit models
+([`dkhokhlov/whisper-tiny-hqq-4bit`](https://huggingface.co/dkhokhlov/whisper-tiny-hqq-4bit),
+[`dkhokhlov/whisper-base-hqq-4bit`](https://huggingface.co/dkhokhlov/whisper-base-hqq-4bit)).
+n=100 for `fleurs` and `talkbank`, n=200 for `mu-bench`. WER, lower is
+better. "base vs tiny" = base fp32 minus tiny fp32 (negative means base is
+better); the `%` is relative to tiny fp32.
 
-| Dataset        | Lang | fp32 WER | HQQ WER | Delta   |
-|---------------|------|----------|---------|---------|
-| fleurs         | en   | 0.1381   | 0.1367  | -0.0014 |
-| fleurs         | de   | 0.3019   | 0.2946  | -0.0073 |
-| fleurs         | fr   | 0.4451   | 0.4572  | +0.0121 |
-| fleurs         | es   | 0.1899   | 0.2149  | +0.0250 |
-| fleurs         | hi   | 1.0579   | 1.0579  | 0.0000  |
-| mu-bench       | en-US| 0.2777   | 0.2994  | +0.0217 |
-| mu-bench       | es-MX| 0.6884   | 0.6647  | -0.0237 |
-| talkbank       | en   | 0.4108   | 0.4073  | -0.0035 |
-| talkbank       | es   | 0.5246   | 0.5170  | -0.0076 |
-| talkbank       | fr   | 0.7531   | 0.7256  | -0.0275 |
-| talkbank       | de   | 0.6354   | 0.6425  | +0.0071 |
+| Dataset  | Lang  | tiny fp32 | tiny hqq | base fp32 | base hqq | base vs tiny | base vs tiny % |
+|----------|-------|-----------|----------|-----------|----------|--------------|----------------|
+| fleurs   | en    | 0.1381    | 0.1367   | 0.0985    | 0.0995   | -0.0396      | -28.7%         |
+| fleurs   | de    | 0.3019    | 0.2946   | 0.1994    | 0.1901   | -0.1025      | -34.0%         |
+| fleurs   | fr    | 0.4451    | 0.4572   | 0.2960    | 0.2963   | -0.1491      | -33.5%         |
+| fleurs   | es    | 0.1899    | 0.2149   | 0.1148    | 0.1200   | -0.0751      | -39.5%         |
+| fleurs   | hi    | 1.0579    | 1.0579   | 1.0367    | 1.0340   | -0.0212      | -2.0%          |
+| mu-bench | en-US | 0.2777    | 0.2994   | 0.2650    | 0.2662   | -0.0127      | -4.6%          |
+| mu-bench | es-MX | 0.6884    | 0.6647   | 0.5707    | 0.5758   | -0.1177      | -17.1%         |
+| talkbank | en    | 0.4108    | 0.4073   | 0.3810    | 0.3993   | -0.0298      | -7.3%          |
+| talkbank | es    | 0.5246    | 0.5170   | 0.3653    | 0.3794   | -0.1593      | -30.4%         |
+| talkbank | fr    | 0.7531    | 0.7256   | 0.5737    | 0.5950   | -0.1794      | -23.8%         |
+| talkbank | de    | 0.6354    | 0.6425   | 0.5646    | 0.5770   | -0.0708      | -11.1%         |
 
-HQQ 4-bit is within 0.025 absolute of fp32 on every config (61.65 MB vs
-151.06 MB, -59.2%). Per-eval runtime and the full quantization report are in
-[`hqq_report.md`](hqq_report.md) (the model card for
-`dkhokhlov/whisper-tiny-hqq-4bit`). Evidence JSONs are committed under
-`eval_multilingual/` and `eval_callcenter/`.
+HQQ 4-bit is within 5% relative of fp32 for both models on every config.
+Size: tiny 151.06 -> 61.66 MB (-59.2%); base 290.38 -> 104.89 MB (-63.9%).
+`whisper-base` beats `whisper-tiny` on every config except Hindi (both are
+not usable). Per-eval runtime, the relative Delta % column, and the full
+quantization reports are in [`hqq_report.md`](hqq_report.md) (the
+`whisper-tiny` card) and [`hqq_report_base.md`](hqq_report_base.md) (the
+`whisper-base` card). Evidence JSONs are committed under `eval_multilingual/`
+and `eval_callcenter/` (base files are prefixed `base_`).
 
 ## Notes
 

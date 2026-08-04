@@ -1,0 +1,36 @@
+{
+  "model": "openai/whisper-base",
+  "quant": null,
+  "dataset": "diabolocom/talkbank_4_stt",
+  "config": "de",
+  "split": "segment",
+  "language": null,
+  "n": 100,
+  "n_fail": 0,
+  "wer": 0.5646,
+  "total_duration_s": 202.033,
+  "total_elapsed_s": 65.339,
+  "avg_rtf": 0.323,
+  "samples": [
+    {
+      "ref": "ich unterrichte nachher Französisch, Englisch und Deutsch .",
+      "hyp": "die Unterrichten nachher von Zößech englisch und durch."
+    },
+    {
+      "ref": "&=laugh und aber .",
+      "hyp": "And I bet..."
+    },
+    {
+      "ref": "was, was viel wichtiger ist, ist daß der ganze Campus, die ganze Uni ist &+ähm .",
+      "hyp": "Was viel wichtiger ist, ist das ganze Campus, ganze Uni."
+    },
+    {
+      "ref": "+, und gehen in die Entwicklungshilfe also ist es ist eine Schule, die mulit- wirklich multinational ausgerichtet ist, wir haben viele &+aus +/.  ausländische Studenten dort, inklusive ich .",
+      "hyp": "und gehen in die Entwicklungshilfe. Also sind die Schule, die wirklich multinational ausgerichtet wird. Wir haben viele ausländische Studenten dort inklusive ich."
+    },
+    {
+      "ref": "&+äh wir lernen unheimlich viel über interkulturelle Kommunikation, wir haben viele .",
+      "hyp": "Ich will an unheimlich viel über interkulturelle Kommunikation haben."
+    }
+  ]
+}

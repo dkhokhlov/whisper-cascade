@@ -1,0 +1,36 @@
+{
+  "model": "./whisper-base-hqq-4bit",
+  "quant": "hqq",
+  "dataset": "diabolocom/talkbank_4_stt",
+  "config": "fr",
+  "split": "segment",
+  "language": null,
+  "n": 100,
+  "n_fail": 0,
+  "wer": 0.595,
+  "total_duration_s": 659.47,
+  "total_elapsed_s": 185.618,
+  "avg_rtf": 0.281,
+  "samples": [
+    {
+      "ref": "Et voilà .  Ben , oui , on me paye pour t'appeler .  C'est pas pire , non certain .  Ils paye la communication .  Mais en plus de ça , je jeje vais recevoir dix dollar .",
+      "hyp": "Et voilà. Et on paye pour t'appeler, non, ça fait un pay de la communication, mais en plus de ça, je vais avoir de l'alors."
+    },
+    {
+      "ref": "Moi , quand la fille me demandait ça , tu vas me payer pour parler .  Pas de problème .  C'est ce que je fais le mieux .  Ah .",
+      "hyp": "On regarde la fille manement des seins. Tu vas me payer pour parler. Pas de problème, c'est ce que je fais mieux."
+    },
+    {
+      "ref": "Parce que c'est une université américaine .",
+      "hyp": "Spass das mit den Universitäten."
+    },
+    {
+      "ref": "Fait l'étude des langues hautes que l'anglais dans qui étudie soit le français , l'allemand , ces choses-là .  Mais ils veulent faire une étude .  Ils regardent voir le niveau de scolarité des gens et le niveau de français utilisé parce .",
+      "hyp": "Il fait les tuts des langues autres que l'anglais. La saute qui est du soeur français, l'allemand, c'est chose. Mais il veulent faire les netteurs et les gargants voir le niveau de scolagité des gens et le niveau de français utilisés."
+    },
+    {
+      "ref": "Entre autres , ça se parle souvent que même les ceux qui sortent des universités ici cou .  Donc français , c'est massacré .  C'est pas possible là .",
+      "hyp": "en trop que ça se passe souvent quand même les succents des universités ici, où dans les Français, c'est massacré, c'est pas possible."
+    }
+  ]
+}
