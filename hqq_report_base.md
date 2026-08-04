@@ -19,12 +19,22 @@ tags:
 
 Model card source for `dkhokhlov/whisper-base-hqq-4bit`.
 
+## Related models
+
+- [`dkhokhlov/whisper-tiny-hqq-4bit`](https://huggingface.co/dkhokhlov/whisper-tiny-hqq-4bit) — HQQ 4-bit, whisper-tiny (CPU eval)
+- [`dkhokhlov/whisper-small-hqq-4bit`](https://huggingface.co/dkhokhlov/whisper-small-hqq-4bit) — HQQ 4-bit, whisper-small (A10 GPU eval)
+- Source model: [`openai/whisper-base`](https://huggingface.co/openai/whisper-base) (fp32)
+- Benchmark + code: [`dkhokhlov/whisper-cascade`](https://github.com/dkhokhlov/whisper-cascade)
+
 ## Summary
 
 [`openai/whisper-base`](https://huggingface.co/openai/whisper-base) was
 quantized with [HQQ](https://huggingface.co/docs/transformers/en/quantization/hqq)
-4-bit grouped quantization for CPU inference. The model size shrank from
-290.38 MB (fp32) to 104.89 MB (63.9% reduction). The Word Error Rate (WER)
+4-bit grouped quantization for CPU inference. The deployment RAM (fp16
+compute) is 102.97 MB, 64.5% smaller than the 290.38 MB fp32 model; it
+equals the on-disk `qmodel.pt` and is WER-neutral. The fp32-compute
+benchmark resident RAM is 159.8 MB (45.0% smaller). The
+Word Error Rate (WER)
 on 100 English samples from [`google/fleurs`](https://huggingface.co/datasets/google/fleurs)
 `en_us` (test split) stayed at the baseline level: 0.0985 (fp32) vs 0.0995
 (HQQ), a difference of +0.0010 absolute (+1.0% relative), within the noise
@@ -39,9 +49,9 @@ applied to base without a separate sweep; it matches the fp32 baseline on
 English and stays within 5% relative of fp32 on every tested config.
 
 `whisper-base` is a larger model than `whisper-tiny`, so it transcribes
-better. Across the 11 tested configs (5 `fleurs`, 4 `talkbank`, 2 `mu-bench`),
-base fp32 beats tiny fp32 by 2-40% relative (except Hindi, where both models
-are not usable). The cross-reference table is below.
+better. Across the 9 tested configs (5 `fleurs`, 4 `talkbank`), base fp32
+beats tiny fp32 by 2-40% relative (except Hindi, where both models are not
+usable). The cross-reference table is below.
 
 Generation config: this revision clears the English `forced_decoder_ids`
 that the source `config.json` ships with and writes a modern
@@ -127,26 +137,14 @@ conversational telephone speech, which is harder.
   `de` (also `jp`, `zh`). Split `segment` (the `switch` split has long
   silences and a much higher WER, so it is not used). `n=100` per config.
   mp3 bytes are decoded with `torchaudio`.
-- [`sierra-research/mu-bench`](https://huggingface.co/datasets/sierra-research/mu-bench):
-  customer-service telephone calls to a banking AI agent, 8 kHz mono wav.
-  Locales `en-US` (817 utterances), `es-MX` (792), `tr-TR`, `vi-VN`, `zh-CN`.
-  `n=200` per locale for `en-US` and `es-MX`. Gated, CC-BY-NC-4.0. The
-  `datasets` builder forces the `torchcodec` encoder for this dataset, which
-  this CPU project does not depend on, so the `metadata.jsonl` manifest and
-  the per-utterance wav files are downloaded directly with
-  [huggingface_hub](https://github.com/huggingface/huggingface_hub), decoded
-  with `soundfile`, and resampled 8 kHz to 16 kHz with
-  `torchaudio.functional.resample`. Only aggregate metrics (WER, n, runtime)
-  are reported here; no audio, transcripts, or per-utterance data are
-  retained or redistributed.
 
 ## Results (English, en_us, fleurs)
 
 | Metric                 | fp32 baseline | HQQ 4-bit  | Delta abs        | Delta %        |
 |------------------------|---------------|------------|------------------|----------------|
 | WER                    | 0.0985        | 0.0995     | +0.0010          | +1.0%          |
-| Model size on disk     | 290.38 MB     | 104.89 MB  | -185.49 MB       | -63.9%         |
-| Weights only (qmodel)  | 290.38 MB     | 102.97 MB  | -187.41 MB       | -64.5%         |
+| Deployment RAM (fp16)  | 290.38 MB     | 102.97 MB  | -187.41 MB       | -64.5%         |
+| Benchmark RAM (fp32)   | 290.38 MB     | 159.8 MB   | -130.58 MB       | -45.0%         |
 | Avg real-time factor   | 0.093         | 0.144      | +0.051           | -              |
 | Total elapsed (100 fx) | 88.9 s        | 137.3 s    | +48.4 s          | -              |
 | Samples succeeded      | 100 / 100     | 100 / 100  | -                | -              |
@@ -154,12 +152,22 @@ conversational telephone speech, which is harder.
 Notes:
 - The WER difference (+0.0010) is within the noise of a 100-sample eval, so
   the HQQ model is statistically tied with the fp32 baseline.
+- Deployment RAM (fp16 compute) is the weight memory a host holds at run
+  time in the fp16-compute deployment mode. It equals the on-disk
+  `qmodel.pt` weight file (the full published directory adds the processor
+  and tokenizer files, ~104.89 MB). fp16 compute is WER-neutral, so the
+  deployment mode matches the published WER.
+- Benchmark RAM (fp32 compute) is the weight memory in the published WER
+  setup. It is larger than deployment RAM because the non-quantized fp16
+  weights upcast to fp32 at load time. The `proj_out`/embedding tie is
+  restored after load so the embedding is held once. The packed 4-bit
+  weights stay uint8 in RAM; HQQ dequantizes them per group at compute time.
 - HQQ has no fused 4-bit kernel on CPU, so each linear dequantizes
   group-by-group. HQQ is slower than fp32 because of the dequantize overhead;
   the absolute speed is still well under real time.
 - `whisper-base` English WER (0.0985) is lower than `whisper-tiny` (0.1381)
   on the same samples. Base is the larger model; the size cost is 290 MB
-  fp32 / 105 MB HQQ vs 151 MB / 62 MB for tiny.
+  fp32 / 103 MB HQQ (deployment RAM) vs 151 MB / 60 MB for tiny.
 
 ## Results (multilingual, fleurs, n=100 per language)
 
@@ -202,17 +210,6 @@ the repetition-loop guard. Runtime is on the Intel Xeon W-1290 host.
 The `segment` split is used. `n=100` per language, the first 100 segments
 streamed.
 
-### mu-bench (customer-service telephone)
-
-| Locale | Config | fp32 WER | HQQ WER | Delta abs   | Delta %  | n   | fp32 run | HQQ run | RTF (fp32) | RTF (hqq) |
-|--------|--------|----------|---------|-------------|----------|-----|----------|---------|------------|-----------|
-| en-US  | en     | 0.2650   | 0.2662  | +0.0012     | +0.5%    | 200 | 139.4 s  | 194.2 s | 0.184      | 0.257     |
-| es-MX  | es     | 0.5707   | 0.5758  | +0.0051     | +0.9%    | 200 | 183.1 s  | 311.6 s | 0.212      | 0.360     |
-
-`mu-bench` is 8 kHz mono telephone speech, resampled to 16 kHz. `n=200` per
-locale. Gated, CC-BY-NC-4.0; only aggregate metrics are reported here (no
-audio or transcripts are redistributed).
-
 Notes:
 - HQQ is within 5% relative of fp32 on every telephone config. The
   quantization is effectively lossless on conversational telephone speech.
@@ -238,8 +235,6 @@ value means base transcribes better. The `%` is relative to tiny fp32.
 | fleurs   | fr    | 0.4451    | 0.4572   | 0.2960    | 0.2963   | -0.1491          | -33.5%         |
 | fleurs   | es    | 0.1899    | 0.2149   | 0.1148    | 0.1200   | -0.0751          | -39.5%         |
 | fleurs   | hi    | 1.0579    | 1.0579   | 1.0367    | 1.0340   | -0.0212          | -2.0%          |
-| mu-bench | en-US | 0.2777    | 0.2994   | 0.2650    | 0.2662   | -0.0127          | -4.6%          |
-| mu-bench | es-MX | 0.6884    | 0.6647   | 0.5707    | 0.5758   | -0.1177          | -17.1%         |
 | talkbank | en    | 0.4108    | 0.4073   | 0.3810    | 0.3993   | -0.0298          | -7.3%          |
 | talkbank | es    | 0.5246    | 0.5170   | 0.3653    | 0.3794   | -0.1593          | -30.4%         |
 | talkbank | fr    | 0.7531    | 0.7256   | 0.5737    | 0.5950   | -0.1794          | -23.8%         |
@@ -257,7 +252,7 @@ Notes:
   both are not usable). The improvement is largest on Spanish and French
   (30-40% lower WER).
 - The HQQ size reduction is similar for both models (59% / 64%). Base is
-  about 1.7x the size of tiny at HQQ 4-bit (105 MB vs 62 MB).
+  about 1.7x the size of tiny at HQQ 4-bit (103 MB vs 60 MB).
 - HQQ RTF is higher for base (0.144 vs 0.074 on English) because base has
   more linears to dequantize. Both stay well under real time.
 
@@ -285,7 +280,7 @@ make asr MODEL_ASR=dkhokhlov/whisper-base-hqq-4bit QUANT=hqq AUDIO=clip.wav
 The repo also ships `model.safetensors` next to `qmodel.pt`. It is a flat tensor
 map: an 8-byte JSON header plus raw tensor bytes, with no pickle, zero-mappable,
 and parseable from C/C++/Rust. Use it for host tooling that cannot read a torch
-pickle (for example an FPGA loader). Set `HQQ_FORMAT=safetensors` to load it;
+pickle (for example a deployment loader). Set `HQQ_FORMAT=safetensors` to load it;
 the default (no `HQQ_FORMAT`) loads `qmodel.pt`. Both give the same WER. The
 HQQ config per linear (nbits, group_size, axis, packing, bools) is encoded as
 tensors inside the file, so no extra metadata file is needed.
@@ -312,11 +307,9 @@ EVAL_LIMIT=100 MODEL_ASR=openai/whisper-base EVAL_CONFIG=en_us \
 EVAL_LIMIT=100 QUANT=hqq MODEL_ASR=./whisper-base-hqq-4bit EVAL_CONFIG=en_us \
   EVAL_OUT=eval_base_hqq.json python eval_wer.py
 
-# 4. Telephone benchmark.
+# 4. Telephone benchmark (talkbank segment split).
 EVAL_DATASET=diabolocom/talkbank_4_stt EVAL_CONFIG=en EVAL_SPLIT=segment EVAL_LIMIT=100 \
   MODEL_ASR=openai/whisper-base EVAL_OUT=base_talkbank_en_fp32.json python eval_wer.py
-EVAL_DATASET=sierra-research/mu-bench EVAL_CONFIG=en EVAL_SPLIT=train EVAL_LIMIT=200 \
-  QUANT=hqq MODEL_ASR=./whisper-base-hqq-4bit EVAL_OUT=base_mubench_en_hqq.json python eval_wer.py
 
 # 5. Publish (needs a Hugging Face write token).
 PUSH=1 HQQ_REPO=dkhokhlov/whisper-base-hqq-4bit MODEL_ASR=openai/whisper-base \
@@ -329,9 +322,7 @@ The quantization, eval harness, and per-config WER evidence live in the
 benchmark repository: [dkhokhlov/whisper-cascade](https://github.com/dkhokhlov/whisper-cascade)
 (branch `hqq-4bit`, tag `v1.5.0`). Base evidence:
 - Multilingual (fleurs): `eval_multilingual/base_<config>_<fp32|hqq>.json`.
-- Telephone: `eval_telephone/base_talkbank_<lang>_<fp32|hqq>.json` and
-  `eval_telephone/base_mubench_<lang>_<fp32|hqq>.json` (mu-bench files hold
-  only aggregate metrics, per the CC-BY-NC-4.0 terms).
+- Telephone: `eval_telephone/base_talkbank_<lang>_<fp32|hqq>.json`.
 - The `whisper-tiny` comparison numbers are in the
   [`dkhokhlov/whisper-tiny-hqq-4bit`](https://huggingface.co/dkhokhlov/whisper-tiny-hqq-4bit)
   model card.
@@ -347,9 +338,8 @@ benchmark repository: [dkhokhlov/whisper-cascade](https://github.com/dkhokhlov/w
   without a separate sweep. It matches the fp32 baseline on English and
   stays within 5% relative of fp32 on every tested config. A base-specific
   sweep might tighten the small Spanish/French gap further.
-- Evaluated on `fleurs` (en, es, fr, de, hi), `talkbank_4_stt` (en, es, fr,
-  de), and `mu-bench` (en-US, es-MX). Other languages and datasets were not
-  measured.
+- Evaluated on `fleurs` (en, es, fr, de, hi) and `talkbank_4_stt` (en, es, fr,
+  de). Other languages and datasets were not measured.
 - WER on conversational telephone speech is high (0.27-0.60) because the
   model is small. Use a larger Whisper model for this domain when lower WER
   is needed. `whisper-base` is not usable for Hindi at either precision.

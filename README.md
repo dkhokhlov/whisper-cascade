@@ -283,7 +283,7 @@ not teed.)
 ## Evaluation
 
 `eval_wer.py` measures the Word Error Rate (WER) of an ASR model on a HF
-audio dataset. It supports three dataset sources (dispatched by `EVAL_DATASET`):
+audio dataset. It supports two dataset sources (dispatched by `EVAL_DATASET`):
 
 - [`google/fleurs`](https://huggingface.co/datasets/google/fleurs): read
   speech, 16 kHz wav. Configs `en_us`, `es_419`, `fr_fr`, `de_de`, `hi_in`.
@@ -292,16 +292,6 @@ audio dataset. It supports three dataset sources (dispatched by `EVAL_DATASET`):
   spontaneous telephone conversation, 16 kHz mp3. Configs `en`, `es`, `fr`,
   `de`, `jp`, `zh`. Split `segment` (the `switch` split has long silences
   and a much higher WER, so it is not used).
-- [`sierra-research/mu-bench`](https://huggingface.co/datasets/sierra-research/mu-bench):
-  customer-service telephone calls to a banking AI agent, 8 kHz mono wav.
-  Gated, CC-BY-NC-4.0. Locales `en-US`, `es-MX`, `tr-TR`, `vi-VN`, `zh-CN`.
-  The `datasets` builder forces the `torchcodec` encoder for this dataset,
-  which this CPU project does not depend on, so the manifest and
-  per-utterance wav files are downloaded directly with
-  [huggingface_hub](https://github.com/huggingface/huggingface_hub), decoded
-  with `soundfile`, and resampled 8 kHz to 16 kHz with
-  `torchaudio.functional.resample`. Only aggregate metrics (WER, n, runtime)
-  are reported for `mu-bench`; no audio or transcripts are redistributed.
 
 A post-hoc repetition-loop guard (gzip compression ratio > 2.4, the openai
 whisper CLI default) is applied to every hypothesis. On short or noisy
@@ -323,7 +313,7 @@ vs the published HQQ 4-bit models
 ([`dkhokhlov/whisper-tiny-hqq-4bit`](https://huggingface.co/dkhokhlov/whisper-tiny-hqq-4bit),
 [`dkhokhlov/whisper-base-hqq-4bit`](https://huggingface.co/dkhokhlov/whisper-base-hqq-4bit),
 [`dkhokhlov/whisper-small-hqq-4bit`](https://huggingface.co/dkhokhlov/whisper-small-hqq-4bit)).
-n=100 for `fleurs` and `talkbank`, n=200 for `mu-bench`. WER, lower is
+n=100 for `fleurs` and `talkbank`. WER, lower is
 better. "base vs tiny" = base fp32 minus tiny fp32; "small vs base" = small
 fp32 minus base fp32 (negative means the larger model is better); the `%`
 is relative to the smaller model's fp32.
@@ -337,19 +327,38 @@ is relative to the smaller model's fp32.
 | fleurs   | fr    | 0.4451    | 0.4572   | 0.2960    | 0.2963   | 0.1624     | 0.1589    | -0.1491      | -33.5%         | -0.1336       | -45.1%          |
 | fleurs   | es    | 0.1899    | 0.2149   | 0.1148    | 0.1200   | 0.0616     | 0.0648    | -0.0751      | -39.5%         | -0.0532       | -46.3%          |
 | fleurs   | hi    | 1.0579    | 1.0579   | 1.0367    | 1.0340   | 0.6777     | 0.7117    | -0.0212      | -2.0%          | -0.3590       | -34.6%          |
-| mu-bench | en-US | 0.2777    | 0.2994   | 0.2650    | 0.2662   | 0.2783     | 0.2885    | -0.0127      | -4.6%          | +0.0133       | +5.0%           |
-| mu-bench | es-MX | 0.6884    | 0.6647   | 0.5707    | 0.5758   | 0.4742     | 0.4606    | -0.1177      | -17.1%         | -0.0965       | -16.9%          |
 | talkbank | en    | 0.4108    | 0.4073   | 0.3810    | 0.3993   | 0.2952     | 0.2929    | -0.0298      | -7.3%          | -0.0858       | -22.5%          |
 | talkbank | es    | 0.5246    | 0.5170   | 0.3653    | 0.3794   | 0.2529     | 0.2564    | -0.1593      | -30.4%         | -0.1124       | -30.8%          |
 | talkbank | fr    | 0.7531    | 0.7256   | 0.5737    | 0.5950   | 0.4236     | 0.4338    | -0.1794      | -23.8%         | -0.1501       | -26.2%          |
 | talkbank | de    | 0.6354    | 0.6425   | 0.5646    | 0.5770   | 0.4850     | 0.4920    | -0.0708      | -11.1%         | -0.0796       | -14.1%          |
 
 HQQ 4-bit is within 5% relative of fp32 for all three models on every
-config. Size: tiny 151.06 -> 61.66 MB (-59.2%); base 290.38 -> 104.89 MB
-(-63.9%); small 966.94 -> 294.92 MB (-69.5%). `whisper-base` beats
-`whisper-tiny` on every config except Hindi (both are not usable);
-`whisper-small` beats `whisper-base` on 10 of 11 configs (the exception is
-`mu-bench` en-US, where small is 5% worse than base, within sample noise).
+config. `whisper-base` beats `whisper-tiny` on every config except Hindi
+(both are not usable); `whisper-small` beats `whisper-base` on every config.
+
+Model size is reported by use. The deployment RAM is the weight memory a
+host holds at run time in the fp16-compute deployment mode (packed 4-bit
+weights, fp16 non-quantized modules). It equals the on-disk `qmodel.pt`
+size because fp16 compute keeps the non-quantized weights in fp16 (no
+upcast). fp16 compute is WER-neutral (measured within n=100 noise), so the
+deployment mode is accuracy-equivalent. The published WER benchmark uses
+fp32 compute; its resident RAM is larger because the non-quantized fp16
+weights upcast to fp32 at load time. The `proj_out` head and the decoder
+embedding are tied (one shared weight), and the loader restores that tie
+after load so the embedding is held once.
+
+| model  | fp32 file | deployment RAM (fp16 compute) | benchmark RAM (fp32 compute) |
+|--------|-----------|-------------------------------|------------------------------|
+| tiny   | 151.06 MB | 59.7 MB (-60.4%)              | 102.1 MB (-32.4%)            |
+| base   | 290.38 MB | 103.0 MB (-64.5%)             | 159.8 MB (-45.0%)            |
+| small  | 966.94 MB | 293.0 MB (-69.7%)             | 379.5 MB (-60.7%)            |
+
+The fp32 file is the `openai/whisper-*` `model.safetensors` size (the
+parameter count multiplied by 4 bytes). The deployment-RAM and
+benchmark-RAM reductions are versus that fp32 baseline. Deployment RAM
+equals the on-disk `qmodel.pt` weight file (59.74 / 102.97 / 292.99 MB);
+the benchmark-RAM reduction is the quantization-only gain, and the gap to
+deployment RAM is the fp16-storage gain (the embedding is most of it).
 Per-eval runtime, the relative Delta % columns, and the full quantization
 reports are in [`hqq_report.md`](hqq_report.md) (the `whisper-tiny` card),
 [`hqq_report_base.md`](hqq_report_base.md) (the `whisper-base` card), and
@@ -366,7 +375,7 @@ Evidence JSONs are committed under `eval_multilingual/` and `eval_telephone/`
   [`hqq_report_small.md`](hqq_report_small.md).
 - Each published HQQ repo ships `qmodel.pt` (torch pickle, the default loader
   target) and `model.safetensors` (a flat tensor map, no pickle, parseable from
-  C/C++/Rust for host tooling such as an FPGA loader). Set `HQQ_FORMAT=safetensors`
+  C/C++/Rust for host tooling such as a deployment loader). Set `HQQ_FORMAT=safetensors`
   to load the safetensors; both formats give the same WER. `export_safetensors.py`
   writes `model.safetensors` from a local quantized dir. See the "safetensors
   format" section of each report card.

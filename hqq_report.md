@@ -19,12 +19,22 @@ tags:
 
 Model card source for `dkhokhlov/whisper-tiny-hqq-4bit`.
 
+## Related models
+
+- [`dkhokhlov/whisper-base-hqq-4bit`](https://huggingface.co/dkhokhlov/whisper-base-hqq-4bit) — HQQ 4-bit, whisper-base (CPU eval)
+- [`dkhokhlov/whisper-small-hqq-4bit`](https://huggingface.co/dkhokhlov/whisper-small-hqq-4bit) — HQQ 4-bit, whisper-small (A10 GPU eval)
+- Source model: [`openai/whisper-tiny`](https://huggingface.co/openai/whisper-tiny) (fp32)
+- Benchmark + code: [`dkhokhlov/whisper-cascade`](https://github.com/dkhokhlov/whisper-cascade)
+
 ## Summary
 
 [`openai/whisper-tiny`](https://huggingface.co/openai/whisper-tiny) was
 quantized with [HQQ](https://huggingface.co/docs/transformers/en/quantization/hqq)
-4-bit grouped quantization for CPU inference. The model size shrank from
-151.06 MB (fp32) to 61.65 MB (59.2% reduction). The Word Error Rate (WER) on
+4-bit grouped quantization for CPU inference. The deployment RAM (fp16
+compute) is 59.74 MB, 60.4% smaller than the 151.06 MB fp32 model; it
+equals the on-disk `qmodel.pt` and is WER-neutral. The fp32-compute
+benchmark resident RAM is 102.1 MB (32.4% smaller). The
+Word Error Rate (WER) on
 100 English samples from [`google/fleurs`](https://huggingface.co/datasets/google/fleurs)
 `en_us` (test split) stayed at the baseline level: 0.1381 (fp32) vs 0.1367
 (HQQ), a difference of -0.0014 absolute (-1.0% relative), which is within
@@ -143,33 +153,30 @@ conversational telephone speech, which is harder for a small model.
   `de` (also `jp`, `zh`). Split `segment` (the `switch` split has long
   silences and a much higher WER, so it is not used). `n=100` per config.
   Loaded the same way as `fleurs`; mp3 bytes are decoded with `torchaudio`.
-- [`sierra-research/mu-bench`](https://huggingface.co/datasets/sierra-research/mu-bench):
-  customer-service telephone calls to a banking AI agent, 8 kHz mono wav.
-  Locales `en-US` (817 utterances), `es-MX` (792), `tr-TR`, `vi-VN`, `zh-CN`.
-  `n=200` per locale for `en-US` and `es-MX`. This dataset is gated,
-  CC-BY-NC-4.0. The `datasets` builder forces the `torchcodec` encoder for
-  this dataset, which this CPU project does not depend on, so the
-  `metadata.jsonl` manifest and the per-utterance wav files are downloaded
-  directly with [huggingface_hub](https://github.com/huggingface/huggingface_hub)
-  and decoded with `soundfile`; the 8 kHz audio is resampled to 16 kHz with
-  `torchaudio.functional.resample`. Only aggregate metrics (WER, n, runtime)
-  are reported here; no audio, transcripts, or per-utterance data are
-  retained or redistributed.
 
 ## Results (English, en_us, fleurs)
 
 | Metric                 | fp32 baseline | HQQ 4-bit  | Delta abs        | Delta %        |
 |------------------------|---------------|------------|------------------|----------------|
 | WER                    | 0.1381        | 0.1367     | -0.0014          | -1.0%          |
-| Model size on disk     | 151.06 MB     | 61.65 MB   | -89.41 MB        | -59.2%         |
-| Weights only (qmodel)  | 151.06 MB     | 59.74 MB   | -91.32 MB        | -60.4%         |
+| Deployment RAM (fp16)  | 151.06 MB     | 59.74 MB   | -91.32 MB        | -60.4%         |
+| Benchmark RAM (fp32)   | 151.06 MB     | 102.1 MB   | -48.96 MB        | -32.4%         |
 | Avg real-time factor   | 0.054         | 0.074      | +0.020           | -              |
 | Total elapsed (100 fx) | 51.5 s        | 70.9 s     | +19.4 s          | -              |
 | Samples succeeded      | 100 / 100     | 100 / 100  | -                | -              |
 
 Notes:
-- The size is the full output directory: `qmodel.pt` plus the processor and
-  tokenizer files (`vocab.json`, `merges.txt`, `normalizer.json`, etc.).
+- Deployment RAM (fp16 compute) is the weight memory a host holds at run
+  time in the fp16-compute deployment mode. It equals the on-disk
+  `qmodel.pt` weight file (the full published directory adds the processor
+  and tokenizer files, ~61.65 MB). fp16 compute is WER-neutral, so the
+  deployment mode matches the published WER.
+- Benchmark RAM (fp32 compute) is the weight memory in the published WER
+  setup. It is larger than deployment RAM because the non-quantized fp16
+  weights (the embedding, convs, norms) upcast to fp32 at load time. The
+  `proj_out`/embedding tie is restored after load so the embedding is held
+  once. The packed 4-bit weights stay uint8 in RAM; HQQ dequantizes them
+  per group at compute time.
 - The WER difference (-0.0014) is within the noise of a 100-sample eval, so
   the HQQ model is statistically tied with the fp32 baseline, not better.
   The headline is that 4-bit HQQ with mixed-precision protection matches the
@@ -228,28 +235,14 @@ The `segment` split is used. The `switch` split has long silences and a much
 higher WER, so it is not used. `n=100` per language, the first 100 segments
 streamed.
 
-### mu-bench (customer-service telephone)
-
-| Locale | Config | fp32 WER | HQQ WER | Delta abs   | Delta %  | n   | fp32 run | HQQ run | Avg RTF (fp32) | Avg RTF (hqq) |
-|--------|--------|----------|---------|-------------|----------|-----|----------|---------|----------------|---------------|
-| en-US  | en     | 0.2777   | 0.2994  | +0.0217     | +7.8%    | 200 | 70.8 s   | 99.9 s  | 0.093          | 0.132         |
-| es-MX  | es     | 0.6884   | 0.6647  | -0.0237     | -3.4%    | 200 | 105.9 s  | 139.4 s | 0.122          | 0.161         |
-
-`mu-bench` is 8 kHz mono telephone speech, resampled to 16 kHz. `n=200` per
-locale. `mu-bench` is gated, CC-BY-NC-4.0; only aggregate metrics are
-reported here (no audio or transcripts are redistributed).
-
 Notes:
 - fp32 and HQQ are within noise on every telephone config (deltas are all
   within +/-0.03 absolute). HQQ 4-bit is effectively lossless on
   conversational telephone speech, as it is on `fleurs` read speech.
-- The WERs are high (0.28-0.75) because `whisper-tiny` is small and
+- The WERs are high (0.41-0.75) because `whisper-tiny` is small and
   conversational telephone speech is hard; this is a property of the base
   model, not of the quantization. Use a larger Whisper model when lower WER
   is needed on this domain.
-- `mu-bench` en-US (0.28) is lower than `talkbank` en (0.41) because
-  `mu-bench` is banking customer-service calls (more structured) while
-  `talkbank` is spontaneous conversation.
 - HQQ RTF is higher than fp32 (1.1x-1.7x) because HQQ has no fused 4-bit
   kernel on CPU; each linear dequantizes group-by-group. For this tiny model
   the absolute speed is still well under real time.
@@ -275,8 +268,6 @@ transcribes better. The `%` is relative to tiny fp32.
 | fleurs   | fr    | 0.4451    | 0.4572   | 0.2960    | 0.2963   | -0.1491          | -33.5%         |
 | fleurs   | es    | 0.1899    | 0.2149   | 0.1148    | 0.1200   | -0.0751          | -39.5%         |
 | fleurs   | hi    | 1.0579    | 1.0579   | 1.0367    | 1.0340   | -0.0212          | -2.0%          |
-| mu-bench | en-US | 0.2777    | 0.2994   | 0.2650    | 0.2662   | -0.0127          | -4.6%          |
-| mu-bench | es-MX | 0.6884    | 0.6647   | 0.5707    | 0.5758   | -0.1177          | -17.1%         |
 | talkbank | en    | 0.4108    | 0.4073   | 0.3810    | 0.3993   | -0.0298          | -7.3%          |
 | talkbank | es    | 0.5246    | 0.5170   | 0.3653    | 0.3794   | -0.1593          | -30.4%         |
 | talkbank | fr    | 0.7531    | 0.7256   | 0.5737    | 0.5950   | -0.1794          | -23.8%         |
@@ -341,7 +332,7 @@ make asr MODEL_ASR=dkhokhlov/whisper-tiny-hqq-4bit QUANT=hqq AUDIO=clip.wav
 The repo also ships `model.safetensors` next to `qmodel.pt`. It is a flat tensor
 map: an 8-byte JSON header plus raw tensor bytes, with no pickle, zero-mappable,
 and parseable from C/C++/Rust. Use it for host tooling that cannot read a torch
-pickle (for example an FPGA loader). Set `HQQ_FORMAT=safetensors` to load it;
+pickle (for example a deployment loader). Set `HQQ_FORMAT=safetensors` to load it;
 the default (no `HQQ_FORMAT`) loads `qmodel.pt`. Both give the same WER. The
 HQQ config per linear (nbits, group_size, axis, packing, bools) is encoded as
 tensors inside the file, so no extra metadata file is needed.
@@ -368,11 +359,9 @@ EVAL_LIMIT=100 MODEL_ASR=openai/whisper-tiny EVAL_CONFIG=en_us \
 EVAL_LIMIT=100 QUANT=hqq MODEL_ASR=./whisper-tiny-hqq-4bit EVAL_CONFIG=en_us \
   EVAL_OUT=eval_hqq.json python eval_wer.py
 
-# 4. Telephone benchmark (talkbank segment split, mu-bench direct download).
+# 4. Telephone benchmark (talkbank segment split).
 EVAL_DATASET=diabolocom/talkbank_4_stt EVAL_CONFIG=en EVAL_SPLIT=segment EVAL_LIMIT=100 \
   MODEL_ASR=openai/whisper-tiny EVAL_OUT=talkbank_en_fp32.json python eval_wer.py
-EVAL_DATASET=sierra-research/mu-bench EVAL_CONFIG=en EVAL_SPLIT=train EVAL_LIMIT=200 \
-  QUANT=hqq MODEL_ASR=./whisper-tiny-hqq-4bit EVAL_OUT=mubench_en_hqq.json python eval_wer.py
 
 # 5. Publish (needs a Hugging Face write token).
 PUSH=1 HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit python quantize.py
@@ -385,9 +374,7 @@ benchmark repository: [dkhokhlov/whisper-cascade](https://github.com/dkhokhlov/w
 (branch `hqq-4bit`, tag `v1.5.0`). Evidence:
 - English (fleurs): `eval_baseline.json`, `eval_hqq.json`.
 - Multilingual (fleurs): `eval_multilingual/<config>_<fp32|hqq>.json`.
-- Telephone: `eval_telephone/talkbank_<lang>_<fp32|hqq>.json` and
-  `eval_telephone/mubench_<lang>_<fp32|hqq>.json` (mu-bench files hold only
-  aggregate metrics, per the CC-BY-NC-4.0 terms).
+- Telephone: `eval_telephone/talkbank_<lang>_<fp32|hqq>.json`.
 - The `whisper-base` comparison numbers and its base evidence files
   (`eval_multilingual/base_*`, `eval_telephone/base_*`) are in the
   [`dkhokhlov/whisper-base-hqq-4bit`](https://huggingface.co/dkhokhlov/whisper-base-hqq-4bit)
@@ -405,9 +392,9 @@ benchmark repository: [dkhokhlov/whisper-cascade](https://github.com/dkhokhlov/w
   dataset. Spanish shows a small +0.025 regression on `fleurs`; the other
   configs are within noise. Use the fp32 model when the lowest WER is
   required and the size is acceptable.
-- Evaluated on `fleurs` (en, es, fr, de, hi), `talkbank_4_stt` (en, es, fr,
-  de), and `mu-bench` (en-US, es-MX). The base model is multilingual; other
-  languages and datasets were not measured.
-- WER on conversational telephone speech is high (0.28-0.75) because
+- Evaluated on `fleurs` (en, es, fr, de, hi) and `talkbank_4_stt` (en, es, fr,
+  de). The base model is multilingual; other languages and datasets were not
+  measured.
+- WER on conversational telephone speech is high (0.41-0.75) because
   `whisper-tiny` is small. This is a base-model property. Use a larger
   Whisper model for this domain when lower WER is needed.

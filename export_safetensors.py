@@ -4,7 +4,7 @@
 The hqq loader stores weights in qmodel.pt, a torch pickle (zip archive). This
 script re-exports the same weights as a single safetensors file: a flat
 8-byte-JSON-header + raw-tensor-bytes format with no pickle, zero-mappable,
-and parseable from C/C++/Rust (useful for FPGA host tooling). model.safetensors
+and parseable from C/C++/Rust (useful for deployment host tooling). model.safetensors
 is an ADDITIONAL file; qmodel.pt stays the default loader target.
 
 Safetensors stores tensors only, so the per-linear HQQ config scalars (nbits,

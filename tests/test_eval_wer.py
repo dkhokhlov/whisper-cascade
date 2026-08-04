@@ -1,5 +1,5 @@
 """Tests for eval_wer helpers: the post-hoc repetition-loop guard and the
-8 kHz -> 16 kHz resampler (the mu-bench telephone path).
+sample-rate resampler (a safety net for any non-16 kHz source).
 
 Unit tests only: no model load, no network. Importing eval_wer pulls
 torch/torchaudio/transformers/datasets (all in the venv) but no model and
@@ -42,7 +42,7 @@ def test_is_loop_threshold_boundary():
     assert eval_wer.is_loop("word " * 200, threshold=100.0) is False
 
 
-# --- resample: the 8 kHz -> 16 kHz mu-bench path --------------------------
+# --- resample: 8 kHz -> 16 kHz safety-net path --------------------------
 
 def test_resample_doubles_length_8k_to_16k():
     # 1 second of 8 kHz mono float32 -> 16000 samples at 16 kHz.

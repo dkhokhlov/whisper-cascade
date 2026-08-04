@@ -216,6 +216,14 @@ def load_whisper_hqq(model_id_or_dir, device="cpu"):
     model = WhisperHQQModel.from_quantized(
         model_id_or_dir, compute_dtype=COMPUTE_DTYPE, device=device,
     )
+    # Re-tie proj_out to the decoder embedding. hqq's from_quantized._load_module
+    # upcasts each stored tensor to fp32 with .to(), which copies storage and
+    # breaks the proj_out/embed_tokens tie that exists on disk (torch.save dedups
+    # the shared weight to one copy). Without this re-tie the embedding lives
+    # twice in resident RAM, and for whisper-tiny HQQ RAM (181.8 MB) would exceed
+    # the fp32 baseline (151.06 MB). The tie is value-identical (same weights),
+    # so this is WER-neutral (verified 0.1367 == 0.1367 on fleurs en_us).
+    model.proj_out.weight = model.model.decoder.embed_tokens.weight
     try:
         from transformers import GenerationConfig
         gc = GenerationConfig.from_pretrained(model_id_or_dir)
