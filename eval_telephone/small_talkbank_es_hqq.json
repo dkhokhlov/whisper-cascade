@@ -1,0 +1,36 @@
+{
+  "model": "./whisper-small-hqq-4bit",
+  "quant": "hqq",
+  "dataset": "diabolocom/talkbank_4_stt",
+  "config": "es",
+  "split": "segment",
+  "language": null,
+  "n": 100,
+  "n_fail": 0,
+  "wer": 0.2564,
+  "total_duration_s": 564.14,
+  "total_elapsed_s": 47.493,
+  "avg_rtf": 0.084,
+  "samples": [
+    {
+      "ref": "aló .",
+      "hyp": "A lo."
+    },
+    {
+      "ref": "qué más ve, cómo te ha ido ?",
+      "hyp": "Quer ver como tem ido?"
+    },
+    {
+      "ref": "ah, Mi madre, ya casi .",
+      "hyp": "Ay, voy mal, hay un café."
+    },
+    {
+      "ref": "sí .",
+      "hyp": "See"
+    },
+    {
+      "ref": "me voy el once, pedí día, pues yo iba a pedir día libre el, el Al otro día Del examen, o sea el trece .  &=lips:smack pero pues la supervisora me dijo que me aconsejaba mejor que pidiera el día anterior para que me fuera temprano .  eh, reconociera el sitio, viera cuanto me demoraba, etcétera, etcétera .",
+      "hyp": "Me voy el 11, pues yo iba a pedir día libre al otro día del examen, no sea el 13. Pero la supervisora me dijo que me aconsejaba que me pidiera el día anterior para que me fuera temprano, reconociera el sitio, viera cuánto me demoraba, etcétera, etcétera."
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "model": "./whisper-small-hqq-4bit",
+  "quant": "hqq",
+  "dataset": "google/fleurs",
+  "config": "es_419",
+  "split": "test",
+  "language": null,
+  "n": 100,
+  "n_fail": 0,
+  "wer": 0.0648,
+  "total_duration_s": 1200.78,
+  "total_elapsed_s": 60.653,
+  "avg_rtf": 0.051,
+  "samples": [
+    {
+      "ref": "se recomienda enfáticamente a los viajeros que se informen sobre cualquier riesgo de clima extremo en el área que visitan dado que ello puede afectar sus planes de viaje",
+      "hyp": "Se recomienda enfáticamente a los viajeros que se informen sobre cualquier riesgo del clima extremo en el área que visitan, dado que ello puede afectar sus planes de viaje."
+    },
+    {
+      "ref": "el uso adecuado de los blogs «puede empoderar a los alumnos para que sean más analíticos y críticos a través de la respuesta activa a los contenidos de internet pueden definir sus posturas en el contexto de los escritos de otros además de establecer sus perspectivas sobre temas específicos» oravec 2002",
+      "hyp": "El uso adecuado de los blogs pueden poderar a los alumnos para que sean más analíticos y críticos a través de la respuesta activa a los contenidos de internet. Pueden definir sus posturas en el contexto de los escritos de otros, además de establecer sus perspectivas sobre temas específicos."
+    },
+    {
+      "ref": "fue tanta la cantidad de gente que se concentró que no todos pudieron acceder al funeral en la plaza de san pedro",
+      "hyp": "Fue tanta la cantidad de gente que se concentró que no todos pudieron acceder al funeral en la plaza de San Pedro."
+    },
+    {
+      "ref": "esto parece tener sentido ya que en la tierra no se percibe su movimiento ¿cierto?",
+      "hyp": "Esto parece tener sentido ya que en la tierra no se percibe su movimiento ¿cierto?"
+    },
+    {
+      "ref": "carpanedo participó en dos carreras individuales del campeonato aparte de la competencia del miércoles",
+      "hyp": "Carpaneo participó en dos carreras individuales del campeonato a parte de la competencia del miércoles."
+    }
+  ]
+}

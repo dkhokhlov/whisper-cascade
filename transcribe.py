@@ -46,6 +46,9 @@ MODEL_ASR = os.environ.get("MODEL_ASR", "openai/whisper-tiny")
 # model (local dir or Hugging Face repo). When unset, the model loads as fp32,
 # or loads an already-quantized model when MODEL_ASR points at one.
 QUANT = os.environ.get("QUANT", "").strip().lower()
+# Compute device: "cpu" (default) keeps the original CPU behavior; "cuda" runs
+# the model on GPU (needs CUDA torch, e.g. the .venv-gpu env for the A10).
+ASR_DEVICE = os.environ.get("ASR_DEVICE", "cpu").strip().lower() or "cpu"
 DATASET = "Narsil/asr_dummy"
 # Default multilingual sample set: English, Spanish, Hindi. All are loose files
 # in the dataset and resolve from the HF cache via huggingface_hub.
@@ -149,7 +152,7 @@ def main() -> int:
         print("error: AUDIO matched no files", file=sys.stderr)
         return 1
 
-    pipe = hqq_asr.build_pipeline(MODEL_ASR, QUANT)
+    pipe = hqq_asr.build_pipeline(MODEL_ASR, QUANT, device=ASR_DEVICE)
 
     results = []
     had_error = False

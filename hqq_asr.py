@@ -210,9 +210,31 @@ def build_pipeline(model_id, quant, device="cpu"):
     quant == "hqq": load MODEL_ASR as a saved HQQ model and wrap it in the
     pipeline with its processor. Otherwise load MODEL_ASR with the pipeline
     defaults (fp32, or an already-quantized model when it points at one).
+
+    device == "cpu" (default) keeps the original CPU behavior. Any other value
+    (e.g. "cuda") moves the model to that device and runs the pipeline on GPU:
+    the fp32 model is loaded and moved with .to(device), the HQQ model is
+    loaded on device, and device=0 (cuda:0) is passed to the pipeline so the
+    inputs are moved to the model. HQQ weights are dequantized in COMPUTE_DTYPE
+    (fp32) on the chosen device.
     """
     if quant == "hqq":
         model = load_whisper_hqq(model_id, device=device)
+        model.eval()
+        processor = AutoProcessor.from_pretrained(model_id)
+        kwargs = dict(
+            task="automatic-speech-recognition",
+            model=model,
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+        )
+        if device != "cpu":
+            kwargs["device"] = 0
+        return pipeline(**kwargs)
+    if device != "cpu":
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_id, torch_dtype=COMPUTE_DTYPE
+        ).to(device)
         model.eval()
         processor = AutoProcessor.from_pretrained(model_id)
         return pipeline(
@@ -220,5 +242,6 @@ def build_pipeline(model_id, quant, device="cpu"):
             model=model,
             tokenizer=processor.tokenizer,
             feature_extractor=processor.feature_extractor,
+            device=0,
         )
     return pipeline(task="automatic-speech-recognition", model=model_id)

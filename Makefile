@@ -1,5 +1,10 @@
 VENV  := .venv
 PY    := $(VENV)/bin/python
+# GPU venv for A10 runs (CUDA torch). Separate from the CPU .venv so the
+# CPU-only project contract and pyproject.toml stay untouched. Used by the
+# whisper-small eval (make gpu-venv, then run scripts with $(PYGPU)).
+VENV_GPU := .venv-gpu
+PYGPU    := $(VENV_GPU)/bin/python
 # Semantic version, sourced from pyproject.toml so it stays in sync.
 VERSION := $(shell awk -F'"' '/^version =/ {print $$2; exit}' pyproject.toml)
 # Whisper ASR model (override: make asr MODEL_ASR=openai/whisper-tiny.en). The
@@ -22,6 +27,11 @@ MODEL_TTS ?= facebook/mms-tts-eng
 # Optional HQQ 4-bit quantization mode for ASR. Set QUANT=hqq to load MODEL_ASR
 # as a saved HQQ model (local dir or HF repo). Default: fp32.
 export QUANT
+# ASR compute device: "cpu" (default) keeps the original CPU behavior; "cuda"
+# runs the model on GPU (needs CUDA torch, e.g. the .venv-gpu env for the A10).
+# Exported so make asr / quantize / push / eval-* all forward it to the scripts.
+ASR_DEVICE ?= cpu
+export ASR_DEVICE
 # HQQ quantization output dir, HF repo, and quant config (make quantize / push).
 # Defaults are the best measured config on fleurs en_us (WER 0.1367 vs 0.1381
 # fp32 baseline): 4-bit, group_size=32, axis=1, the whole encoder stack and
@@ -43,7 +53,7 @@ EVAL_LIMIT ?= 100
 # WER eval config / language code (make eval-baseline / eval-hqq).
 EVAL_CONFIG ?= en_us
 
-.PHONY: help info venv samples asr en tts quantize push eval-baseline eval-hqq test test-integration clean clean-all
+.PHONY: help info venv gpu-venv samples asr en tts quantize push eval-baseline eval-hqq test test-integration clean clean-all
 
 help: ## Show available targets
 	@echo "whisper-cascade v$(VERSION)"
@@ -94,6 +104,20 @@ $(VENV)/.stamp: pyproject.toml uv.lock
 	@touch $(VENV)/.stamp
 
 venv: $(VENV)/.stamp ## Create the local .venv and install deps with uv (idempotent)
+
+# CUDA venv for the A10 GPU, separate from the CPU .venv. Same pinned versions
+# as pyproject.toml but torch/torchaudio from the cu121 wheel index (compatible
+# with driver 610 / nvcc 13.3). Not synced from pyproject.toml: that file pins
+# the CPU wheel index by design. Idempotent via a stamp, like $(VENV)/.stamp.
+$(VENV_GPU)/.stamp:
+	@uv venv $(VENV_GPU) --python 3.10
+	@uv pip install --python $(PYGPU) --index-url https://download.pytorch.org/whl/cu121 \
+	    torch==2.4.1 torchaudio==2.4.1
+	@uv pip install --python $(PYGPU) \
+	    transformers==4.44.2 soundfile==0.12.1 "numpy<2" sentencepiece==0.2.0 hqq jiwer datasets
+	@touch $(VENV_GPU)/.stamp
+
+gpu-venv: $(VENV_GPU)/.stamp ## Create the CUDA .venv-gpu for A10 GPU runs (small model)
 
 samples: ## Warm the HF sample cache for the default set - idempotent, no re-download
 	@$(PY) -c "from huggingface_hub import hf_hub_download; [hf_hub_download('Narsil/asr_dummy', f, repo_type='dataset') for f in ('mlk.flac','4.flac','hindi.ogg')]" && echo "samples cache warm"

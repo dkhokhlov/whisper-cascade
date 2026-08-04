@@ -1,0 +1,36 @@
+{
+  "model": "./whisper-small-hqq-4bit",
+  "quant": "hqq",
+  "dataset": "google/fleurs",
+  "config": "de_de",
+  "split": "test",
+  "language": null,
+  "n": 100,
+  "n_fail": 0,
+  "wer": 0.0965,
+  "total_duration_s": 1496.22,
+  "total_elapsed_s": 66.887,
+  "avg_rtf": 0.045,
+  "samples": [
+    {
+      "ref": "für die besten aussichten auf hongkong sollten sie die insel verlassen und zum gegenüberliegenden ufer von kowloon fahren",
+      "hyp": "Für die besten Aussichten auf Hongkong sollten sie die Insel verlassen und zum gegenüberliegenden Ufer von Kowloon fahren."
+    },
+    {
+      "ref": "er griff auch alles an was ins wasser kam selbst ein großer dinosaurier wie der t rex war ihm nicht gewachsen",
+      "hyp": "Er griff auch alles an, was ins Wasser kam. Selbst ein großer Dinosaurier wie der T-Rex war ihm nicht gewachsen."
+    },
+    {
+      "ref": "wenn sie den film das vermächtnis der tempelritter gesehen haben denken sie vielleicht dass auf die rückseite der unabhängigkeitserklärung eine schatzkarte gezeichnet wurde",
+      "hyp": "Wenn Sie den Film das Vermächtnis der Tempelritter gesehen haben, denken Sie vielleicht, dass auf der Rückseite der Unabhängigkeitserklärung eine Schatzkarte gezeichnet wurde."
+    },
+    {
+      "ref": "es leben noch viele männer und frauen die ihre zeit hier überlebt haben und viele weitere mit angehörigen die dort ermordet wurden oder sich zu tode arbeiteten juden und nichtjuden gleichermaßen",
+      "hyp": "Es leben noch viele Männer und Frauen, die ihre Zeit überlebt haben und viele weitere mit Angehörigen, die dort ermordet wurden oder sich zu Tode arbeiteten, Juden und nicht Juden gleichermaßen."
+    },
+    {
+      "ref": "die höhle befindet sich auf der spitze eines der berge nördlich von mekka und ist vom rest der welt völlig isoliert",
+      "hyp": "Die Höhle befindet sich auf der Spitze eines der Berge nördlich von Mecca und ist vom Rest der Welt völlig insudiert."
+    }
+  ]
+}

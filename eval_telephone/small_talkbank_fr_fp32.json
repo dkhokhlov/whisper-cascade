@@ -1,0 +1,36 @@
+{
+  "model": "openai/whisper-small",
+  "quant": null,
+  "dataset": "diabolocom/talkbank_4_stt",
+  "config": "fr",
+  "split": "segment",
+  "language": null,
+  "n": 100,
+  "n_fail": 0,
+  "wer": 0.4236,
+  "total_duration_s": 659.47,
+  "total_elapsed_s": 34.072,
+  "avg_rtf": 0.052,
+  "samples": [
+    {
+      "ref": "Et voilà .  Ben , oui , on me paye pour t'appeler .  C'est pas pire , non certain .  Ils paye la communication .  Mais en plus de ça , je jeje vais recevoir dix dollar .",
+      "hyp": "Et voilà. On me paye pour t'appeler, c'est pas pire. Non, ça ça, il paye la communication. Mais en plus de ça, je vais re-sauvoir du dollar."
+    },
+    {
+      "ref": "Moi , quand la fille me demandait ça , tu vas me payer pour parler .  Pas de problème .  C'est ce que je fais le mieux .  Ah .",
+      "hyp": "Moi quand la fille me demandait ça, tu vas me payer pour parler? Pas de problème, c'est ce que je fais le mieux."
+    },
+    {
+      "ref": "Parce que c'est une université américaine .",
+      "hyp": "C'est pas de cette université américaine."
+    },
+    {
+      "ref": "Fait l'étude des langues hautes que l'anglais dans qui étudie soit le français , l'allemand , ces choses-là .  Mais ils veulent faire une étude .  Ils regardent voir le niveau de scolarité des gens et le niveau de français utilisé parce .",
+      "hyp": "Il fait l'étude des langues hautes que l'anglais. Il est étudié soit le français, l'allemand, ces choses-là. Mais il veut le faire une étude et regarde le niveau de scolarité des gens et le niveau de français utilisé."
+    },
+    {
+      "ref": "Entre autres , ça se parle souvent que même les ceux qui sortent des universités ici cou .  Donc français , c'est massacré .  C'est pas possible là .",
+      "hyp": "entre autres, ça se parle souvent quand même les ceux qui sortent des universités ici, qui ont des français, c'est massacré, c'est pas possible."
+    }
+  ]
+}

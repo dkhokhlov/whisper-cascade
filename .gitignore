@@ -5,6 +5,7 @@ __pycache__/
 
 # uv / virtualenv
 .venv/
+.venv-gpu/
 
 # Local caches (HF model/sample cache lives in ~/.cache/huggingface by default)
 .cache/
@@ -23,6 +24,7 @@ out.txt
 # Local HQQ quantized model output (published to Hugging Face, not in git)
 whisper-tiny-hqq-4bit/
 whisper-base-hqq-4bit/
+whisper-small-hqq-4bit/
 # Transient WER-sweep model dirs
 sweep_*/
 # Hugging Face cache dirs downloaded into the repo root

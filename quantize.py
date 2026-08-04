@@ -42,6 +42,11 @@ HQQ_PROTECT = tuple(
 )
 PUSH = os.environ.get("PUSH", "").strip() not in ("", "0", "false")
 HQQ_REPO = os.environ.get("HQQ_REPO", "dkhokhlov/whisper-tiny-hqq-4bit")
+# Quantization report copied as the model card when it exists (it holds the
+# measured WER results). One report per model size: hqq_report.md (tiny),
+# hqq_report_base.md (base), hqq_report_small.md (small). The push step sets
+# this so each upload gets its own card instead of tiny's.
+HQQ_REPORT = os.environ.get("HQQ_REPORT", "hqq_report.md")
 # Multilingual generation config (default on): clear the English
 # forced_decoder_ids baked into the source config and write a modern
 # generation_config.json so the model auto-detects the language and
@@ -49,10 +54,14 @@ HQQ_REPO = os.environ.get("HQQ_REPO", "dkhokhlov/whisper-tiny-hqq-4bit")
 # v1.3.1 / HF revision e43f2bb; English WER is identical under auto-detect.
 # Set HQQ_MULTILINGUAL=0 to reproduce the legacy English-forced config.
 HQQ_MULTILINGUAL = os.environ.get("HQQ_MULTILINGUAL", "1").strip() not in ("", "0", "false")
+# Compute device: "cpu" (default) keeps the original CPU behavior; "cuda"
+# quantizes on GPU (needs CUDA torch, e.g. the .venv-gpu env for the A10). The
+# saved qmodel.pt is device-independent and loads on CPU or GPU.
+ASR_DEVICE = os.environ.get("ASR_DEVICE", "cpu").strip().lower() or "cpu"
 
 MODEL_CARD = """# __REPO__
 
-HQQ 4-bit grouped quantization of `openai/whisper-tiny` for CPU inference.
+HQQ 4-bit grouped quantization of `__MODEL__` for CPU inference.
 
 ## Quantization
 
@@ -100,19 +109,20 @@ def main() -> int:
     counts = hqq_asr.quantize_whisper(
         MODEL_ASR, HQQ_OUT, nbits=HQQ_NBITS, group_size=HQQ_GROUP, axis=HQQ_AXIS,
         protect_nbits=HQQ_PROTECT_NBITS if HQQ_PROTECT else None,
-        protect_patterns=HQQ_PROTECT, multilingual=HQQ_MULTILINGUAL, device="cpu",
+        protect_patterns=HQQ_PROTECT, multilingual=HQQ_MULTILINGUAL, device=ASR_DEVICE,
     )
 
-    # Use the quantization report as the model card when it exists (it has the
-    # measured WER results). Otherwise fall back to the minimal card below.
+    # Use the quantization report (HQQ_REPORT) as the model card when it exists
+    # (it has the measured WER results). Otherwise fall back to the minimal
+    # card below.
     card_path = os.path.join(HQQ_OUT, "README.md")
-    if os.path.exists("hqq_report.md"):
+    if os.path.exists(HQQ_REPORT):
         import shutil
-        shutil.copyfile("hqq_report.md", card_path)
+        shutil.copyfile(HQQ_REPORT, card_path)
     else:
         with open(card_path, "w", encoding="utf-8") as fh:
             repo = HQQ_REPO if PUSH else HQQ_OUT
-            fh.write(MODEL_CARD.replace("__REPO__", repo))
+            fh.write(MODEL_CARD.replace("__REPO__", repo).replace("__MODEL__", MODEL_ASR))
 
     size = dir_size(HQQ_OUT)
     summary = {
