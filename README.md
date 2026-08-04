@@ -380,8 +380,9 @@ the 4-bit tier packs two values per byte, the 8-bit tier stores one value
 per byte. Both are dequantized per group at compute time; the `uint8`
 bytes are only how the weights sit in RAM. The embedding, convs, layer
 norms, and positional embedding stay fp16. The embedding is the largest
-resident component and is not quantized, so the quantization gain is
-bounded by the linear-weight share (larger for the deeper small model).
+non-quantized component, so the quantization gain is bounded by the
+quantized linear-weight share, which grows with model size — for the small
+model the 8-bit-tier linears are the largest resident component overall.
 
 Resident weight RAM by component (HQQ 4-bit, fp16 storage + fp16 compute,
 MB, measured after load, deduplicated by storage pointer so the tied
@@ -390,7 +391,8 @@ embedding counts once):
 | Component (dtype in RAM) | tiny | base | small |
 |---|---:|---:|---:|
 | Embedding, tied `embed_tokens`=`proj_out` (fp16) | 39.83 | 53.11 | 79.66 |
-| HQQ packed weights `W_q` (4/8-bit, `uint8`) | 12.98 | 34.60 | 155.71 |
+| HQQ packed weights `W_q` — 4-bit tier (`uint8`) | 3.54 | 9.44 | 42.47 |
+| HQQ packed weights `W_q` — 8-bit tier (`uint8`) | 9.44 | 25.17 | 113.24 |
 | HQQ scale (fp16) | 1.03 | 2.75 | 12.39 |
 | HQQ zero (fp16) | 1.03 | 2.75 | 12.39 |
 | Positional embedding (fp16) | 1.50 | 1.99 | 2.99 |
@@ -398,6 +400,13 @@ embedding counts once):
 | HQQ bias (fp16) | 0.06 | 0.12 | 0.35 |
 | LayerNorm (fp16) | 0.03 | 0.07 | 0.19 |
 | Resident weight RAM (total) | 57.53 | 97.22 | 267.59 |
+
+The `W_q` rows split the quantized linears by tier: 4-bit tier = decoder
+self- and cross-attention projections + `fc2`; 8-bit tier = encoder stack +
+decoder `fc1`. The scale, zero, and bias rows cover the same linears (both
+tiers combined). `proj_out` (exempt) and the non-linear modules (embedding,
+convs, norms, positional embedding) are not quantized, so they are not in
+`W_q`; they appear in their own fp16 rows.
 
 The published WER benchmark runs fp32 compute (for cross-model
 comparability); its resident RAM is larger because the fp16 non-quantized
