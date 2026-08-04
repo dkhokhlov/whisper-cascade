@@ -63,6 +63,30 @@ class WhisperHQQModel(AutoHQQHFModel):
         with init_empty_weights():
             return AutoModelForSpeechSeq2Seq.from_config(config)
 
+    @classmethod
+    def load_weights(cls, save_dir, map_location=None):
+        """Load HQQ weights from qmodel.pt, or model.safetensors when HQQ_FORMAT=safetensors.
+
+        The default qmodel.pt is a torch pickle holding the nested
+        {module_name: {field: tensor}} dict from hqq serialize_weights. The
+        optional model.safetensors is a flat dotted-key tensor map (one entry
+        per leaf-module field); regroup it back into that nested dict so
+        from_quantized._load_module, which indexes weights[module.name],
+        works unchanged.
+        """
+        if os.environ.get("HQQ_FORMAT", "").strip().lower() == "safetensors":
+            st = os.path.join(save_dir, "model.safetensors")
+            if os.path.exists(st):
+                from safetensors.torch import load_file
+
+                flat = load_file(st)
+                weights = {}
+                for key, tensor in flat.items():
+                    module_name, _, field = key.rpartition(".")
+                    weights.setdefault(module_name, {})[field] = tensor
+                return weights
+        return super().load_weights(save_dir, map_location)
+
 
 def _patch_linears(model, default_cfg, protected_cfg, device, protect_patterns):
     """Replace every nn.Linear (except proj_out) with an HQQLinear on device.

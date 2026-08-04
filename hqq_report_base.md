@@ -280,6 +280,24 @@ Command line (this repository):
 make asr MODEL_ASR=dkhokhlov/whisper-base-hqq-4bit QUANT=hqq AUDIO=clip.wav
 ```
 
+### safetensors format
+
+The repo also ships `model.safetensors` next to `qmodel.pt`. It is a flat tensor
+map: an 8-byte JSON header plus raw tensor bytes, with no pickle, zero-mappable,
+and parseable from C/C++/Rust. Use it for host tooling that cannot read a torch
+pickle (for example an FPGA loader). Set `HQQ_FORMAT=safetensors` to load it;
+the default (no `HQQ_FORMAT`) loads `qmodel.pt`. Both give the same WER. The
+HQQ config per linear (nbits, group_size, axis, packing, bools) is encoded as
+tensors inside the file, so no extra metadata file is needed.
+
+```python
+import os, hqq_asr
+os.environ["HQQ_FORMAT"] = "safetensors"
+pipe = hqq_asr.build_pipeline("dkhokhlov/whisper-base-hqq-4bit", quant="hqq")
+```
+
+To export it from a local quantized dir: `python export_safetensors.py`.
+
 ## Reproduce
 
 ```

@@ -364,6 +364,12 @@ Evidence JSONs are committed under `eval_multilingual/` and `eval_telephone/`
   (`make gpu-venv`, `ASR_DEVICE=cuda`); the saved HQQ model is
   device-independent and loads on CPU or GPU. See
   [`hqq_report_small.md`](hqq_report_small.md).
+- Each published HQQ repo ships `qmodel.pt` (torch pickle, the default loader
+  target) and `model.safetensors` (a flat tensor map, no pickle, parseable from
+  C/C++/Rust for host tooling such as an FPGA loader). Set `HQQ_FORMAT=safetensors`
+  to load the safetensors; both formats give the same WER. `export_safetensors.py`
+  writes `model.safetensors` from a local quantized dir. See the "safetensors
+  format" section of each report card.
 - Audio is decoded with `soundfile` (no ffmpeg required). WAV, FLAC, OGG, and
   MP3 are accepted.
 - The ASR pipeline resamples each input to 16 kHz internally, so no
