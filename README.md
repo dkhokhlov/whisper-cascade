@@ -391,8 +391,8 @@ embedding counts once):
 | Component (dtype in RAM) | tiny | base | small |
 |---|---:|---:|---:|
 | Embedding, tied `embed_tokens`=`proj_out` (fp16) | 39.83 | 53.11 | 79.66 |
-| HQQ weights `W_q` — 4-bit tier (2 per byte, `uint8`) | 3.54 | 9.44 | 42.47 |
-| HQQ weights `W_q` — 8-bit tier (1 per byte, `uint8`) | 9.44 | 25.17 | 113.24 |
+| HQQ weights `W_q` — 4-bit tier (packed, `uint8`) | 3.54 | 9.44 | 42.47 |
+| HQQ weights `W_q` — 8-bit tier (`uint8`) | 9.44 | 25.17 | 113.24 |
 | HQQ scale (fp16) | 1.03 | 2.75 | 12.39 |
 | HQQ zero (fp16) | 1.03 | 2.75 | 12.39 |
 | Positional embedding (fp16) | 1.50 | 1.99 | 2.99 |
