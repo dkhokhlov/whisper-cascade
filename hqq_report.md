@@ -207,7 +207,7 @@ Notes:
 - Per-language evidence is committed under `eval_multilingual/` in the
   benchmark repository (see "Benchmarked with" below).
 
-## Call-center benchmark
+## Telephone benchmark
 
 These benchmarks measure `whisper-tiny` (fp32 vs HQQ 4-bit) on conversational
 telephone speech, which is harder than the read-speech `fleurs` eval. Both
@@ -240,7 +240,7 @@ locale. `mu-bench` is gated, CC-BY-NC-4.0; only aggregate metrics are
 reported here (no audio or transcripts are redistributed).
 
 Notes:
-- fp32 and HQQ are within noise on every call-center config (deltas are all
+- fp32 and HQQ are within noise on every telephone config (deltas are all
   within +/-0.03 absolute). HQQ 4-bit is effectively lossless on
   conversational telephone speech, as it is on `fleurs` read speech.
 - The WERs are high (0.28-0.75) because `whisper-tiny` is small and
@@ -350,7 +350,7 @@ EVAL_LIMIT=100 MODEL_ASR=openai/whisper-tiny EVAL_CONFIG=en_us \
 EVAL_LIMIT=100 QUANT=hqq MODEL_ASR=./whisper-tiny-hqq-4bit EVAL_CONFIG=en_us \
   EVAL_OUT=eval_hqq.json python eval_wer.py
 
-# 4. Call-center benchmark (talkbank segment split, mu-bench direct download).
+# 4. Telephone benchmark (talkbank segment split, mu-bench direct download).
 EVAL_DATASET=diabolocom/talkbank_4_stt EVAL_CONFIG=en EVAL_SPLIT=segment EVAL_LIMIT=100 \
   MODEL_ASR=openai/whisper-tiny EVAL_OUT=talkbank_en_fp32.json python eval_wer.py
 EVAL_DATASET=sierra-research/mu-bench EVAL_CONFIG=en EVAL_SPLIT=train EVAL_LIMIT=200 \
@@ -367,11 +367,11 @@ benchmark repository: [dkhokhlov/whisper-cascade](https://github.com/dkhokhlov/w
 (branch `hqq-4bit`, tag `v1.5.0`). Evidence:
 - English (fleurs): `eval_baseline.json`, `eval_hqq.json`.
 - Multilingual (fleurs): `eval_multilingual/<config>_<fp32|hqq>.json`.
-- Call-center: `eval_callcenter/talkbank_<lang>_<fp32|hqq>.json` and
-  `eval_callcenter/mubench_<lang>_<fp32|hqq>.json` (mu-bench files hold only
+- Telephone: `eval_telephone/talkbank_<lang>_<fp32|hqq>.json` and
+  `eval_telephone/mubench_<lang>_<fp32|hqq>.json` (mu-bench files hold only
   aggregate metrics, per the CC-BY-NC-4.0 terms).
 - The `whisper-base` comparison numbers and its base evidence files
-  (`eval_multilingual/base_*`, `eval_callcenter/base_*`) are in the
+  (`eval_multilingual/base_*`, `eval_telephone/base_*`) are in the
   [`dkhokhlov/whisper-base-hqq-4bit`](https://huggingface.co/dkhokhlov/whisper-base-hqq-4bit)
   model card and the same repo at tag `v1.5.0`.
 

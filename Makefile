@@ -34,7 +34,7 @@ HQQ_PROTECT ?= encoder.layers,fc1
 HQQ_PROTECT_NBITS ?= 8
 # WER eval dataset (make eval-baseline / eval-hqq). fleurs (read speech),
 # diabolocom/talkbank_4_stt (telephone, split=segment), or
-# sierra-research/mu-bench (call-center, split=train; gated CC-BY-NC-4.0).
+# sierra-research/mu-bench (telephone, split=train; gated CC-BY-NC-4.0).
 EVAL_DATASET ?= google/fleurs
 # WER eval split (fleurs test, talkbank segment, mu-bench train).
 EVAL_SPLIT ?= test
@@ -64,7 +64,7 @@ help: ## Show available targets
 	@printf '  %-52s %s\n' 'make eval-baseline EVAL_CONFIG=en_us' 'WER of fp32 MODEL_ASR on a fleurs config'
 	@printf '  %-52s %s\n' 'make eval-hqq EVAL_CONFIG=es_419' 'WER of HQQ MODEL_ASR on a fleurs config'
 	@printf '  %-52s %s\n' 'make eval-baseline EVAL_DATASET=diabolocom/talkbank_4_stt EVAL_CONFIG=es EVAL_SPLIT=segment' 'talkbank telephone Spanish'
-	@printf '  %-52s %s\n' 'make eval-hqq EVAL_DATASET=sierra-research/mu-bench EVAL_CONFIG=en EVAL_SPLIT=train' 'mu-bench call-center English (gated)'
+	@printf '  %-52s %s\n' 'make eval-hqq EVAL_DATASET=sierra-research/mu-bench EVAL_CONFIG=en EVAL_SPLIT=train' 'mu-bench telephone English (gated)'
 	@printf '  %-52s %s\n' 'make test' 'fast unit tests'
 	@echo ""
 	@echo "Pipeline (foreign speech -> English speech; each stage prints JSON, jq extracts text):"

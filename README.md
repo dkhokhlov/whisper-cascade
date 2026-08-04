@@ -346,7 +346,7 @@ not usable). Per-eval runtime, the relative Delta % column, and the full
 quantization reports are in [`hqq_report.md`](hqq_report.md) (the
 `whisper-tiny` card) and [`hqq_report_base.md`](hqq_report_base.md) (the
 `whisper-base` card). Evidence JSONs are committed under `eval_multilingual/`
-and `eval_callcenter/` (base files are prefixed `base_`).
+and `eval_telephone/` (base files are prefixed `base_`).
 
 ## Notes
 
