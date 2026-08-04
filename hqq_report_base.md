@@ -229,6 +229,8 @@ Same samples, same eval harness, same repetition-loop guard. `tiny` =
 `base` = this model. "base vs tiny" is base fp32 minus tiny fp32; a negative
 value means base transcribes better. The `%` is relative to tiny fp32.
 
+**Cross-reference: whisper-tiny vs whisper-base — fp32 and HQQ 4-bit WER**
+
 | Dataset  | Lang  | tiny fp32 | tiny hqq | base fp32 | base hqq | base vs tiny abs | base vs tiny % |
 |----------|-------|-----------|----------|-----------|----------|------------------|----------------|
 | fleurs   | en    | 0.1381    | 0.1367   | 0.0985    | 0.0995   | -0.0396          | -28.7%         |

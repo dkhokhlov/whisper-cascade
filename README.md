@@ -323,6 +323,8 @@ n=100 for `fleurs` and `talkbank`, n=200 for `mu-bench`. WER, lower is
 better. "base vs tiny" = base fp32 minus tiny fp32 (negative means base is
 better); the `%` is relative to tiny fp32.
 
+**Cross-reference: whisper-tiny vs whisper-base — fp32 and HQQ 4-bit WER**
+
 | Dataset  | Lang  | tiny fp32 | tiny hqq | base fp32 | base hqq | base vs tiny | base vs tiny % |
 |----------|-------|-----------|----------|-----------|----------|--------------|----------------|
 | fleurs   | en    | 0.1381    | 0.1367   | 0.0985    | 0.0995   | -0.0396      | -28.7%         |
