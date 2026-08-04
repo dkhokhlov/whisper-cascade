@@ -35,13 +35,13 @@ export ASR_DEVICE
 # HQQ quantization output dir, HF repo, and quant config (make quantize / push).
 # Defaults are the best measured config on fleurs en_us (WER 0.1367 vs 0.1381
 # fp32 baseline): 4-bit, group_size=32, axis=1, the whole encoder stack and
-# fc1 kept at 8-bit.
+# fc1 assigned to the 8-bit tier.
 HQQ_OUT ?= whisper-tiny-hqq-4bit
 HQQ_REPO ?= dkhokhlov/whisper-tiny-hqq-4bit
 HQQ_GROUP ?= 32
 HQQ_AXIS ?= 1
-HQQ_PROTECT ?= encoder.layers,fc1
-HQQ_PROTECT_NBITS ?= 8
+HQQ_8BIT_PATTERNS ?= encoder.layers,fc1
+HQQ_8BIT_NBITS ?= 8
 # WER eval dataset (make eval-baseline / eval-hqq). fleurs (read speech),
 # or diabolocom/talkbank_4_stt (telephone, split=segment).
 EVAL_DATASET ?= google/fleurs
@@ -131,12 +131,12 @@ tts: $(VENV)/.stamp ## Synthesize speech from text (stdin/TEXT=; writes tts.wav,
 
 quantize: $(VENV)/.stamp ## Quantize MODEL_ASR with HQQ 4-bit -> HQQ_OUT (local dir)
 	@MODEL_ASR=$(MODEL_ASR) HQQ_OUT=$(HQQ_OUT) HQQ_GROUP=$(HQQ_GROUP) HQQ_AXIS=$(HQQ_AXIS) \
-	 HQQ_PROTECT=$(HQQ_PROTECT) HQQ_PROTECT_NBITS=$(HQQ_PROTECT_NBITS) $(PY) quantize.py
+	 HQQ_8BIT_PATTERNS=$(HQQ_8BIT_PATTERNS) HQQ_8BIT_NBITS=$(HQQ_8BIT_NBITS) $(PY) quantize.py
 
 push: $(VENV)/.stamp ## Quantize and upload HQQ_OUT to HQQ_REPO (needs HF_TOKEN_WRITE from ~/.api_keys)
 	@set -a; . ~/.api_keys 2>/dev/null; set +a; \
 	 MODEL_ASR=$(MODEL_ASR) HQQ_OUT=$(HQQ_OUT) HQQ_GROUP=$(HQQ_GROUP) HQQ_AXIS=$(HQQ_AXIS) \
-	 HQQ_PROTECT=$(HQQ_PROTECT) HQQ_PROTECT_NBITS=$(HQQ_PROTECT_NBITS) HQQ_REPO=$(HQQ_REPO) PUSH=1 $(PY) quantize.py
+	 HQQ_8BIT_PATTERNS=$(HQQ_8BIT_PATTERNS) HQQ_8BIT_NBITS=$(HQQ_8BIT_NBITS) HQQ_REPO=$(HQQ_REPO) PUSH=1 $(PY) quantize.py
 
 eval-baseline: $(VENV)/.stamp ## Measure baseline WER (fp32 MODEL_ASR) on EVAL_DATASET/EVAL_CONFIG/EVAL_SPLIT (EVAL_LIMIT)
 	@MODEL_ASR=$(MODEL_ASR) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \

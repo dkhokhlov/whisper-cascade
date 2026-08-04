@@ -32,13 +32,13 @@ HQQ_GROUP = int(os.environ.get("HQQ_GROUP", "32"))
 # on whisper-tiny (0.1622 vs 0.2032 WER on fleurs en_us); axis=0 targets
 # GPU-optimized inference kernels.
 HQQ_AXIS = int(os.environ.get("HQQ_AXIS", "1"))
-# Fragile linears kept at a higher bit width. HQQ_PROTECT is a comma-separated
-# list of name substrings; default keeps the whole encoder stack and fc1 (the
-# GELU up-projection) at 8-bit. Measured best on fleurs en_us (WER matches the
-# fp32 baseline at ~61% size reduction).
-HQQ_PROTECT_NBITS = int(os.environ.get("HQQ_PROTECT_NBITS", "8"))
-HQQ_PROTECT = tuple(
-    p.strip() for p in os.environ.get("HQQ_PROTECT", "encoder.layers,fc1").split(",") if p.strip()
+# Sensitive linears assigned to the 8-bit tier. HQQ_8BIT_PATTERNS is a
+# comma-separated list of name substrings; default keeps the whole encoder
+# stack and fc1 (the GELU up-projection) at 8-bit. Measured best on fleurs
+# en_us (WER matches the fp32 baseline at ~61% size reduction).
+HQQ_8BIT_NBITS = int(os.environ.get("HQQ_8BIT_NBITS", "8"))
+HQQ_8BIT_PATTERNS = tuple(
+    p.strip() for p in os.environ.get("HQQ_8BIT_PATTERNS", "encoder.layers,fc1").split(",") if p.strip()
 )
 PUSH = os.environ.get("PUSH", "").strip() not in ("", "0", "false")
 HQQ_REPO = os.environ.get("HQQ_REPO", "dkhokhlov/whisper-tiny-hqq-4bit")
@@ -67,7 +67,7 @@ HQQ 4-bit grouped quantization of `__MODEL__` for CPU inference.
 
 - Method: HQQ (Half-Quadratic Quantization), no calibration data.
 - Linear layers: nbits=4, group_size=32, axis=1 (group along input dim; measured best on whisper-tiny).
-- Fragile linears (whole encoder stack + fc1): kept at 8-bit.
+- 8-bit tier (whole encoder stack + fc1): quantized at 8-bit.
 - proj_out (the lm_head): kept tied to the embedding in fp16 (not quantized).
   It shares the weight with the decoder embed_tokens, so quantizing it would
   store the weight twice and add error to the vocab projection.
@@ -102,14 +102,14 @@ def main() -> int:
     print(
         f"quantizing {MODEL_ASR} -> {HQQ_OUT} "
         f"(nbits={HQQ_NBITS}, group_size={HQQ_GROUP}, axis={HQQ_AXIS}, "
-        f"protect={HQQ_PROTECT}@{HQQ_PROTECT_NBITS}bit, "
+        f"tier8={HQQ_8BIT_PATTERNS}@{HQQ_8BIT_NBITS}bit, "
         f"multilingual={HQQ_MULTILINGUAL})",
         file=sys.stderr,
     )
     counts = hqq_asr.quantize_whisper(
         MODEL_ASR, HQQ_OUT, nbits=HQQ_NBITS, group_size=HQQ_GROUP, axis=HQQ_AXIS,
-        protect_nbits=HQQ_PROTECT_NBITS if HQQ_PROTECT else None,
-        protect_patterns=HQQ_PROTECT, multilingual=HQQ_MULTILINGUAL, device=ASR_DEVICE,
+        tier8_nbits=HQQ_8BIT_NBITS if HQQ_8BIT_PATTERNS else None,
+        tier8_patterns=HQQ_8BIT_PATTERNS, multilingual=HQQ_MULTILINGUAL, device=ASR_DEVICE,
     )
 
     # Use the quantization report (HQQ_REPORT) as the model card when it exists
@@ -132,10 +132,10 @@ def main() -> int:
         "group_size": HQQ_GROUP,
         "axis": HQQ_AXIS,
         "multilingual": HQQ_MULTILINGUAL,
-        "protect_patterns": list(HQQ_PROTECT),
-        "protect_nbits": HQQ_PROTECT_NBITS if HQQ_PROTECT else None,
+        "tier8_patterns": list(HQQ_8BIT_PATTERNS),
+        "tier8_nbits": HQQ_8BIT_NBITS if HQQ_8BIT_PATTERNS else None,
         "linears_default_bit": counts["default"],
-        "linears_protected_bit": counts["protected"],
+        "linears_8bit": counts["tier8"],
         "size_bytes": size,
         "size_mb": round(size / 1e6, 2),
         "files": sorted(os.listdir(HQQ_OUT)),

@@ -88,39 +88,40 @@ class WhisperHQQModel(AutoHQQHFModel):
         return super().load_weights(save_dir, map_location)
 
 
-def _patch_linears(model, default_cfg, protected_cfg, device, protect_patterns):
+def _patch_linears(model, default_cfg, tier8_cfg, device, tier8_patterns):
     """Replace every nn.Linear (except proj_out) with an HQQLinear on device.
 
-    A linear whose name contains any substring in protect_patterns uses
-    protected_cfg (e.g. 8-bit); the rest use default_cfg (e.g. 4-bit). proj_out
-    is skipped (tied to the embedding, kept fp16). Return (n_default,
-    n_protected).
+    A linear whose name contains any substring in tier8_patterns uses
+    tier8_cfg (the 8-bit tier); the rest use default_cfg (the 4-bit tier).
+    proj_out is exempt (tied to the embedding, kept fp16). Embeddings, convs,
+    and norms are not nn.Linear, so they are not patched here; they are cast
+    to fp16 separately. Return (n_default, n_tier8).
     """
     n_default = 0
-    n_protected = 0
+    n_tier8 = 0
     for name, module in list(model.named_modules()):
         if type(module) is not nn.Linear:
             continue
         # proj_out is the tied lm_head (shares its weight with the decoder
-        # embedding). Skip it: quantizing it would store the weight twice and
-        # add error to the vocab projection. It is kept in fp16 instead.
+        # embedding). Exempt it: quantizing it would store the weight twice
+        # and add error to the vocab projection. It is kept in fp16 instead.
         if name == "proj_out":
             continue
         parent = model
         for part in name.split(".")[:-1]:
             parent = getattr(parent, part)
         leaf = name.split(".")[-1]
-        if protected_cfg is not None and any(p and p in name for p in protect_patterns):
+        if tier8_cfg is not None and any(p and p in name for p in tier8_patterns):
             setattr(parent, leaf, HQQLinear(
-                module, protected_cfg, compute_dtype=COMPUTE_DTYPE, device=device,
+                module, tier8_cfg, compute_dtype=COMPUTE_DTYPE, device=device,
             ))
-            n_protected += 1
+            n_tier8 += 1
         else:
             setattr(parent, leaf, HQQLinear(
                 module, default_cfg, compute_dtype=COMPUTE_DTYPE, device=device,
             ))
             n_default += 1
-    return n_default, n_protected
+    return n_default, n_tier8
 
 
 def quantize_whisper(
@@ -129,8 +130,8 @@ def quantize_whisper(
     nbits=4,
     group_size=32,
     axis=1,
-    protect_nbits=None,
-    protect_patterns=(),
+    tier8_nbits=None,
+    tier8_patterns=(),
     multilingual=True,
     device="cpu",
 ):
@@ -143,8 +144,8 @@ def quantize_whisper(
 
     axis=1 groups along the input/reduction dim and measures better than axis=0
     on whisper-tiny (0.1622 vs 0.2032 WER on fleurs en_us); axis=0 is meant for
-    GPU-optimized inference. protect_nbits/protect_patterns keep fragile linears
-    (e.g. fc1, the encoder stack) at a higher bit width.
+    GPU-optimized inference. tier8_nbits/tier8_patterns assign sensitive linears
+    (e.g. fc1, the encoder stack) to the 8-bit tier.
 
     multilingual: whisper-tiny's config.json ships with forced_decoder_ids that
     hardcode the output language to English (the English track). When True,
@@ -155,10 +156,10 @@ def quantize_whisper(
     English track is preserved.
     """
     default_cfg = BaseQuantizeConfig(nbits=nbits, group_size=group_size, axis=axis)
-    protected_cfg = None
-    if protect_nbits is not None and protect_patterns:
-        protected_cfg = BaseQuantizeConfig(
-            nbits=protect_nbits, group_size=group_size, axis=axis
+    tier8_cfg = None
+    if tier8_nbits is not None and tier8_patterns:
+        tier8_cfg = BaseQuantizeConfig(
+            nbits=tier8_nbits, group_size=group_size, axis=axis
         )
 
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
@@ -166,8 +167,8 @@ def quantize_whisper(
     ).to(device)
     model.eval()
 
-    n_default, n_protected = _patch_linears(
-        model, default_cfg, protected_cfg, device, protect_patterns
+    n_default, n_tier8 = _patch_linears(
+        model, default_cfg, tier8_cfg, device, tier8_patterns
     )
     # hqq bookkeeping so save_quantized serializes the patched model.
     AutoHQQHFModel.setup_model(model)
@@ -200,7 +201,7 @@ def quantize_whisper(
         gc.language = None
         gc.task = "transcribe"
         gc.save_pretrained(save_dir)
-    return {"default": n_default, "protected": n_protected}
+    return {"default": n_default, "tier8": n_tier8}
 
 
 def load_whisper_hqq(model_id_or_dir, device="cpu"):

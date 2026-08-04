@@ -405,20 +405,18 @@ All three models use the same mixed-precision HQQ config, tuned once on
 `whisper-small` without a separate sweep. No calibration data; the
 quantization is direct (grouped, `axis=1`).
 
-- 4-bit linears (`nbits=4, group_size=32, axis=1`): the decoder self-attention
+- **4-bit tier** (`nbits=4, group_size=32, axis=1`): the decoder self-attention
   projections (`q_proj`, `k_proj`, `v_proj`, `out_proj`), the decoder
   cross-attention projections, and `fc2`.
-- 8-bit linears (`nbits=8, group_size=32, axis=1`): the whole encoder stack
+- **8-bit tier** (`nbits=8, group_size=32, axis=1`): the whole encoder stack
   (`encoder.layers.*` self-attention `q/k/v/out` and `fc1/fc2`) and `fc1` in
-  the decoder. The encoder is the acoustic front-end (cheap to protect); `fc1`
-  is the GELU up-projection, the more sensitive half of the FFN. Keeping these
-  at 8-bit removes almost all of the 4-bit WER gap.
-- `proj_out` (the lm_head): NOT quantized. It is tied to the decoder embedding
-  and shares one weight tensor; it is kept tied in fp16, so the weight is
-  stored once with no quantization error.
-- Non-quantized modules (embedding, `conv1`, `conv2`, layer norms, positional
-  embedding): stored as fp16. Whisper is trained in fp16, so this is
-  near-lossless.
+  the decoder. The encoder is the acoustic front-end (cheap to keep at 8-bit);
+  `fc1` is the GELU up-projection, the more sensitive half of the FFN. Keeping
+  these sensitive linears at 8-bit removes almost all of the 4-bit WER gap.
+- **Exempt** (not quantized): `proj_out` (the lm_head, tied to the decoder
+  embedding — one shared weight, kept fp16), the embedding, `conv1`, `conv2`,
+  layer norms, and the positional embedding (all stored fp16; whisper is
+  trained in fp16, so this is near-lossless).
 - Compute dtype: fp32 for the published WER benchmark (cross-model
   comparability); fp16 for deployment (WER-neutral). See [Size](#size).
 - `axis=1` groups along the input/reduction dim. It measured better than
@@ -426,14 +424,19 @@ quantization is direct (grouped, `axis=1`).
   `axis=0` targets GPU-optimized inference kernels. `axis=1` is kept for all
   three so the WER is directly comparable.
 
-The protect config (`encoder.layers,fc1` substring patterns, 8-bit) scales
+The 8-bit-tier patterns (`encoder.layers,fc1` substring match) scale
 automatically to the deeper stack; no per-model change.
 
-| model | linears quantized | 4-bit | 8-bit | skipped (tied) |
+| model | linears quantized | 4-bit | 8-bit | exempt (tied) |
 |---|---:|---:|---:|---|
 | whisper-tiny  | 64  | 36  | 28  | `proj_out` |
 | whisper-base  | 96  | 54  | 42  | `proj_out` |
 | whisper-small | 192 | 108 | 84  | `proj_out` |
+
+The 8-bit tier is set by `HQQ_8BIT_PATTERNS` (comma-separated name substrings,
+default `encoder.layers,fc1`) and its bit width by `HQQ_8BIT_NBITS` (default
+8). The 4-bit tier is the default for every other linear; `proj_out` is
+hardcoded exempt.
 
 ### Why not transformers `HqqConfig`
 
@@ -452,12 +455,13 @@ path (not `HqqConfig`) on the A10 (`ASR_DEVICE=cuda`), so the saved
 ### Ablation
 
 Config sweep on `whisper-tiny`, same 100 English (`fleurs` `en_us`) samples.
-All rows use `axis=1` except row A. `protect` names the linears kept at 8-bit;
-the rest are 4-bit. `group` is the `group_size`. The winner (row H) is the
-published config. These runs predate the repetition-loop guard; English
-`en_us` does not loop, so the guard does not change these values.
+All rows use `axis=1` except row A. The **8-bit tier** column names the
+linears assigned to the 8-bit tier; the rest are 4-bit. `group` is the
+`group_size`. The winner (row H) is the published config. These runs predate
+the repetition-loop guard; English `en_us` does not loop, so the guard does
+not change these values.
 
-| Row | group | protect (8-bit)        | WER    | Size (on-disk) |
+| Row | group | 8-bit tier             | WER    | Size (on-disk) |
 |-----|-------|------------------------|--------|----------------|
 | -   | 64    | (none, all 4-bit)      | 0.1622 | 54.86 MB       |
 | A   | 64    | (axis=0, all 4-bit)    | 0.2032 | -              |
@@ -473,11 +477,11 @@ What the sweep shows:
 - `axis=1` beats `axis=0` decisively (row A vs the 64/all-4-bit row).
 - `group_size=32` beats `group_size=64` (row B vs the 64/all-4-bit row);
   `group_size=16` (row E) did not improve over 32, so 32 is the sweet spot.
-- Protecting the cross-attention (rows C, D) did not help; cross-attention
-  K/V are computed once from the already-clean encoder output, so their
-  quantization error does not compound.
-- Protecting `fc1` (row F) helps; protecting the whole encoder stack (row G)
-  helps more; doing both (row H) matches the fp32 baseline.
+- Assigning the cross-attention to the 8-bit tier (rows C, D) did not help;
+  cross-attention K/V are computed once from the already-clean encoder output,
+  so their quantization error does not compound.
+- Assigning `fc1` to the 8-bit tier (row F) helps; assigning the whole encoder
+  stack (row G) helps more; doing both (row H) matches the fp32 baseline.
 
 ## safetensors format
 
