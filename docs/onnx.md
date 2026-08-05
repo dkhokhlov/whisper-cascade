@@ -3,7 +3,8 @@
 This document is the spec for exporting the HQQ-quantized Whisper models to ONNX so they
 run on CPU in ONNX Runtime and reproduce the HQQ transcription results.
 
-Status: **in progress on the `onnx` branch**, tiny-first. Not merged. No ONNX files published yet.
+Status: **whisper-tiny passes both gates on the `onnx` branch** (not merged; no ONNX files
+published yet). base and small are next.
 
 ## Goal
 
@@ -25,6 +26,46 @@ Two gates, kept separate:
 
 Compact runtime RAM (Path B's reason to exist over a plain dense export) is a later
 optimization, not part of these gates.
+
+## Results (whisper-tiny)
+
+Both gates pass on the `onnx` branch (commit `dbc95c9`). Settings: `google/fleurs` `en_us`
+`test`, n=100, CPU ONNX Runtime, auto-detect language, post-hoc gzip loop guard, greedy
+(`do_sample=False`). The ONNX run uses the same processor and generation config as the HQQ
+run, so the texts are comparable.
+
+1. **Path B graph proof (structural): PASS.** The raw `.onnx` protobuf, inspected before any
+   ORT session, contains the packed `uint8` `W_q` initializers, the dequant chain
+   (`Cast`/`Sub`/`Mul`/`Reshape`/`Transpose`/`MatMul`), and the 4-bit unpack ops
+   (`BitwiseAnd`/`BitShift`) in every exported subgraph. The export did not fold the dequant to
+   dense at export time (`do_constant_folding=False`). Exported files: `encoder_model.onnx`,
+   `decoder_model.onnx`, `decoder_with_past_model.onnx`, `decoder_model_merged.onnx`.
+2. **WER / text proof (functional): PASS.** The ONNX run reproduces the HQQ result exactly.
+   - Exact `output["text"]` match on all 100 samples vs the full 100-sample HQQ reference
+     manifest (`hqq_reference.json`, written by `make hqq-reference`). Zero mismatches.
+   - WER **0.1367**, identical to the HQQ baseline (`eval_hqq.json`).
+
+Reproduce:
+
+```bash
+make onnx-venv                       # .venv-onnx (pinned optimum/onnxruntime set)
+make onnx                            # export HQQ_OUT -> ONNX_OUT (3 subgraphs)
+make hqq-reference                   # 100-sample HQQ manifest (the gate oracle)
+make eval-onnx                       # ONNX WER + exact-text gate vs the manifest
+# eval_onnx.json -> exact_text_gate.exact_match == true, wer == 0.1367
+```
+
+### Known validation false alarm (cached decoder step)
+
+optimum's built-in export validation flags the cached decoder (`decoder_with_past_model.onnx`
+/ `decoder_model_merged.onnx`) with large KV-cache diffs (up to 13.4 in logits). This is a
+false alarm, not a defect. The legacy exporter traces the `if sequence_length != 1` branch
+(`transformers/models/whisper/modeling_whisper.py:100`) as a constant, and optimum's
+validation feeds dummy shapes that break this assumption. `ORTModelForSpeechSeq2Seq` always
+feeds `sequence_length == 1` for cached steps, so inference is exact. Gate 2 (the 100-sample
+exact-text match) confirms it. The export validation `atol` is set to `1e-3` because
+ORT-vs-torch fp32 reassociation over the 4-layer decoder is about `2e-4`, above the default
+`1e-4`; the real gate is the exact-text match, not this sanity check.
 
 ## Why Path B
 
