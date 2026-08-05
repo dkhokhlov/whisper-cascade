@@ -50,8 +50,14 @@ across flavors; only the layer/linear counts differ.
    ORT session, contains the packed `uint8` `W_q` initializers, the dequant chain
    (`Cast`/`Sub`/`Mul`/`Reshape`/`Transpose`/`MatMul`), and the 4-bit unpack ops
    (`BitwiseAnd`/`BitShift`) in every exported subgraph. The export did not fold the dequant to
-   dense at export time (`do_constant_folding=False`). Exported files: `encoder_model.onnx`,
-   `decoder_model.onnx`, `decoder_with_past_model.onnx`, `decoder_model_merged.onnx`.
+   dense at export time (`do_constant_folding=False`). Shipped files: `encoder_model.onnx`
+   and `decoder_model_merged.onnx`. optimum also emits the un-merged decoder pair
+   (`decoder_model.onnx` + `decoder_with_past_model.onnx`); `export_onnx.py` trims them after
+   the gate-1 check because `ORTModelForSpeechSeq2Seq` loads the merged decoder (the merged
+   graph carries the no-past and with-past branches behind one control-flow switch), so the
+   un-merged pair is redundant and roughly doubles the decoder disk footprint. Whisper is an
+   encoder-decoder model, so two graphs (encoder + decoder) are the minimum; the
+   autoregressive generation loop runs in Python in `ORTModelForSpeechSeq2Seq`.
 2. **WER / text proof (functional): PASS.** The ONNX run reproduces the HQQ result exactly.
    - Exact `output["text"]` match on all 100 samples vs the full 100-sample HQQ reference
      manifest (`hqq_reference.json`, written by `make hqq-reference`). Zero mismatches.
@@ -199,10 +205,11 @@ W_q  (uint8 initializer, shape [O*I/32, 32], values 0..255)
 | swapped model                                                          |
 |    v   onnx_export_from_model(fn_get_submodels, custom_onnx_configs)   |
 |        dynamo=False, do_constant_folding=False, opset=18               |
-| ONNX_OUT:                                                              |
-|    encoder_model.onnx, decoder_model.onnx,                             |
-|    decoder_with_past_model.onnx, config.json,                          |
-|    processor files, generation_config.json                             |
+| ONNX_OUT (shipped, 2 files):                                           |
+|    encoder_model.onnx, decoder_model_merged.onnx,                      |
+|    config.json, processor files, generation_config.json                |
+| (optimum also emits decoder_model.onnx + decoder_with_past_model.onnx; |
+|  export_onnx.py trims them: ORTModelForSpeechSeq2Seq loads the merged) |
 +------------------------------------------------------------------------+
               HQQ_OUT is read-only (the exporter never writes it)
                                   v

@@ -91,8 +91,20 @@ CPU ONNX Runtime with no HQQ runtime dependency. The export uses Path B — it
 keeps the packed uint8 `W_q` and the per-group `scale`/`zero` as ONNX
 initializers and emits the unpack + dequant as standard ONNX ops (opset 18),
 so the graph carries the exact HQQ weights (and the measured WER), not a
-re-dequantized dense copy. The three subgraphs are `encoder_model.onnx`,
-`decoder_model.onnx`, and `decoder_with_past_model.onnx`.
+re-dequantized dense copy. Whisper is an encoder-decoder model, so the export
+is two ONNX graphs; the autoregressive generation loop (argmax, KV-cache, EOS
+stop) runs in Python in `ORTModelForSpeechSeq2Seq`, calling the encoder once
+and the decoder once per token:
+
+| File | Role | Input | Output | Runs |
+|---|---|---|---|---|
+| `encoder_model.onnx` | encoder | audio mel-spectrogram | hidden states | once per utterance |
+| `decoder_model_merged.onnx` | decoder | encoder hidden states + KV cache | next text token | once per token (loop) |
+
+The merged decoder carries the no-past (first step) and with-past (cached
+steps) branches behind one control-flow switch, so one session handles the
+whole generation; the separate un-merged decoder files optimum emits are not
+shipped.
 
 The export reproduces the HQQ output exactly. An exact-text gate over 100
 `fleurs` `en_us` samples compares the ONNX transcript to the HQQ manifest and

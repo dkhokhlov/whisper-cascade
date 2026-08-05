@@ -224,18 +224,47 @@ def main() -> int:
     print(f"copied {n_meta} config/processor files from {hqq_src} -> {ONNX_OUT}", file=sys.stderr)
 
     gate1 = _gate1_structural_check(ONNX_OUT)
+    if not gate1["pass"]:
+        summary = {
+            "hqq_out": HQQ_OUT,
+            "onnx_out": ONNX_OUT,
+            "linears_default_bit": n_default,
+            "linears_8bit": n_tier8,
+            "gate1_structural": gate1,
+            "files": sorted(os.listdir(ONNX_OUT)),
+        }
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        print("GATE 1 FAILED: dequant was folded to dense or W_q not packed", file=sys.stderr)
+        return 1
+
+    # Trim the redundant un-merged decoder pair. optimum emits both the
+    # separate decoder sessions (decoder_model.onnx + decoder_with_past_model.onnx)
+    # and the merged one (decoder_model_merged.onnx). ORTModelForSpeechSeq2Seq
+    # loads the merged decoder, which carries the no-past and with-past branches
+    # behind one control-flow switch, so the separate-session pair is never used
+    # by the quant="onnx" load path. Keeping only encoder + merged halves the
+    # decoder disk footprint (verified: load + transcribe work with 2 files).
+    trimmed = []
+    for fn in ("decoder_model.onnx", "decoder_with_past_model.onnx"):
+        p = os.path.join(ONNX_OUT, fn)
+        if os.path.isfile(p):
+            os.remove(p)
+            trimmed.append(fn)
+    if trimmed:
+        print(f"trimmed redundant un-merged decoder pair: {trimmed}", file=sys.stderr)
+
     summary = {
         "hqq_out": HQQ_OUT,
         "onnx_out": ONNX_OUT,
         "linears_default_bit": n_default,
         "linears_8bit": n_tier8,
         "gate1_structural": gate1,
-        "files": sorted(os.listdir(ONNX_OUT)),
+        "shipped_files": [
+            f for f in sorted(os.listdir(ONNX_OUT)) if f.endswith(".onnx")
+        ],
+        "trimmed_files": trimmed,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    if not gate1["pass"]:
-        print("GATE 1 FAILED: dequant was folded to dense or W_q not packed", file=sys.stderr)
-        return 1
     return 0
 
 
