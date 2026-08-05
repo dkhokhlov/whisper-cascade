@@ -124,10 +124,9 @@ steps) branches behind one control-flow switch, so one session handles the
 whole generation; the separate un-merged decoder files optimum emits are not
 shipped.
 
-Both exports reproduce the HQQ WER (0.0636). The fp32 export exact-matches the
-HQQ manifest (0 mismatches); the fp16 export matches the WER and differs from
-the fp32 manifest by at most a few case-only tokens (fp16-vs-fp32 rounding,
-WER-neutral). The ONNX path runs on CPU (`make onnx` / `make eval-onnx` use
+Both exports reproduce the HQQ WER (0.0636). Both exact-match the HQQ manifest
+(0 mismatches); on the 100-sample gate the fp16 export is text-identical to the
+fp32 export. The ONNX path runs on CPU (`make onnx` / `make eval-onnx` use
 `.venv-onnx`), independent of the GPU eval used for the HQQ WER above.
 
 Load via ONNX Runtime (the no-suffix files are the fp16 default):

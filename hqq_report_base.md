@@ -120,8 +120,8 @@ shipped.
 
 Both exports reproduce the HQQ WER (0.0995). The fp32 export exact-matches the
 HQQ manifest (0 mismatches); the fp16 export matches the WER and differs from
-the fp32 manifest by at most a few case-only tokens (fp16-vs-fp32 rounding,
-WER-neutral).
+the fp32 manifest by one WER-neutral token (a punctuation comma, a
+fp16-vs-fp32 rounding effect).
 
 Load via ONNX Runtime (the no-suffix files are the fp16 default):
 
