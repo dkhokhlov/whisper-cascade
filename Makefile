@@ -52,6 +52,10 @@ HQQ_REPO ?= dkhokhlov/whisper-tiny-hqq-4bit
 # eval-onnx points MODEL_ASR here (not HQQ_OUT). The export sources HQQ weights from
 # HQQ_REPO (HF repo id -> default HF cache), so the local HQQ_OUT dir is not needed.
 ONNX_OUT ?= $(BUILD)/whisper-tiny-hqq-onnx
+# HQQ storage bit-width for the default tier (the 8-bit tier is set by HQQ_8BIT_NBITS).
+# 4 is the published default; 3 is the int8-compute deploy target (WER == 4-bit);
+# 2 is non-viable on whisper-tiny (WER ~0.77). quantize.py reads HQQ_NBITS.
+HQQ_NBITS ?= 4
 HQQ_GROUP ?= 32
 HQQ_AXIS ?= 1
 HQQ_8BIT_PATTERNS ?= encoder.layers,fc1
@@ -166,13 +170,13 @@ en: $(VENV)/.stamp ## Translate text to English (stdin/TEXT=; JSON to stdout, jq
 tts: $(VENV)/.stamp ## Synthesize speech from text (stdin/TEXT=; writes tts.wav, OUTPUT= to override)
 	@MODEL_TTS=$(MODEL_TTS) $(PY) tts.py
 
-quantize: $(VENV)/.stamp ## Quantize MODEL_ASR with HQQ 4-bit -> HQQ_OUT (local dir)
-	@MODEL_ASR=$(MODEL_ASR) HQQ_OUT=$(HQQ_OUT) HQQ_GROUP=$(HQQ_GROUP) HQQ_AXIS=$(HQQ_AXIS) \
+quantize: $(VENV)/.stamp ## Quantize MODEL_ASR with HQQ (HQQ_NBITS-bit) -> HQQ_OUT (local dir)
+	@MODEL_ASR=$(MODEL_ASR) HQQ_OUT=$(HQQ_OUT) HQQ_NBITS=$(HQQ_NBITS) HQQ_GROUP=$(HQQ_GROUP) HQQ_AXIS=$(HQQ_AXIS) \
 	 HQQ_8BIT_PATTERNS=$(HQQ_8BIT_PATTERNS) HQQ_8BIT_NBITS=$(HQQ_8BIT_NBITS) $(PY) quantize.py
 
 push: $(VENV)/.stamp ## Quantize and upload HQQ_OUT to HQQ_REPO (needs HF_TOKEN_WRITE from ~/.api_keys)
 	@set -a; . ~/.api_keys 2>/dev/null; set +a; \
-	 MODEL_ASR=$(MODEL_ASR) HQQ_OUT=$(HQQ_OUT) HQQ_GROUP=$(HQQ_GROUP) HQQ_AXIS=$(HQQ_AXIS) \
+	 MODEL_ASR=$(MODEL_ASR) HQQ_OUT=$(HQQ_OUT) HQQ_NBITS=$(HQQ_NBITS) HQQ_GROUP=$(HQQ_GROUP) HQQ_AXIS=$(HQQ_AXIS) \
 	 HQQ_8BIT_PATTERNS=$(HQQ_8BIT_PATTERNS) HQQ_8BIT_NBITS=$(HQQ_8BIT_NBITS) HQQ_REPO=$(HQQ_REPO) PUSH=1 $(PY) quantize.py
 
 eval-baseline: $(VENV)/.stamp ## Measure baseline WER (fp32 MODEL_ASR) on EVAL_DATASET/EVAL_CONFIG/EVAL_SPLIT (EVAL_LIMIT)
