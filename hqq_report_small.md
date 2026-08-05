@@ -21,8 +21,10 @@ tags:
 
 **Includes fp16 + fp32 ONNX exports — the same HQQ model runs on CPU ONNX
 Runtime with no HQQ runtime.** The fp16 export is a fp32-free graph for
-fp32-less deployment hardware; the fp32 export matches the published benchmark
-compute. HQQ ships no ONNX exporter; this repo adds one (see
+host-side validation; the fp32 export matches the published benchmark compute.
+The deployment hardware has no fp16 and no fp32 unit, so an int8-compute export
+(zero fp16/fp32) is the deploy target — under development. HQQ ships no ONNX
+exporter; this repo adds one (see
 [ONNX export](#onnx-export-cpu-onnx-runtime)).
 
 Model card source for `dkhokhlov/whisper-small-hqq-4bit`.
@@ -96,12 +98,13 @@ ASR_DEVICE=cuda make asr MODEL_ASR=dkhokhlov/whisper-small-hqq-4bit QUANT=hqq AU
 This repo ships **two ONNX exports** of the same HQQ model, differing only in
 compute dtype:
 
-- **fp16 (default): `encoder_model.onnx` + `decoder_model_merged.onnx`** — the
-  deployment compute. The graph is fp16-only (zero fp32 ops), for hardware with
-  no fp32 unit. It uses eager attention so the attention scale stays a fp16
-  `Mul` (SDPA would decompose it to `Sqrt`→`Div` in fp32). On CPU ONNX Runtime
-  it runs slower than the fp32 export (ORT-CPU upcasts fp16 to fp32 internally)
-  but loads less RAM, and it is the graph the deployment hardware imports.
+- **fp16 (default): `encoder_model.onnx` + `decoder_model_merged.onnx`** —
+  host-side validation, not the deploy target. The graph is fp16-only (zero
+  fp32 ops) and uses eager attention so the attention scale stays a fp16 `Mul`
+  (SDPA would decompose it to `Sqrt`→`Div` in fp32). On CPU ONNX Runtime it runs
+  slower than the fp32 export (ORT-CPU upcasts fp16→fp32) but loads less RAM.
+  The deployment hardware has no fp16 unit, so this graph cannot run on it; the
+  deploy target is an int8-compute export (under development).
 - **fp32: `encoder_model-fp32.onnx` + `decoder_model_merged-fp32.onnx`** — the
   benchmark compute. Faster on CPU ORT; use it for host-side validation that
   matches the published fp32 WER benchmark.
