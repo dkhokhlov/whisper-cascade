@@ -132,6 +132,7 @@ Run `make` (no target) to print this help.
 | `make onnx` | Export `HQQ_REPO` (HF) to ONNX (Path B, 3 subgraphs) -> `ONNX_OUT` (`build/`; `.venv-onnx`). |
 | `make hqq-reference` | Write the full 100-sample HQQ text manifest (the ONNX exact-text gate oracle). |
 | `make eval-onnx` | ONNX WER + exact-text gate vs the manifest (`QUANT=onnx MODEL_ASR=ONNX_OUT`; `.venv-onnx`). |
+| `make push-onnx` | Upload `ONNX_OUT/*.onnx` (+ `MODEL_CARD`) into `HQQ_REPO` (needs `HF_TOKEN_WRITE`). |
 | `make test` | Run the fast unit tests (no model load, no network). |
 | `make test-integration` | Run the integration tests (load the real Whisper/MarianMT/VITS models). |
 | `make clean` | Remove bytecode cache + the `build/` artifact dir; keeps `.venv`. |

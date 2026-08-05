@@ -1,6 +1,7 @@
 ---
 license: mit
 base_model: openai/whisper-tiny
+base_model_relation: quantized
 library_name: transformers
 pipeline_tag: automatic-speech-recognition
 language:
@@ -13,9 +14,14 @@ tags:
   - 4-bit
   - asr
   - cpu
+  - onnx
 ---
 
 # HQQ 4-bit Whisper-Tiny
+
+**Includes an ONNX export — the same HQQ model runs on CPU ONNX Runtime with no
+HQQ runtime.** HQQ ships no ONNX exporter; this repo adds one (see
+[ONNX export](#onnx-export-cpu-onnx-runtime)).
 
 Model card source for `dkhokhlov/whisper-tiny-hqq-4bit`.
 
@@ -75,6 +81,40 @@ Command line (this repository):
 ```
 make asr MODEL_ASR=dkhokhlov/whisper-tiny-hqq-4bit QUANT=hqq AUDIO=clip.wav
 ```
+
+## ONNX export (CPU ONNX Runtime)
+
+This repo also ships an **ONNX** export of the same HQQ model. HQQ itself ships
+no ONNX exporter, so this is a unique addition: the quantized model runs on
+CPU ONNX Runtime with no HQQ runtime dependency. The export uses Path B — it
+keeps the packed uint8 `W_q` and the per-group `scale`/`zero` as ONNX
+initializers and emits the unpack + dequant as standard ONNX ops (opset 18),
+so the graph carries the exact HQQ weights (and the measured WER), not a
+re-dequantized dense copy. The three subgraphs are `encoder_model.onnx`,
+`decoder_model.onnx`, and `decoder_with_past_model.onnx`.
+
+The export reproduces the HQQ output exactly. An exact-text gate over 100
+`fleurs` `en_us` samples compares the ONNX transcript to the HQQ manifest and
+returns `exact_match=true` with 0 mismatches (WER 0.1367, identical to HQQ).
+
+Load via ONNX Runtime:
+
+```python
+import hqq_asr
+pipe = hqq_asr.build_pipeline("dkhokhlov/whisper-tiny-hqq-4bit", quant="onnx")
+text = pipe({"array": audio, "sampling_rate": 16000})["text"]
+```
+
+Reproduce the export and the gate:
+
+```
+make onnx HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit ONNX_OUT=build/whisper-tiny-hqq-onnx
+make hqq-reference HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit EVAL_OUT=build/hqq_reference_tiny.json
+make eval-onnx ONNX_OUT=build/whisper-tiny-hqq-onnx \
+     HQQ_REFERENCE_MANIFEST=build/hqq_reference_tiny.json EVAL_OUT=build/eval_onnx_tiny.json
+```
+
+The Path B spec and the two validation gates are in `docs/onnx.md` in the repo.
 
 ## Reproduce
 

@@ -66,7 +66,7 @@ EVAL_LIMIT ?= 100
 # WER eval config / language code (make eval-baseline / eval-hqq).
 EVAL_CONFIG ?= en_us
 
-.PHONY: help info venv gpu-venv onnx-venv samples asr en tts quantize push eval-baseline eval-hqq eval-onnx onnx hqq-reference test test-integration clean clean-all
+.PHONY: help info venv gpu-venv onnx-venv samples asr en tts quantize push eval-baseline eval-hqq eval-onnx onnx hqq-reference push-onnx test test-integration clean clean-all
 
 help: ## Show available targets
 	@echo "whisper-cascade v$(VERSION)"
@@ -86,6 +86,9 @@ help: ## Show available targets
 	@printf '  %-52s %s\n' 'make push' 'quantize + upload to HQQ_REPO (needs HF_TOKEN_WRITE)'
 	@printf '  %-52s %s\n' 'make eval-baseline EVAL_CONFIG=en_us' 'WER of fp32 MODEL_ASR on a fleurs config'
 	@printf '  %-52s %s\n' 'make eval-hqq EVAL_CONFIG=es_419' 'WER of HQQ MODEL_ASR on a fleurs config'
+	@printf '  %-52s %s\n' 'make onnx HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit' 'export HQQ -> ONNX (Path B) to build/'
+	@printf '  %-52s %s\n' 'make eval-onnx ONNX_OUT=build/whisper-tiny-hqq-onnx' 'ONNX WER + exact-text gate vs manifest'
+	@printf '  %-52s %s\n' 'make push-onnx HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit MODEL_CARD=hqq_report.md' 'upload ONNX + card into the HQQ repo'
 	@printf '  %-52s %s\n' 'make eval-baseline EVAL_DATASET=diabolocom/talkbank_4_stt EVAL_CONFIG=es EVAL_SPLIT=segment' 'talkbank telephone Spanish'
 	@printf '  %-52s %s\n' 'make test' 'fast unit tests'
 	@echo ""
@@ -199,6 +202,15 @@ eval-onnx: $(VENV_ONNX)/.stamp ## Measure ONNX WER + exact-text gate vs the mani
 	@QUANT=onnx MODEL_ASR=$(ONNX_OUT) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
 	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=$(EVAL_OUT) \
 	 HQQ_REFERENCE_MANIFEST=$(HQQ_REFERENCE_MANIFEST) $(PYONNX) eval_wer.py
+
+# Upload the ONNX files (+ optional MODEL_CARD as README.md) into the HQQ repo
+# alongside qmodel.pt. Only .onnx/.onnx_data are uploaded; the repo's config /
+# processor / qmodel.pt stay. Needs HF_TOKEN_WRITE from ~/.api_keys.
+# Per-flavor: ONNX_OUT=build/whisper-<flavor>-hqq-onnx HQQ_REPO=dkhokhlov/whisper-<flavor>-hqq-4bit
+# MODEL_CARD=hqq_report[_base|_small].md
+push-onnx: $(VENV_ONNX)/.stamp ## Upload ONNX_OUT/*.onnx (+ MODEL_CARD) into HQQ_REPO (needs HF_TOKEN_WRITE)
+	@set -a; . ~/.api_keys 2>/dev/null; set +a; \
+	 ONNX_OUT=$(ONNX_OUT) HQQ_REPO=$(HQQ_REPO) MODEL_CARD=$(MODEL_CARD) $(PYONNX) push_onnx.py
 
 test: $(VENV)/.stamp ## Run the fast unit tests (no model load, no network)
 	@$(PY) -m pytest

@@ -3,8 +3,8 @@
 This document is the spec for exporting the HQQ-quantized Whisper models to ONNX so they
 run on CPU in ONNX Runtime and reproduce the HQQ transcription results.
 
-Status: **whisper-tiny passes both gates on the `onnx` branch** (not merged; no ONNX files
-published yet). base and small are next.
+Status: **all three flavors (tiny, base, small) pass both gates on the `onnx` branch**
+(not merged; ONNX files published to the HQQ repos after user approval).
 
 ## Goal
 
@@ -27,12 +27,24 @@ Two gates, kept separate:
 Compact runtime RAM (Path B's reason to exist over a plain dense export) is a later
 optimization, not part of these gates.
 
-## Results (whisper-tiny)
+## Results (all flavors)
 
-Both gates pass on the `onnx` branch (commit `dbc95c9`). Settings: `google/fleurs` `en_us`
-`test`, n=100, CPU ONNX Runtime, auto-detect language, post-hoc gzip loop guard, greedy
+Both gates pass on the `onnx` branch. Settings: `google/fleurs` `en_us` `test`, n=100,
+CPU ONNX Runtime, auto-detect language, post-hoc gzip loop guard, greedy
 (`do_sample=False`). The ONNX run uses the same processor and generation config as the HQQ
 run, so the texts are comparable.
+
+| Flavor | HQQ repo | Gate 1 (Path B graph) | Gate 2 (exact text, 100 samples) | ONNX WER | HQQ WER |
+|---|---|---|---|---|---|
+| tiny  | `dkhokhlov/whisper-tiny-hqq-4bit`  | PASS | PASS, 0 mismatches | 0.1367 | 0.1367 |
+| base  | `dkhokhlov/whisper-base-hqq-4bit`  | PASS | PASS, 0 mismatches | 0.0995 | 0.0995 |
+| small | `dkhokhlov/whisper-small-hqq-4bit` | PASS | PASS, 0 mismatches | 0.0636 | 0.0636 |
+
+For every flavor the ONNX WER is identical to the HQQ WER (the exact-text gate proves this:
+zero mismatches implies WER equality). The HQQ math and the ONNX op chain are identical
+across flavors; only the layer/linear counts differ.
+
+### whisper-tiny (commit `dbc95c9`)
 
 1. **Path B graph proof (structural): PASS.** The raw `.onnx` protobuf, inspected before any
    ORT session, contains the packed `uint8` `W_q` initializers, the dequant chain
@@ -45,14 +57,29 @@ run, so the texts are comparable.
      manifest (`hqq_reference.json`, written by `make hqq-reference`). Zero mismatches.
    - WER **0.1367**, identical to the HQQ baseline (`eval_hqq.json`).
 
-Reproduce:
+### whisper-base
+
+1. **Path B graph proof (structural): PASS.** Packed `uint8` `W_q` + dequant chain + 4-bit
+   unpack ops present in every subgraph (encoder 763, decoder 1863, with_past 1563 nodes).
+2. **WER / text proof (functional): PASS.** Exact `output["text"]` match on all 100 samples
+   vs `hqq_reference_base.json`; 0 mismatches. WER **0.0995**, identical to HQQ.
+
+### whisper-small
+
+1. **Path B graph proof (structural): PASS.** Packed `uint8` `W_q` + dequant chain + 4-bit
+   unpack ops present in every subgraph (encoder 1501, decoder 3651, with_past 3062 nodes).
+2. **WER / text proof (functional): PASS.** Exact `output["text"]` match on all 100 samples
+   vs `hqq_reference_small.json`; 0 mismatches. WER **0.0636**, identical to HQQ.
+
+Reproduce (per flavor; tiny shown):
 
 ```bash
 make onnx-venv                       # .venv-onnx (pinned optimum/onnxruntime set)
-make onnx                            # export HQQ_OUT -> ONNX_OUT (3 subgraphs)
-make hqq-reference                   # 100-sample HQQ manifest (the gate oracle)
-make eval-onnx                       # ONNX WER + exact-text gate vs the manifest
-# eval_onnx.json -> exact_text_gate.exact_match == true, wer == 0.1367
+make onnx HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit ONNX_OUT=build/whisper-tiny-hqq-onnx
+make hqq-reference HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit EVAL_OUT=build/hqq_reference_tiny.json
+make eval-onnx ONNX_OUT=build/whisper-tiny-hqq-onnx \
+     HQQ_REFERENCE_MANIFEST=build/hqq_reference_tiny.json EVAL_OUT=build/eval_onnx_tiny.json
+# eval_onnx_tiny.json -> exact_text_gate.exact_match == true, wer == 0.1367
 ```
 
 ### Known validation false alarm (cached decoder step)

@@ -212,8 +212,16 @@ def main() -> int:
         device=ASR_DEVICE,
         atol=1e-3,
     )
-    n_meta = _copy_meta_files(HQQ_OUT, ONNX_OUT)
-    print(f"copied {n_meta} config/processor files from {HQQ_OUT} -> {ONNX_OUT}", file=sys.stderr)
+    # _copy_meta_files needs a local dir, but HQQ_OUT may be an HF repo id (the
+    # Makefile sources the weights from HQQ_REPO). Resolve it to its local
+    # HF-cache snapshot path (already downloaded by load_whisper_hqq) so the
+    # processor/tokenizer files are copied from the same snapshot the model
+    # was loaded from.
+    from huggingface_hub import snapshot_download
+
+    hqq_src = HQQ_OUT if os.path.isdir(HQQ_OUT) else snapshot_download(repo_id=HQQ_OUT)
+    n_meta = _copy_meta_files(hqq_src, ONNX_OUT)
+    print(f"copied {n_meta} config/processor files from {hqq_src} -> {ONNX_OUT}", file=sys.stderr)
 
     gate1 = _gate1_structural_check(ONNX_OUT)
     summary = {
