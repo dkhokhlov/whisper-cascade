@@ -1,4 +1,4 @@
-"""Unit tests for the ONNX Path B export (HQQLinearONNX).
+"""Unit tests for the ONNX export (HQQLinearONNX).
 
 Two layers of tests:
   * dequant / single-linear equivalence vs hqq -- pure torch + hqq, run under the CPU .venv
@@ -87,7 +87,7 @@ def _ort_probe(nbits):
     import onnx
 
     model = onnx.load(io.BytesIO(buf.getvalue()))
-    # Path B structural check: the graph keeps a uint8 W_q initializer and the dequant ops.
+    # Structural check: the graph keeps a uint8 W_q initializer and the dequant ops.
     dtypes = {init.data_type for init in model.graph.initializer}
     op_types = {node.op_type for node in model.graph.node}
     # onnx TensorProto.UINT8 == 2

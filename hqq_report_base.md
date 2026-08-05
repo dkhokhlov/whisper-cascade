@@ -87,8 +87,8 @@ make asr MODEL_ASR=dkhokhlov/whisper-base-hqq-4bit QUANT=hqq AUDIO=clip.wav
 
 This repo also ships an **ONNX** export of the same HQQ model. HQQ itself ships
 no ONNX exporter, so this is a unique addition: the quantized model runs on
-CPU ONNX Runtime with no HQQ runtime dependency. The export uses Path B — it
-keeps the packed uint8 `W_q` and the per-group `scale`/`zero` as ONNX
+CPU ONNX Runtime with no HQQ runtime dependency. The export keeps the packed
+uint8 `W_q` and the per-group `scale`/`zero` as ONNX
 initializers and emits the unpack + dequant as standard ONNX ops (opset 18),
 so the graph carries the exact HQQ weights (and the measured WER), not a
 re-dequantized dense copy. Whisper is an encoder-decoder model, so the export
@@ -127,7 +127,7 @@ make eval-onnx ONNX_OUT=build/whisper-base-hqq-onnx \
      HQQ_REFERENCE_MANIFEST=build/hqq_reference_base.json EVAL_OUT=build/eval_onnx_base.json
 ```
 
-The Path B spec and the two validation gates are in `docs/onnx.md` in the repo.
+The export spec and the two validation gates are in `docs/onnx.md` in the repo.
 
 ## Reproduce
 

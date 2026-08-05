@@ -1,4 +1,4 @@
-# ONNX export of the HQQ Whisper models (Path B)
+# ONNX export of the HQQ Whisper models
 
 This document is the spec for exporting the HQQ-quantized Whisper models to ONNX so they
 run on CPU in ONNX Runtime and reproduce the HQQ transcription results.
@@ -14,17 +14,17 @@ language, with the post-hoc gzip loop guard in `eval_wer.py`.
 
 Two gates, kept separate:
 
-1. **Path B graph proof (structural)** — the raw `.onnx` protobuf, inspected before any ORT
+1. **Packed-weight graph proof (structural)** — the raw `.onnx` protobuf, inspected before any ORT
    session, contains packed `uint8` `W_q` initializers and the dequant ops (`BitShift`/
    `BitwiseAnd` or `Div`/`Mod`, `Cast`/`Sub`/`Mul`/`Reshape`/`Transpose`/`MatMul`). If they are
    absent, the exporter folded the dequant to dense at export time and the file is a dense
-   export — WER may still pass, but it is not Path B.
+   export — WER may still pass, but the weights are no longer packed.
 2. **WER / text proof (functional)** — exact `output["text"]` match on all 100 samples vs a
    full 100-sample reference manifest (`eval_hqq.json` stores only 5, so it cannot gate this);
    WER == 0.1367 secondary. Logit/submodel tolerance `atol=1e-5, rtol=1e-5`; the text gate is
    exact.
 
-Compact runtime RAM (Path B's reason to exist over a plain dense export) is a later
+Compact runtime RAM (the packed-weight export's reason to exist over a plain dense export) is a later
 optimization, not part of these gates.
 
 ## Results (all flavors)
@@ -34,7 +34,7 @@ CPU ONNX Runtime, auto-detect language, post-hoc gzip loop guard, greedy
 (`do_sample=False`). The ONNX run uses the same processor and generation config as the HQQ
 run, so the texts are comparable.
 
-| Flavor | HQQ repo | Gate 1 (Path B graph) | Gate 2 (exact text, 100 samples) | ONNX WER | HQQ WER |
+| Flavor | HQQ repo | Gate 1 (packed-weight graph) | Gate 2 (exact text, 100 samples) | ONNX WER | HQQ WER |
 |---|---|---|---|---|---|
 | tiny  | `dkhokhlov/whisper-tiny-hqq-4bit`  | PASS | PASS, 0 mismatches | 0.1367 | 0.1367 |
 | base  | `dkhokhlov/whisper-base-hqq-4bit`  | PASS | PASS, 0 mismatches | 0.0995 | 0.0995 |
@@ -46,7 +46,7 @@ across flavors; only the layer/linear counts differ.
 
 ### whisper-tiny (commit `dbc95c9`)
 
-1. **Path B graph proof (structural): PASS.** The raw `.onnx` protobuf, inspected before any
+1. **Packed-weight graph proof (structural): PASS.** The raw `.onnx` protobuf, inspected before any
    ORT session, contains the packed `uint8` `W_q` initializers, the dequant chain
    (`Cast`/`Sub`/`Mul`/`Reshape`/`Transpose`/`MatMul`), and the 4-bit unpack ops
    (`BitwiseAnd`/`BitShift`) in every exported subgraph. The export did not fold the dequant to
@@ -65,14 +65,14 @@ across flavors; only the layer/linear counts differ.
 
 ### whisper-base
 
-1. **Path B graph proof (structural): PASS.** Packed `uint8` `W_q` + dequant chain + 4-bit
+1. **Packed-weight graph proof (structural): PASS.** Packed `uint8` `W_q` + dequant chain + 4-bit
    unpack ops present in every subgraph (encoder 763, decoder 1863, with_past 1563 nodes).
 2. **WER / text proof (functional): PASS.** Exact `output["text"]` match on all 100 samples
    vs `hqq_reference_base.json`; 0 mismatches. WER **0.0995**, identical to HQQ.
 
 ### whisper-small
 
-1. **Path B graph proof (structural): PASS.** Packed `uint8` `W_q` + dequant chain + 4-bit
+1. **Packed-weight graph proof (structural): PASS.** Packed `uint8` `W_q` + dequant chain + 4-bit
    unpack ops present in every subgraph (encoder 1501, decoder 3651, with_past 3062 nodes).
 2. **WER / text proof (functional): PASS.** Exact `output["text"]` match on all 100 samples
    vs `hqq_reference_small.json`; 0 mismatches. WER **0.0636**, identical to HQQ.
@@ -100,13 +100,14 @@ exact-text match) confirms it. The export validation `atol` is set to `1e-3` bec
 ORT-vs-torch fp32 reassociation over the 4-layer decoder is about `2e-4`, above the default
 `1e-4`; the real gate is the exact-text match, not this sanity check.
 
-## Why Path B
+## Why keep the packed weights
 
-HQQ ships no ONNX exporter. Path A (dequantize to dense, then export) loses the quantization.
-Path C (re-quantize in ORT) is a different, unmeasured quantization. Path B keeps the packed
-`uint8` `W_q` + per-group scale/zero as ONNX tensors and emits the unpack + dequant as ONNX
-ops, so the exact HQQ weights and the measured WER carry over. Codex reviewed the bit math
-and confirmed Path B is viable for WER correctness.
+HQQ ships no ONNX exporter. A dense export (dequantize all weights to fp32, then export)
+loses the quantization and the compact footprint. Re-quantizing inside ONNX Runtime is a
+different, unmeasured quantization. This export instead keeps the packed `uint8` `W_q` +
+per-group scale/zero as ONNX tensors and emits the unpack + dequant as ONNX ops, so the
+exact HQQ weights and the measured WER carry over. Codex reviewed the bit math and
+confirmed the approach is viable for WER correctness.
 
 ## Verified HQQ dequant math (hqq 0.2.8.post1)
 
@@ -227,7 +228,7 @@ W_q  (uint8 initializer, shape [O*I/32, 32], values 0..255)
 
 ```
 +-------------------------------------------------------+
-| GATE 1 -- Path B graph proof (structural)             |
+| GATE 1 -- packed-weight graph proof (structural)      |
 +-------------------------------------------------------+
 | inspect raw .onnx protobuf BEFORE any ORT run         |
 | require: uint8 W_q initializer (packed)               |

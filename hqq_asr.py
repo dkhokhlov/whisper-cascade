@@ -252,7 +252,7 @@ def build_pipeline(model_id, quant, device="cpu"):
     (fp32) on the chosen device.
     """
     if quant == "onnx":
-        # Path B: load the exported ONNX subgraphs (encoder/decoder/decoder_with_past
+        # Load the exported ONNX subgraphs (encoder/decoder/decoder_with_past
         # in model_id == ONNX_OUT) via ORTModelForSpeechSeq2Seq on CPU ONNX Runtime,
         # wrapped in the standard ASR pipeline. ORTModelForSpeechSeq2Seq runs the
         # generation loop outside ONNX. The processor (config/processor/tokenizer

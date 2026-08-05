@@ -86,7 +86,7 @@ help: ## Show available targets
 	@printf '  %-52s %s\n' 'make push' 'quantize + upload to HQQ_REPO (needs HF_TOKEN_WRITE)'
 	@printf '  %-52s %s\n' 'make eval-baseline EVAL_CONFIG=en_us' 'WER of fp32 MODEL_ASR on a fleurs config'
 	@printf '  %-52s %s\n' 'make eval-hqq EVAL_CONFIG=es_419' 'WER of HQQ MODEL_ASR on a fleurs config'
-	@printf '  %-52s %s\n' 'make onnx HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit' 'export HQQ -> ONNX (Path B) to build/'
+	@printf '  %-52s %s\n' 'make onnx HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit' 'export HQQ -> ONNX to build/'
 	@printf '  %-52s %s\n' 'make eval-onnx ONNX_OUT=build/whisper-tiny-hqq-onnx' 'ONNX WER + exact-text gate vs manifest'
 	@printf '  %-52s %s\n' 'make push-onnx HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit MODEL_CARD=hqq_report.md' 'upload ONNX + card into the HQQ repo'
 	@printf '  %-52s %s\n' 'make eval-baseline EVAL_DATASET=diabolocom/talkbank_4_stt EVAL_CONFIG=es EVAL_SPLIT=segment' 'talkbank telephone Spanish'
@@ -147,7 +147,7 @@ $(VENV_ONNX)/.stamp: Makefile
 	    optimum==2.0.0 "optimum-onnx[onnxruntime]==0.0.3" "pytest>=9.1.1"
 	@touch $(VENV_ONNX)/.stamp
 
-onnx-venv: $(VENV_ONNX)/.stamp ## Create the CPU .venv-onnx for ONNX export/eval (Path B)
+onnx-venv: $(VENV_ONNX)/.stamp ## Create the CPU .venv-onnx for ONNX export/eval
 
 samples: ## Warm the HF sample cache for the default set - idempotent, no re-download
 	@$(PY) -c "from huggingface_hub import hf_hub_download; [hf_hub_download('Narsil/asr_dummy', f, repo_type='dataset') for f in ('mlk.flac','4.flac','hindi.ogg')]" && echo "samples cache warm"
@@ -178,7 +178,7 @@ eval-hqq: $(VENV)/.stamp ## Measure HQQ WER (QUANT=hqq MODEL_ASR=HQQ_REPO) on EV
 	@QUANT=hqq MODEL_ASR=$(HQQ_REPO) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
 	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_hqq.json $(PY) eval_wer.py
 
-# ONNX (Path B) targets. Runs in .venv-onnx (optimum/onnxruntime). Export reads the
+# ONNX targets. Runs in .venv-onnx (optimum/onnxruntime). Export reads the
 # HQQ weights from HQQ_REPO (HF repo id -> default HF cache) and writes the 3 .onnx
 # + config/processor into ONNX_OUT (build/). eval-onnx points MODEL_ASR at ONNX_OUT.
 # Per-flavor: override HQQ_REPO + ONNX_OUT + EVAL_OUT + HQQ_REFERENCE_MANIFEST.

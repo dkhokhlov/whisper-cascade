@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Export a saved HQQ Whisper model to ONNX (Path B) for CPU ONNX Runtime inference.
+"""Export a saved HQQ Whisper model to ONNX for CPU ONNX Runtime inference.
 
-Path B keeps the packed uint8 W_q plus per-group scale/zero as ONNX initializers and emits
+It keeps the packed uint8 W_q plus per-group scale/zero as ONNX initializers and emits
 the unpack + dequant as ONNX ops, so the exported graph carries the exact HQQ weights (and
 the measured WER), not a re-dequantized dense copy. This is a work in progress on the `onnx`
 branch; see docs/onnx.md for the spec and the two validation gates.
@@ -151,12 +151,12 @@ def _copy_meta_files(hqq_out, onnx_out):
 
 
 def _gate1_structural_check(onnx_out):
-    """Gate 1 (Path B graph proof): inspect the raw .onnx protobuf before any ORT session.
+    """Gate 1 (packed-weight graph proof): inspect the raw .onnx protobuf before any ORT session.
 
     Every exported subgraph must keep a packed uint8 W_q initializer and the dequant chain
     (Cast/Sub/Mul/Reshape/Transpose/MatMul); at least one subgraph (a decoder, which holds
     4-bit linears) must keep the 4-bit unpack ops (BitwiseAnd/BitShift or Div/Mod). If the
-    dequant was folded to dense at export time, these are absent -> not Path B.
+    dequant was folded to dense at export time, these are absent -> the weights are no longer packed.
     """
     import onnx
 
