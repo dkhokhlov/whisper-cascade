@@ -6,6 +6,11 @@ __pycache__/
 # uv / virtualenv
 .venv/
 .venv-gpu/
+.venv-onnx/
+
+# Repo-local build dir: HQQ quantize output, ONNX export output, eval/gate
+# manifests, test output/logs. Transient; make clean wipes it.
+build/
 
 # Local caches (HF model/sample cache lives in ~/.cache/huggingface by default)
 .cache/
@@ -21,16 +26,17 @@ hf_cache/
 # Pipeline tee artifact (README Pipeline example writes ./out.txt)
 out.txt
 
-# Local HQQ quantized model output (published to Hugging Face, not in git)
+# Local HQQ quantized model output (published to Hugging Face, not in git).
+# Safety net: make quantize defaults HQQ_OUT to build/ now, but a stray override
+# writing to the repo root should still not get committed.
 whisper-tiny-hqq-4bit/
 whisper-base-hqq-4bit/
 whisper-small-hqq-4bit/
 # Local ONNX export output (regenerable via make onnx; published to HF only
-# after the user approves, never committed to git)
+# after the user approves, never committed to git). Same safety net.
 whisper-tiny-hqq-onnx/
 whisper-base-hqq-onnx/
 whisper-small-hqq-onnx/
-.venv-onnx/
 # Transient WER-sweep model dirs
 sweep_*/
 # Hugging Face cache dirs downloaded into the repo root

@@ -37,16 +37,21 @@ export QUANT
 # Exported so make asr / quantize / push / eval-* all forward it to the scripts.
 ASR_DEVICE ?= cpu
 export ASR_DEVICE
+# Repo-local, gitignored build dir for transient artifacts: HQQ quantize output,
+# ONNX export output, eval/gate manifests, test output/logs. Models and datasets
+# otherwise live in the default HF cache. make clean wipes this.
+BUILD ?= build
 # HQQ quantization output dir, HF repo, and quant config (make quantize / push).
 # Defaults are the best measured config on fleurs en_us (WER 0.1367 vs 0.1381
 # fp32 baseline): 4-bit, group_size=32, axis=1, the whole encoder stack and
 # fc1 assigned to the 8-bit tier.
-HQQ_OUT ?= whisper-tiny-hqq-4bit
+HQQ_OUT ?= $(BUILD)/whisper-tiny-hqq-4bit
 HQQ_REPO ?= dkhokhlov/whisper-tiny-hqq-4bit
 # ONNX export output dir. Separate from HQQ_OUT: the optimum exporter may overwrite
 # config.json/processor/index files, so it must not write into the canonical HQQ source dir.
-# eval-onnx points MODEL_ASR here (not HQQ_OUT).
-ONNX_OUT ?= whisper-tiny-hqq-onnx
+# eval-onnx points MODEL_ASR here (not HQQ_OUT). The export sources HQQ weights from
+# HQQ_REPO (HF repo id -> default HF cache), so the local HQQ_OUT dir is not needed.
+ONNX_OUT ?= $(BUILD)/whisper-tiny-hqq-onnx
 HQQ_GROUP ?= 32
 HQQ_AXIS ?= 1
 HQQ_8BIT_PATTERNS ?= encoder.layers,fc1
@@ -77,7 +82,7 @@ help: ## Show available targets
 	@printf '  %-52s %s\n' 'make en TEXT="Hola"' 'translate text to English'
 	@printf '  %-52s %s\n' 'make tts TEXT="Hello"' 'synthesize speech to tts.wav'
 	@printf '  %-52s %s\n' 'make asr QUANT=hqq MODEL_ASR=dkhokhlov/whisper-tiny-hqq-4bit' 'HQQ 4-bit ASR from HF'
-	@printf '  %-52s %s\n' 'make quantize' 'quantize whisper-tiny -> HQQ_OUT (local)'
+	@printf '  %-52s %s\n' 'make quantize' 'quantize whisper-tiny -> HQQ_OUT (build/)'
 	@printf '  %-52s %s\n' 'make push' 'quantize + upload to HQQ_REPO (needs HF_TOKEN_WRITE)'
 	@printf '  %-52s %s\n' 'make eval-baseline EVAL_CONFIG=en_us' 'WER of fp32 MODEL_ASR on a fleurs config'
 	@printf '  %-52s %s\n' 'make eval-hqq EVAL_CONFIG=es_419' 'WER of HQQ MODEL_ASR on a fleurs config'
@@ -170,21 +175,30 @@ eval-hqq: $(VENV)/.stamp ## Measure HQQ WER (QUANT=hqq MODEL_ASR=HQQ_REPO) on EV
 	@QUANT=hqq MODEL_ASR=$(HQQ_REPO) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
 	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_hqq.json $(PY) eval_wer.py
 
-# ONNX (Path B) targets. Runs in .venv-onnx (optimum/onnxruntime). Export reads HQQ_OUT
-# (read-only) and writes the 3 .onnx + config/processor into ONNX_OUT. eval-onnx points
-# MODEL_ASR at ONNX_OUT, not HQQ_OUT.
-onnx: $(VENV_ONNX)/.stamp ## Export HQQ_OUT to ONNX (3 graphs) -> ONNX_OUT (.venv-onnx)
-	@HQQ_OUT=$(HQQ_OUT) ONNX_OUT=$(ONNX_OUT) $(PYONNX) export_onnx.py
+# ONNX (Path B) targets. Runs in .venv-onnx (optimum/onnxruntime). Export reads the
+# HQQ weights from HQQ_REPO (HF repo id -> default HF cache) and writes the 3 .onnx
+# + config/processor into ONNX_OUT (build/). eval-onnx points MODEL_ASR at ONNX_OUT.
+# Per-flavor: override HQQ_REPO + ONNX_OUT + EVAL_OUT + HQQ_REFERENCE_MANIFEST.
+onnx: $(VENV_ONNX)/.stamp ## Export HQQ_REPO (HF) to ONNX (3 graphs) -> ONNX_OUT (.venv-onnx)
+	@mkdir -p $(dir $(ONNX_OUT))
+	@HQQ_OUT=$(HQQ_REPO) ONNX_OUT=$(ONNX_OUT) $(PYONNX) export_onnx.py
 
+# Per-target EVAL_OUT defaults; override on the command line for per-flavor runs
+# (make hqq-reference EVAL_OUT=build/hqq_reference_base.json, etc.).
+hqq-reference: EVAL_OUT = $(BUILD)/hqq_reference.json
 hqq-reference: $(VENV_ONNX)/.stamp ## Write the full 100-sample HQQ reference manifest (the exact-text gate oracle)
-	@QUANT=hqq MODEL_ASR=$(HQQ_OUT) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
-	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=hqq_reference.json \
+	@mkdir -p $(dir $(EVAL_OUT))
+	@QUANT=hqq MODEL_ASR=$(HQQ_REPO) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
+	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=$(EVAL_OUT) \
 	 HQQ_REFERENCE=1 $(PYONNX) eval_wer.py
 
-eval-onnx: $(VENV_ONNX)/.stamp ## Measure ONNX WER + exact-text gate vs hqq_reference.json (QUANT=onnx MODEL_ASR=ONNX_OUT)
+eval-onnx: EVAL_OUT = $(BUILD)/eval_onnx.json
+eval-onnx: HQQ_REFERENCE_MANIFEST = $(BUILD)/hqq_reference.json
+eval-onnx: $(VENV_ONNX)/.stamp ## Measure ONNX WER + exact-text gate vs the manifest (QUANT=onnx MODEL_ASR=ONNX_OUT)
+	@mkdir -p $(dir $(EVAL_OUT))
 	@QUANT=onnx MODEL_ASR=$(ONNX_OUT) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
-	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_onnx.json \
-	 HQQ_REFERENCE_MANIFEST=hqq_reference.json $(PYONNX) eval_wer.py
+	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=$(EVAL_OUT) \
+	 HQQ_REFERENCE_MANIFEST=$(HQQ_REFERENCE_MANIFEST) $(PYONNX) eval_wer.py
 
 test: $(VENV)/.stamp ## Run the fast unit tests (no model load, no network)
 	@$(PY) -m pytest
@@ -192,9 +206,10 @@ test: $(VENV)/.stamp ## Run the fast unit tests (no model load, no network)
 test-integration: $(VENV)/.stamp ## Run the integration tests (loads the real Whisper/MarianMT/VITS models)
 	@$(PY) -m pytest -m integration
 
-clean: ## Remove Python bytecode cache (__pycache__, *.pyc); keeps .venv
-	@-find . -path ./.venv -prune -o \( -name '__pycache__' -o -name '*.pyc' \) -exec rm -rf {} +
-	@echo "cleaned pyc noise"
+clean: ## Remove Python bytecode cache (__pycache__, *.pyc) and the build/ artifact dir; keeps .venv
+	@-find . -path ./.venv -prune -o -path ./.venv-onnx -prune -o -path ./.venv-gpu -prune -o \( -name '__pycache__' -o -name '*.pyc' \) -exec rm -rf {} +
+	@rm -rf $(BUILD)
+	@echo "cleaned pyc noise and build/"
 
 clean-all: clean ## Also remove the local .venv (HF cache is left untouched)
 	rm -rf $(VENV)

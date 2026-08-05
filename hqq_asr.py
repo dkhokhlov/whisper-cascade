@@ -215,7 +215,7 @@ def load_whisper_hqq(model_id_or_dir, device="cpu"):
     preserved unchanged.
     """
     model = WhisperHQQModel.from_quantized(
-        model_id_or_dir, compute_dtype=COMPUTE_DTYPE, device=device,
+        model_id_or_dir, compute_dtype=COMPUTE_DTYPE, device=device, cache_dir=None,
     )
     # Re-tie proj_out to the decoder embedding. hqq's from_quantized._load_module
     # upcasts each stored tensor to fp32 with .to(), which copies storage and
