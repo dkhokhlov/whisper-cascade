@@ -1,6 +1,6 @@
 [project]
 name = "whisper-cascade"
-version = "1.9.3"
+version = "1.9.4"
 description = "Whisper ASR + MarianMT translate + VITS TTS pipeline (CPU)."
 requires-python = ">=3.10,<3.11"
 dependencies = [
