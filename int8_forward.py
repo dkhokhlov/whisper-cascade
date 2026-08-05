@@ -16,6 +16,10 @@ from __future__ import annotations
 import os
 
 os.environ.setdefault("HQQ_COMPUTE_DTYPE", "fp32")  # fp reference == the fp32 benchmark
+# Eager attention (like the fp16 ONNX export): the attention scale stays a Mul (1/sqrt(d)
+# = >>3 here), not an SDPA Sqrt/Div. Int8Attention implements the eager path; SDPA would
+# fuse scale+softmax+mask and bypass it. Must be set before hqq_asr import.
+os.environ.setdefault("HQQ_ATTN_IMPL", "eager")
 
 import torch
 import torch.nn as nn
@@ -69,6 +73,196 @@ class Int8Linear(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# Int8LayerNorm / Int8GELU / Int8Conv1d: drop-in int8-compute wrappers (A2/A3/A5)
+# --------------------------------------------------------------------------- #
+
+
+class Int8LayerNorm(nn.Module):
+    """int8-compute LayerNorm (A2). Drop-in for nn.LayerNorm: quantizes the input per-token
+    to int8, runs the fixed-point mean/var + int rsqrt + fixed-point gamma/beta, returns fp."""
+
+    def __init__(self, ln: nn.LayerNorm):
+        super().__init__()
+        self.normalized_shape = ln.normalized_shape
+        self.eps = ln.eps
+        self.register_buffer("weight", ln.weight.to(torch.float32))
+        self.register_buffer("bias", ln.bias.to(torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        lead = x.shape[:-1]
+        D = x.shape[-1]
+        x2 = x.reshape(-1, D).to(torch.float32)
+        x_int, x_scale, x_zp = i8.quantize_act_per_token(x2)
+        y = i8.int8_layernorm(x_int, x_scale, x_zp, self.weight, self.bias, self.eps, stage=4)
+        return y.reshape(*lead, D)
+
+
+class Int8GELU(nn.Module):
+    """int8-compute GELU (A3). Drop-in for transformers GELUActivation: quantizes the input
+    per-token to int8, runs x*Phi(x) via the int normal-CDF LUT, returns fp."""
+
+    def __init__(self, act):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        lead = x.shape[:-1]
+        D = x.shape[-1]
+        x2 = x.reshape(-1, D).to(torch.float32)
+        x_int, x_scale, x_zp = i8.quantize_act_per_token(x2)
+        y = i8.int8_gelu(x_int, x_scale, x_zp, stage=2)
+        return y.reshape(*lead, D)
+
+
+class Int8Conv1d(nn.Module):
+    """int8-compute Conv1d (A5). Drop-in for nn.Conv1d (kernel 3, pad 1): per-BATCH act
+    quant (per-token is not factorable across the window), per-channel int8 weight, int32
+    window matmul, returns fp."""
+
+    def __init__(self, conv: nn.Conv1d):
+        super().__init__()
+        self.in_channels = conv.in_channels
+        self.out_channels = conv.out_channels
+        self.kernel_size = conv.kernel_size
+        self.stride = conv.stride
+        self.padding = conv.padding
+        w_int, w_scale = i8._quant_weight_per_channel(conv.weight.to(torch.float32))
+        self.register_buffer("w_int", w_int.to(torch.int32))
+        self.register_buffer("w_scale", w_scale.to(torch.float32))
+        self.register_buffer("bias", conv.bias.to(torch.float32) if conv.bias is not None else None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_int, x_scale, x_zp = i8.quantize_act_per_batch(x.to(torch.float32))   # per-batch [B,1,1]
+        return i8.int8_conv1d(x_int, x_scale, x_zp, self.w_int, self.w_scale, self.bias,
+                              stage=2, stride=self.stride[0], kernel=self.kernel_size[0],
+                              padding=self.padding[0])
+
+
+# --------------------------------------------------------------------------- #
+# Int8Attention: int8 softmax (A4) + int8 attention scale (A5) in the eager path
+# --------------------------------------------------------------------------- #
+
+
+class Int8Attention(nn.Module):
+    """int8-compute attention (A4 softmax + A5 attention scale), eager path.
+
+    Wraps a WhisperAttention: reuses its q/k/v/out projections (HQQLinear or Int8Linear if
+    the matmul block was swapped) and KV-cache logic, but replaces the fp softmax with the
+    int8 softmax (quantize scores -> int32 -> exp LUT + int reciprocal) and the fp attention
+    scale with the integer 1/sqrt(d_head) (exact >>3 for d_head=64). When neither is enabled
+    this is equivalent to the fp eager attention.
+
+    The forward mirrors transformers 4.44.2 WhisperAttention.forward (pinned) with only the
+    scale-fold and the softmax replaced, so model.generate()'s KV-cache path is preserved.
+    """
+
+    def __init__(self, attn, use_int_softmax: bool, use_int_scale: bool):
+        super().__init__()
+        self.embed_dim = attn.embed_dim
+        self.num_heads = attn.num_heads
+        self.head_dim = attn.head_dim
+        self.scaling = attn.scaling
+        self.dropout = attn.dropout
+        self.layer_idx = getattr(attn, "layer_idx", None)
+        self.q_proj = attn.q_proj
+        self.k_proj = attn.k_proj
+        self.v_proj = attn.v_proj
+        self.out_proj = attn.out_proj
+        self.use_int_softmax = use_int_softmax
+        self.use_int_scale = use_int_scale
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.contiguous().view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def forward(self, hidden_states, key_value_states=None, past_key_value=None,
+                attention_mask=None, layer_head_mask=None, output_attentions=False,
+                cache_position=None):
+        import torch.nn.functional as F
+        is_cross_attention = key_value_states is not None
+        bsz, tgt_len, _ = hidden_states.size()
+
+        # Fold the attention scale into q in fp UNLESS the int8 scale path is on (then the
+        # exact integer 1/sqrt(d_head) is applied to the int scores below).
+        q_in = self.q_proj(hidden_states)
+        q_scaled = q_in if self.use_int_scale else q_in * self.scaling
+        query_states = self._shape(q_scaled, tgt_len, bsz)
+
+        if past_key_value is not None:
+            is_updated = past_key_value.is_updated.get(self.layer_idx)
+            if is_cross_attention:
+                past_key_value.is_updated[self.layer_idx] = True
+                past_key_value = past_key_value.cross_attention_cache
+            else:
+                past_key_value = past_key_value.self_attention_cache
+
+        current_states = key_value_states if key_value_states is not None else hidden_states
+        if is_cross_attention and past_key_value and is_updated:
+            key_states = past_key_value.key_cache[self.layer_idx]
+            value_states = past_key_value.value_cache[self.layer_idx]
+        else:
+            key_states = self._shape(self.k_proj(current_states), -1, bsz)
+            value_states = self._shape(self.v_proj(current_states), -1, bsz)
+            if past_key_value is not None:
+                cache_position = cache_position if not is_cross_attention else None
+                key_states, value_states = past_key_value.update(
+                    key_states, value_states, self.layer_idx, {"cache_position": cache_position}
+                )
+
+        raw_scores = torch.matmul(query_states, key_states.transpose(2, 3))   # [B,h,Tq,Tk] fp
+        valid = None
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]     # 0 valid, finfo.min masked
+            valid = (causal_mask == 0).expand_as(raw_scores)                   # [B,h,Tq,Tk]
+
+        if self.use_int_softmax:
+            # Quantize the scores to int32 per row over the VALID entries only: the causal/
+            # padding mask adds ~finfo.min to masked positions, and including that in the
+            # per-row min/max explodes the scale and collapses the valid scores to a tiny int
+            # range (the int8 softmax then leaks into masked positions -> decoder garbage).
+            # Fix: scale from valid entries, set masked entries to a large negative int (so
+            # subtract-max + exp LUT push them toward 0), then zero + renormalize after softmax.
+            lead = raw_scores.shape[:-1]
+            K = raw_scores.shape[-1]
+            s2 = raw_scores.reshape(-1, K).to(torch.float32)
+            if valid is not None:
+                v2 = valid.reshape(-1, K)
+                BIG = torch.finfo(torch.float32).max / 4.0
+                minv = s2.masked_fill(~v2, BIG).amin(-1, keepdim=True)
+                maxv = s2.masked_fill(~v2, -BIG).amax(-1, keepdim=True)
+            else:
+                minv, maxv = s2.amin(-1, keepdim=True), s2.amax(-1, keepdim=True)
+            s_scale = ((maxv - minv) / 255.0).clamp(min=1e-8)
+            zp = torch.round(-minv / s_scale - 128.0)
+            s_int = torch.round(s2 / s_scale + zp).clamp(-128, 127).to(torch.int32)
+            if valid is not None:
+                s_int = s_int.masked_fill(~v2, -(2 ** 20))
+            if self.use_int_scale:
+                s_int, s_scale = i8.int_attn_scale(s_int, s_scale, self.head_dim)
+            probs = i8.int8_softmax(s_int, s_scale, stage=4).reshape(*lead, K)
+            if valid is not None:
+                probs = probs * valid.to(torch.float32).reshape(*lead, K)
+                probs = probs / probs.sum(-1, keepdim=True).clamp(min=1e-8)
+            attn_weights = probs
+        else:
+            attn_weights = raw_scores + (attention_mask[:, :, :, : key_states.shape[-2]]
+                                         if attention_mask is not None else 0.0)
+            if self.use_int_scale:
+                lead = attn_weights.shape[:-1]; K = attn_weights.shape[-1]
+                s2 = attn_weights.reshape(-1, K).to(torch.float32)
+                s_int, s_scale, _ = i8.quantize_act_per_token(s2)
+                s_int, s_scale = i8.int_attn_scale(s_int, s_scale, self.head_dim)
+                attn_weights = i8.dequant_act(s_int, s_scale, torch.zeros_like(s_scale)).reshape(*lead, K)
+            attn_weights = F.softmax(attn_weights, dim=-1)
+
+        if layer_head_mask is not None:
+            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights
+        attn_probs = F.dropout(attn_weights, p=self.dropout, training=self.training)
+        attn_output = torch.matmul(attn_probs, value_states)
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)
+        attn_output = self.out_proj(attn_output)
+        return attn_output, attn_weights, past_key_value
+
+
+# --------------------------------------------------------------------------- #
 # Staged swap: replace selected op families with int8-compute modules         #
 # --------------------------------------------------------------------------- #
 
@@ -84,21 +278,33 @@ def _set_child(parent: nn.Module, dotted: str, child: nn.Module) -> None:
 def swap_to_int8(model: nn.Module, blocks: set[str]) -> dict:
     """Swap selected op families in `model` to int8-compute modules. Returns a report dict.
 
-    blocks: subset of {"matmul","ln","gelu","sm","conv"}.
-      matmul: every HQQLinear -> Int8Linear (A1).
-      ln/gelu/conv/sm: TODO (A2-A5 wrappers); raise NotImplementedError if requested.
-    The swap is in-place; the original fp modules are returned in the report for restore.
+    blocks: subset of {"matmul","ln","gelu","sm","conv"} (the staged-WER block names):
+      matmul: every HQQLinear -> Int8Linear (A1, per-group int8 matmul).
+      ln:     every nn.LayerNorm -> Int8LayerNorm (A2, fixed-point + int rsqrt).
+      gelu:   every GELUActivation -> Int8GELU (A3, int sigmoid LUT).
+      sm:     every WhisperAttention -> int8 softmax (A4); combined with conv for int scale.
+      conv:   every nn.Conv1d -> Int8Conv1d (A5) AND every WhisperAttention uses the integer
+              attention scale 1/sqrt(d_head) (A5); the int scale only has effect with sm.
+    The swap is in-place. The int8 attention wraps the existing q/k/v/out_proj modules
+    (which are Int8Linear if matmul is in blocks, else the original HQQLinear).
     """
-    report = {"matmul": 0, "skipped": []}
-    if "matmul" in blocks:
-        for name, mod in list(model.named_modules()):
-            if isinstance(mod, HQQLinear):
-                wrapped = Int8Linear(mod)
-                _set_child(model, name, wrapped)
-                report["matmul"] += 1
-    for b in ("ln", "gelu", "sm", "conv"):
-        if b in blocks:
-            report["skipped"].append(f"{b}: not implemented yet (A2-A5 wrappers)")
+    import transformers.models.whisper.modeling_whisper as w
+
+    report = {"matmul": 0, "ln": 0, "gelu": 0, "conv1d": 0, "attn": 0}
+    use_int_sm = "sm" in blocks
+    use_int_scale = "conv" in blocks
+    for name, mod in list(model.named_modules()):
+        if "matmul" in blocks and isinstance(mod, HQQLinear):
+            _set_child(model, name, Int8Linear(mod)); report["matmul"] += 1
+        elif "ln" in blocks and isinstance(mod, nn.LayerNorm):
+            _set_child(model, name, Int8LayerNorm(mod)); report["ln"] += 1
+        elif "gelu" in blocks and type(mod).__name__ == "GELUActivation":
+            _set_child(model, name, Int8GELU(mod)); report["gelu"] += 1
+        elif "conv" in blocks and isinstance(mod, nn.Conv1d):
+            _set_child(model, name, Int8Conv1d(mod)); report["conv1d"] += 1
+        elif (use_int_sm or use_int_scale) and isinstance(mod, w.WhisperAttention):
+            _set_child(model, name, Int8Attention(mod, use_int_sm, use_int_scale))
+            report["attn"] += 1
     return report
 
 
@@ -195,9 +401,6 @@ def run_wer(model_dir: str, blocks: set[str], n: int, dataset: str, config: str,
 
     report = swap_to_int8(pipe.model, blocks)
     print(f"swapped: {report}", file=sys.stderr)
-    if report["skipped"]:
-        print("  aborting: requested block not implemented: " + ", ".join(report["skipped"]))
-        return
     print(f"int8 ({sorted(blocks)}) pass over the same {len(refs)} samples ...", file=sys.stderr)
     _, i8_hyps = _run_pass(pipe, samples, n, lang)
     n_cmp = min(len(i8_hyps), len(fp_hyps))

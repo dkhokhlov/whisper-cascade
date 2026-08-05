@@ -387,22 +387,26 @@ def int8_layernorm(
 
 
 # --------------------------------------------------------------------------- #
-# A3: int8 GELU (sigmoid-1.702 approx via integer sigmoid LUT)                  #
+# A3: int8 GELU (exact normal-CDF LUT: GELU(x) = x * Phi(x))                   #
 # --------------------------------------------------------------------------- #
 
-# Sigmoid LUT: covers s = 1.702*x in [-L, L]; beyond it sigmoid saturates to <1 LSB.
-_GELU_L = 12          # half-range in s-units (sigmoid(12) ~ 1 - 6e-7, > 16-bit LSB)
-_GELU_T = 4096        # LUT entries over [-L, L]  (grid spacing ~0.006 in s)
-_GELU_S = 16          # sigmoid value fixed-point bits (sig in [0, 2^S])
+# Phi LUT: Phi(x) = 0.5*(1 + erf(x/sqrt2)), the standard normal CDF. GELU is
+# x*Phi(x) exactly, so storing Phi (not sigmoid(1.702x)) removes the 1.702
+# approximation error (measured ~0.0047 MAE on the real fc1 output). Phi
+# saturates to 0/1 outside +/- Lx, so the tail is gelu ~= x_real; the
+# x_real * LUT multiply keeps the tail exact (no clamp error).
+_GELU_LX = 6         # input half-range; |Phi(6)-1| < 1e-9, saturates to <1 LSB
+_GELU_T = 4096        # LUT entries over [-Lx, Lx]  (grid spacing ~0.003 in x)
+_GELU_S = 16          # Phi fixed-point bits (Phi in [0, 1], 1.0 = 2^S)
 
 
-def _sigmoid_lut() -> torch.Tensor:
-    """Int32 LUT [_GELU_T]: round(sigmoid(s_grid) * 2^_GELU_S), s_grid in [-L, L]."""
+def _phi_lut() -> torch.Tensor:
+    """Int32 LUT [_GELU_T]: round(Phi(x_grid) * 2^_GELU_S), x_grid in [-Lx, Lx]."""
     import math
-    L, T, S = _GELU_L, _GELU_T, _GELU_S
-    s_grid = torch.linspace(-L, L, T, dtype=torch.float64)
-    sig = torch.sigmoid(s_grid)
-    return (sig * (2 ** S)).round().to(torch.int32)
+    Lx, T, S = _GELU_LX, _GELU_T, _GELU_S
+    x_grid = torch.linspace(-Lx, Lx, T, dtype=torch.float64)
+    phi = 0.5 * (1.0 + torch.erf(x_grid / math.sqrt(2.0)))            # normal CDF
+    return (phi * (2 ** S)).round().to(torch.int32)
 
 
 def fp_gelu_ref(x: torch.Tensor) -> torch.Tensor:
@@ -411,25 +415,23 @@ def fp_gelu_ref(x: torch.Tensor) -> torch.Tensor:
 
 
 def int8_gelu(x_int: torch.Tensor, x_scale: torch.Tensor, x_zp: torch.Tensor, stage: int) -> torch.Tensor:
-    """Staged int8 GELU via GELU(x) ~= x * sigmoid(1.702*x), sigmoid from an int LUT.
+    """Staged int8 GELU via GELU(x) = x * Phi(x), Phi from an int LUT.
 
     x_int [B,D] int8 (per-token, from the fc1 output requant), x_scale/x_zp [B,1].
     stage 1: exact erf GELU on the int-reconstructed input.      (input-quant error)
-    stage 2: sigmoid-1.702 LUT GELU (fp output).                 (approx + LUT quant)
+    stage 2: Phi-LUT GELU (fp output).                           (LUT quant only)
     stage 3: + per-token requant to int8, dequant for compare.   (output quant)
     """
-    L, T, S = _GELU_L, _GELU_T, _GELU_S
+    Lx, T, S = _GELU_LX, _GELU_T, _GELU_S
     u = (x_int.to(torch.float32) - x_zp.to(torch.float32))          # centered int
     x_real = u * x_scale                                             # [B,D] real input
     if stage == 1:
         return fp_gelu_ref(x_real)
-    # s = 1.702 * x_real ; index = round(s * T/(2L)) + T/2, clamped
-    s = 1.702 * x_real
-    idx = torch.clamp((s * (T / (2 * L))).round().to(torch.int64) + T // 2, 0, T - 1)
-    lut = _sigmoid_lut().to(x_real.device)
-    sig_int = lut[idx]                                               # [B,D] int32, sig in Q_S
-    sig = sig_int.to(torch.float32) / (2 ** S)
-    gelu = x_real * sig                                              # sigmoid-1.702 approx
+    # index = round(x_real * T/(2*Lx)) + T/2, clamped; tail saturates Phi to 0/1
+    idx = torch.clamp((x_real * (T / (2 * Lx))).round().to(torch.int64) + T // 2, 0, T - 1)
+    lut = _phi_lut().to(x_real.device)
+    phi = lut[idx].to(torch.float32) / (2 ** S)                     # [B,D] Phi(x)
+    gelu = x_real * phi                                            # exact GELU = x*Phi(x)
     if stage == 2:
         return gelu
     # stage 3: requant to int8 (the fc2 input), dequant for comparison
@@ -565,12 +567,16 @@ def quantize_act_per_batch(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor,
 
 
 def int8_conv1d(x_int: torch.Tensor, x_scale: torch.Tensor, x_zp: torch.Tensor,
-                w_int: torch.Tensor, w_scale: torch.Tensor, bias: torch.Tensor, stage: int) -> torch.Tensor:
-    """Staged int8 Conv1d (kernel 3, padding 1) via window-matmul + per-channel fixed-point.
+                w_int: torch.Tensor, w_scale: torch.Tensor, bias: torch.Tensor, stage: int,
+                stride: int = 1, kernel: int = 3, padding: int = 1) -> torch.Tensor:
+    """Staged int8 Conv1d via window-matmul + per-channel fixed-point.
 
     x_int [B, in, T] int8 with a PER-BATCH scale x_scale [B, 1, 1] (the kernel window spans
-    3 time positions, so a per-token scale is not factorable across the window sum -- see
-    quantize_act_per_batch). w_int [out, in, 3] int8, w_scale [out].
+    `kernel` time positions, so a per-token scale is not factorable across the window sum --
+    see quantize_act_per_batch). w_int [out, in, kernel] int8, w_scale [out].
+    stride/kernel/padding default to 1/3/1 (the A5 synthetic validation); whisper-tiny uses
+    conv1 = stride 1 and conv2 = stride 2 (both kernel 3, padding 1) -- conv2 halves T to
+    max_source_positions (1500).
     stage 1: fp conv on the int8-reconstructed weight + activation (weight+act quant).
     stage 2: int32 window matmul + per-channel W_scale + x_scale + int bias + requant.
     The per-batch x_scale is constant across the window, so it factors out of the window
@@ -583,18 +589,19 @@ def int8_conv1d(x_int: torch.Tensor, x_scale: torch.Tensor, x_zp: torch.Tensor,
     if stage == 1:
         x_recon = (x_int.to(torch.float32) - x_zp.to(torch.float32)) * x_scale       # [B,in,T]
         w_recon = w_int.to(torch.float32) * w_scale[:, None, None]
-        return fp_conv1d_ref(x_recon, w_recon, bias)
-    # int32 window matmul: pad T by 1, unfold to [B, in, T, 3] -> [B, T, in*3]
+        return torch.nn.functional.conv1d(x_recon, w_recon, bias, stride=stride, padding=padding)
+    # int32 window matmul: pad T by `padding`, unfold with `kernel`/`stride` -> [B, in, T_out, kernel]
+    T_out = (T + 2 * padding - kernel) // stride + 1
     x32 = (x_int.to(torch.int32) - x_zp.to(torch.int32))                       # [B, in, T] centered
-    xp = torch.nn.functional.pad(x32, (1, 1))                                 # [B, in, T+2]
-    win = xp.unfold(-1, 3, 1).movedim(1, 2)                                   # [B, T, in, 3]
-    win = win.reshape(x32.shape[0], T, in_ch * 3).to(torch.int32)             # [B, T, in*3]
-    wr = w_int.reshape(out_ch, in_ch * 3).to(torch.int32)                     # [out, in*3]
-    acc = torch.einsum("bti,oi->bto", win, wr)                                # [B, T, out] int32
+    xp = torch.nn.functional.pad(x32, (padding, padding))                     # [B, in, T+2*pad]
+    win = xp.unfold(-1, kernel, stride).movedim(1, 2)                        # [B, T_out, in, kernel]
+    win = win.reshape(x32.shape[0], T_out, in_ch * kernel).to(torch.int32)   # [B, T_out, in*kernel]
+    wr = w_int.reshape(out_ch, in_ch * kernel).to(torch.int32)               # [out, in*kernel]
+    acc = torch.einsum("bti,oi->bto", win, wr)                              # [B, T_out, out] int32
     # x_scale [B,1,1] is constant across the window -> factors out: out = acc*w_scale*x_scale + bias.
     out = acc.to(torch.float32) * w_scale.to(torch.float32) * x_scale + bias.to(torch.float32)
-    out = out.transpose(1, 2)                                                # [B, out, T] (conv convention)
-    o_int, o_scale, o_zp = quantize_act_per_token(out)                       # per-token output to next op
+    out = out.transpose(1, 2)                                              # [B, out, T_out] (conv convention)
+    o_int, o_scale, o_zp = quantize_act_per_token(out)                     # per-token output to next op
     return dequant_act(o_int, o_scale, o_zp)
 
 
