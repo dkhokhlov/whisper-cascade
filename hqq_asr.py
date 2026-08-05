@@ -12,7 +12,7 @@ this module uses the hqq library directly:
   - Load: a thin subclass of AutoHQQHFModel overrides create_model to build a
     WhisperForConditionalGeneration (the base class picks AutoModel, which
     returns WhisperModel without generate), then from_quantized loads the
-    HQQ weights on CPU. Stored fp16 weights are upcast to fp32 for compute.
+    HQQ weights on CPU. Stored fp16 weights are kept in fp16 for compute.
 
 proj_out (the lm_head) is kept tied to the embedding in fp16 (not quantized):
 it shares its weight with the decoder embed_tokens, so quantizing it would
@@ -42,11 +42,28 @@ transformers.logging.set_verbosity_error()
 from hqq.core.quantize import BaseQuantizeConfig, HQQLinear
 from hqq.models.hf.base import AutoHQQHFModel, init_empty_weights
 
-# CPU compute dtype. Stored fp16 weights are upcast to this at load time so
-# CPU matmuls run in fp32 (fast and dtype-consistent with the HQQ dequant).
-COMPUTE_DTYPE = torch.float32
+# Compute dtype for HQQ loads (and the default ONNX export compute). fp16 is
+# the deployment compute: it matches the hardware target and is WER-neutral
+# vs fp32. CPU matmuls are not faster in fp16 (most CPUs lack native fp16), so
+# CPU-only runs pay a small speed cost for deployment-dtype fidelity; set
+# HQQ_COMPUTE_DTYPE=fp32 to reproduce the fp32 benchmark compute.
+COMPUTE_DTYPE = torch.float16
 # Storage dtype for the non-quantized modules (embedding, convs, norms).
 STORE_DTYPE = torch.float16
+
+# Names accepted for the compute-dtype env knob (HQQ_COMPUTE_DTYPE). fp16 is the
+# deployment compute (the default, COMPUTE_DTYPE); fp32 is the validated benchmark
+# path (WER-neutral on the HQQ torch path; set HQQ_COMPUTE_DTYPE=fp32 to reproduce it).
+_COMPUTE_DTYPE_NAMES = {
+    "fp32": torch.float32, "float32": torch.float32,
+    "fp16": torch.float16, "float16": torch.float16,
+}
+
+
+def resolve_compute_dtype(name):
+    """Map an env-string compute-dtype name to a torch dtype (default fp16)."""
+    key = (name or "").strip().lower()
+    return _COMPUTE_DTYPE_NAMES.get(key, COMPUTE_DTYPE)
 
 
 class WhisperHQQModel(AutoHQQHFModel):
@@ -60,6 +77,9 @@ class WhisperHQQModel(AutoHQQHFModel):
     @classmethod
     def create_model(cls, save_dir, kwargs):
         config = AutoConfig.from_pretrained(os.path.join(save_dir, "config.json"))
+        attn_impl = os.environ.get("HQQ_ATTN_IMPL", "").strip().lower()
+        if attn_impl:
+            config._attn_implementation = attn_impl
         with init_empty_weights():
             return AutoModelForSpeechSeq2Seq.from_config(config)
 
@@ -204,7 +224,7 @@ def quantize_whisper(
     return {"default": n_default, "tier8": n_tier8}
 
 
-def load_whisper_hqq(model_id_or_dir, device="cpu"):
+def load_whisper_hqq(model_id_or_dir, compute_dtype=COMPUTE_DTYPE, device="cpu"):
     """Load a saved HQQ Whisper model on CPU and return it.
 
     If the model ships a modern generation_config.json (the multilingual
@@ -213,9 +233,14 @@ def load_whisper_hqq(model_id_or_dir, device="cpu"):
     overrides are accepted. Without it (the English track) the model keeps the
     forced_decoder_ids built from config.json (English) so that track is
     preserved unchanged.
+
+    compute_dtype (default COMPUTE_DTYPE=fp16, the deployment compute) is passed
+    to hqq's from_quantized, which casts the whole module to that dtype (the
+    non-quantized modules and the HQQLinear dequant/matmul). Set torch.float32
+    to reproduce the fp32 benchmark compute (WER-neutral on the HQQ torch path).
     """
     model = WhisperHQQModel.from_quantized(
-        model_id_or_dir, compute_dtype=COMPUTE_DTYPE, device=device, cache_dir=None,
+        model_id_or_dir, compute_dtype=compute_dtype, device=device, cache_dir=None,
     )
     # Re-tie proj_out to the decoder embedding. hqq's from_quantized._load_module
     # upcasts each stored tensor to fp32 with .to(), which copies storage and
@@ -237,7 +262,7 @@ def load_whisper_hqq(model_id_or_dir, device="cpu"):
     return model
 
 
-def build_pipeline(model_id, quant, device="cpu"):
+def build_pipeline(model_id, quant, device="cpu", compute_dtype=COMPUTE_DTYPE):
     """Build the ASR pipeline for the requested mode.
 
     quant == "hqq": load MODEL_ASR as a saved HQQ model and wrap it in the
@@ -249,7 +274,11 @@ def build_pipeline(model_id, quant, device="cpu"):
     the fp32 model is loaded and moved with .to(device), the HQQ model is
     loaded on device, and device=0 (cuda:0) is passed to the pipeline so the
     inputs are moved to the model. HQQ weights are dequantized in COMPUTE_DTYPE
-    (fp32) on the chosen device.
+    (fp16, the deployment compute) on the chosen device.
+
+    compute_dtype (default COMPUTE_DTYPE=fp16) is the HQQ compute dtype passed to
+    load_whisper_hqq; set torch.float32 to reproduce the fp32 benchmark compute.
+    Only used for quant == "hqq".
     """
     if quant == "onnx":
         # Load the exported ONNX subgraphs (encoder/decoder/decoder_with_past
@@ -269,7 +298,7 @@ def build_pipeline(model_id, quant, device="cpu"):
             feature_extractor=processor.feature_extractor,
         )
     if quant == "hqq":
-        model = load_whisper_hqq(model_id, device=device)
+        model = load_whisper_hqq(model_id, device=device, compute_dtype=compute_dtype)
         model.eval()
         processor = AutoProcessor.from_pretrained(model_id)
         kwargs = dict(

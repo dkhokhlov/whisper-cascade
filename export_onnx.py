@@ -30,13 +30,18 @@ import hqq_asr
 HQQ_OUT = os.environ.get("HQQ_OUT", "whisper-tiny-hqq-4bit")
 ONNX_OUT = os.environ.get("ONNX_OUT", "whisper-tiny-hqq-onnx")
 ASR_DEVICE = os.environ.get("ASR_DEVICE", "cpu").strip().lower() or "cpu"
+# HQQ compute dtype for the export. fp16 (default) is the deployment compute;
+# fp32 is the validated benchmark path (set HQQ_COMPUTE_DTYPE=fp32 to reproduce it).
+COMPUTE_DTYPE = hqq_asr.resolve_compute_dtype(os.environ.get("HQQ_COMPUTE_DTYPE", "fp16"))
+os.environ.setdefault("HQQ_ATTN_IMPL", "eager")
 
 
 class HQQLinearONNX(nn.Module):
     """Plain-torch reimplementation of an HQQLinear for ONNX export.
 
     Reproduces the HQQ dequant formula W = (q - zero) * scale, reshaped to (O, I), then
-    out = x @ W.T (+ bias). axis=1, group_size=32, fp32 compute (this repo's compute_dtype).
+    out = x @ W.T (+ bias). axis=1, group_size=32, compute in the model's compute dtype
+    (fp16 by default, the deployment compute; fp32 to reproduce the benchmark).
 
     4-bit: W_q is uint8 (O*I/64, 32); the pre-pack tensor (O*I/32, 32) is split into two
       halves along axis 0 -- first half in the high nibble, second half in the low nibble.
@@ -61,7 +66,13 @@ class HQQLinearONNX(nn.Module):
         self.in_features = int(in_features)
 
     def dequantize(self):
-        """Return the dequantized fp32 weight (O, I); mirrors HQQLinear.dequantize()."""
+        """Return the dequantized weight (O, I); mirrors HQQLinear.dequantize().
+
+        Computes in the scale/zero dtype (the model's compute dtype), so an fp32
+        load dequants in fp32 and an fp16 load dequants in fp16. The packed uint8
+        W_q is cast to that dtype before the sub/mul; the ONNX graph keeps a
+        matching Cast node.
+        """
         q = self.W_q
         if self.nbits == 4:
             high = torch.bitwise_right_shift(
@@ -73,7 +84,7 @@ class HQQLinearONNX(nn.Module):
             qr = q
         else:
             raise NotImplementedError(f"HQQLinearONNX: nbits={self.nbits} not supported")
-        w = (qr.to(torch.float32) - self.zero) * self.scale
+        w = (qr.to(self.scale.dtype) - self.zero) * self.scale
         return w.reshape(self.out_features, self.in_features)
 
     def forward(self, x):
@@ -192,8 +203,8 @@ def main() -> int:
 
     from optimum.exporters.onnx import onnx_export_from_model
 
-    print(f"loading HQQ model {HQQ_OUT} (device={ASR_DEVICE})", file=sys.stderr)
-    model = hqq_asr.load_whisper_hqq(HQQ_OUT, device=ASR_DEVICE)
+    print(f"loading HQQ model {HQQ_OUT} (device={ASR_DEVICE}, compute={COMPUTE_DTYPE})", file=sys.stderr)
+    model = hqq_asr.load_whisper_hqq(HQQ_OUT, device=ASR_DEVICE, compute_dtype=COMPUTE_DTYPE)
     model.eval()
     n_default, n_tier8 = swap_hqq_linears(model)
     print(
@@ -202,7 +213,12 @@ def main() -> int:
     )
 
     os.makedirs(ONNX_OUT, exist_ok=True)
-    print(f"exporting ONNX -> {ONNX_OUT} (opset=18, do_constant_folding=False)", file=sys.stderr)
+    # optimum's export-time validation compares ORT vs torch on dummy inputs. The
+    # real gate is exact-text (gate 2), not this sanity check: fp32 reassociation over
+    # the decoder is ~2e-4, but fp16 reassociation is larger, so widen atol for fp16
+    # so the fp16 export is not aborted by a tolerance that only fits fp32.
+    atol = 1e-2 if COMPUTE_DTYPE == torch.float16 else 1e-3
+    print(f"exporting ONNX -> {ONNX_OUT} (opset=18, do_constant_folding=False, atol={atol})", file=sys.stderr)
     onnx_export_from_model(
         model,
         ONNX_OUT,
@@ -210,7 +226,7 @@ def main() -> int:
         do_constant_folding=False,
         task="automatic-speech-recognition-with-past",
         device=ASR_DEVICE,
-        atol=1e-3,
+        atol=atol,
     )
     # _copy_meta_files needs a local dir, but HQQ_OUT may be an HF repo id (the
     # Makefile sources the weights from HQQ_REPO). Resolve it to its local
@@ -256,6 +272,7 @@ def main() -> int:
     summary = {
         "hqq_out": HQQ_OUT,
         "onnx_out": ONNX_OUT,
+        "compute_dtype": str(COMPUTE_DTYPE),
         "linears_default_bit": n_default,
         "linears_8bit": n_tier8,
         "gate1_structural": gate1,

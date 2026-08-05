@@ -65,6 +65,11 @@ EVAL_SPLIT ?= test
 EVAL_LIMIT ?= 100
 # WER eval config / language code (make eval-baseline / eval-hqq).
 EVAL_CONFIG ?= en_us
+# HQQ compute dtype for the HQQ-compute targets (onnx / hqq-reference / eval-hqq).
+# fp16 (default) is the deployment compute; fp32 is the validated benchmark path.
+# Override per run: make onnx HQQ_COMPUTE_DTYPE=fp32 (reproduce the fp32 benchmark).
+HQQ_COMPUTE_DTYPE ?= fp16
+export HQQ_COMPUTE_DTYPE
 
 .PHONY: help info venv gpu-venv onnx-venv samples asr en tts quantize push eval-baseline eval-hqq eval-onnx onnx hqq-reference push-onnx test test-integration clean clean-all
 
@@ -189,11 +194,12 @@ onnx: $(VENV_ONNX)/.stamp ## Export HQQ_REPO (HF) to ONNX (3 graphs) -> ONNX_OUT
 # Per-target EVAL_OUT defaults; override on the command line for per-flavor runs
 # (make hqq-reference EVAL_OUT=build/hqq_reference_base.json, etc.).
 hqq-reference: EVAL_OUT = $(BUILD)/hqq_reference.json
+hqq-reference: HQQ_ATTN_IMPL ?= eager
 hqq-reference: $(VENV_ONNX)/.stamp ## Write the full 100-sample HQQ reference manifest (the exact-text gate oracle)
 	@mkdir -p $(dir $(EVAL_OUT))
 	@QUANT=hqq MODEL_ASR=$(HQQ_REPO) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
 	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=$(EVAL_OUT) \
-	 HQQ_REFERENCE=1 $(PYONNX) eval_wer.py
+	 HQQ_REFERENCE=1 HQQ_ATTN_IMPL=$(HQQ_ATTN_IMPL) $(PYONNX) eval_wer.py
 
 eval-onnx: EVAL_OUT = $(BUILD)/eval_onnx.json
 eval-onnx: HQQ_REFERENCE_MANIFEST = $(BUILD)/hqq_reference.json

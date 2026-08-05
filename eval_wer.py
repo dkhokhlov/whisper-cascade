@@ -82,6 +82,10 @@ QUANT = os.environ.get("QUANT", "").strip().lower()
 # Compute device: "cpu" (default) keeps the original CPU behavior; "cuda" runs
 # the model on GPU (needs CUDA torch, e.g. the .venv-gpu env for the A10).
 ASR_DEVICE = os.environ.get("ASR_DEVICE", "cpu").strip().lower() or "cpu"
+# HQQ compute dtype (default fp16, the deployment compute). Set
+# HQQ_COMPUTE_DTYPE=fp32 to reproduce the fp32 benchmark compute (the oracle for
+# a fp32 ONNX gate; WER-neutral on the HQQ torch path).
+COMPUTE_DTYPE = hqq_asr.resolve_compute_dtype(os.environ.get("HQQ_COMPUTE_DTYPE", "fp16"))
 EVAL_DATASET = os.environ.get("EVAL_DATASET", "google/fleurs")
 EVAL_CONFIG = os.environ.get("EVAL_CONFIG", "en_us")
 EVAL_SPLIT = os.environ.get("EVAL_SPLIT", "test")
@@ -219,7 +223,7 @@ def main() -> int:
     Return 0 when at least one sample succeeded. Return 1 when every sample
     failed (so a bad dataset or model does not pass a meaningless result).
     """
-    pipe = hqq_asr.build_pipeline(MODEL_ASR, QUANT, device=ASR_DEVICE)
+    pipe = hqq_asr.build_pipeline(MODEL_ASR, QUANT, device=ASR_DEVICE, compute_dtype=COMPUTE_DTYPE)
 
     print(
         f"loading {EVAL_DATASET}/{EVAL_CONFIG} split={EVAL_SPLIT} "
