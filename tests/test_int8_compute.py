@@ -590,3 +590,67 @@ def test_kv_cache_concat_preserves_int8():
         cached = i8.kv_cache_concat(cached, c)
     assert cached.shape == (B, H, 4, d)
     assert torch.equal(cached, torch.cat(chunks, dim=2)), "concat must preserve int8 values"
+
+
+# --------------------------------------------------------------------------- #
+# A8.4 (int-canonical): residual add in boundary form (int8_residual_add_intscale)#
+# -- the chain's key sub-problem. Two int8 operands with DIFFERENT per-token    #
+# scales -> common 2^-F domain (F = max shift, finer scale, power-of-two        #
+# scale-up is lossless) -> int64 add -> shared Stage 1b requant. The staged ref  #
+# does residuals in fp32; this is the zero-fp form the ONNX chain mirrors.       #
+# --------------------------------------------------------------------------- #
+
+def _res_inputs(B=2, Tq=8, D=384, sigma=2.0, seed=0):
+    torch.manual_seed(seed)
+    a = torch.randn(B, Tq, D) * sigma
+    b = torch.randn(B, Tq, D) * sigma
+    a_int, a_mul, a_shift, a_zp = i8.quantize_act_per_token_intscale(a)   # [B,Tq,D] + [B,Tq,1]
+    b_int, b_mul, b_shift, b_zp = i8.quantize_act_per_token_intscale(b)
+    return a, b, a_int, a_zp, a_mul, a_shift, b_int, b_zp, b_mul, b_shift
+
+
+def test_residual_add_intscale_in_range():
+    """acc int64 < 2^62; y_int8 in int8; y_mul in [2^15,2^16); F = max(a_shift, b_shift) (the
+    finer domain, so the scale-up is lossless)."""
+    for seed in (0, 1, 2):
+        for sig in (0.5, 2.0, 8.0):
+            _, _, a_int, a_zp, a_mul, a_shift, b_int, b_zp, b_mul, b_shift = _res_inputs(sigma=sig, seed=seed)
+            y_int8, y_mul, y_shift, y_zp, inter = i8.int8_residual_add_intscale(
+                a_int, a_zp, a_mul, a_shift, b_int, b_zp, b_mul, b_shift, return_intermediates=True)
+            assert int(inter["acc"].abs().max()) < (1 << 62), "residual acc int64 overflow"
+            assert int(y_int8.min()) >= -128 and int(y_int8.max()) <= 127, "y_int8 out of int8"
+            assert int(y_mul.min()) >= (1 << 15) and int(y_mul.max()) < (1 << 16), "y_mul out of [2^15,2^16)"
+            assert inter["F"] == int(max(int(a_shift.max()), int(b_shift.max()))), "F = max shift"
+
+
+def test_residual_add_intscale_self_consistent():
+    """Re-dequant of (y_int8,y_mul,y_shift,y_zp) matches the pre-requant sum (acc*2^-F =
+    a_real+b_real, exact since the power-of-two scale-up is lossless) within one int8 step."""
+    for seed in (0, 1, 2):
+        _, _, a_int, a_zp, a_mul, a_shift, b_int, b_zp, b_mul, b_shift = _res_inputs(seed=seed)
+        y_int8, y_mul, y_shift, y_zp, inter = i8.int8_residual_add_intscale(
+            a_int, a_zp, a_mul, a_shift, b_int, b_zp, b_mul, b_shift, return_intermediates=True)
+        scale = y_mul.to(torch.float64) * (2.0 ** (-y_shift.to(torch.float64)))
+        recon = (y_int8.to(torch.float64) - y_zp.to(torch.float64)) * scale
+        pre = inter["acc"].to(torch.float64) * (2.0 ** -inter["F"])          # a_real + b_real
+        step = (pre.amax(-1, keepdim=True) - pre.amin(-1, keepdim=True)) / 255.0
+        err = (recon - pre).abs()
+        assert bool((err < step + 1e-6).all()), \
+            f"residual self-consistency err {err.max().item()} >= step {step.max().item()}"
+
+
+def test_residual_add_intscale_vs_fp():
+    """Int-canonical residual (dequant) vs fp a_real+b_real on the SAME int8-quantized operands:
+    the only error is the output int8 requant (one step on the sum). rel_err < 2% (regression
+    guard; the real bound is ~0.5% -- the per-token output step / |sum|)."""
+    worst = 0.0
+    for seed in (0, 1, 2, 3):
+        _, _, a_int, a_zp, a_mul, a_shift, b_int, b_zp, b_mul, b_shift = _res_inputs(sigma=2.0, seed=seed)
+        y_int8, y_mul, y_shift, y_zp = i8.int8_residual_add_intscale(
+            a_int, a_zp, a_mul, a_shift, b_int, b_zp, b_mul, b_shift)
+        scale = y_mul.to(torch.float64) * (2.0 ** (-y_shift.to(torch.float64)))
+        recon = (y_int8.to(torch.float64) - y_zp.to(torch.float64)) * scale
+        a_real = (a_int - a_zp).to(torch.float64) * a_mul.to(torch.float64) * (2.0 ** (-a_shift.to(torch.float64)))
+        b_real = (b_int - b_zp).to(torch.float64) * b_mul.to(torch.float64) * (2.0 ** (-b_shift.to(torch.float64)))
+        worst = max(worst, i8._rel_err(recon, a_real + b_real))
+    assert worst < 0.02, f"int-canonical residual rel err {worst} >= 2%"

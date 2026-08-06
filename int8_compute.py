@@ -1312,6 +1312,48 @@ def kv_cache_concat(cached_int: torch.Tensor | None, new_int: torch.Tensor) -> t
     return torch.cat([cached_int, new_int], dim=2)
 
 
+def int8_residual_add_intscale(a_int, a_zp, a_mul, a_shift, b_int, b_zp, b_mul, b_shift,
+                               return_intermediates=False):
+    """Int-canonical residual add in boundary form (A8.4) -- the chain's key sub-problem.
+
+    Two int8 operands in boundary form (a_real = (a_int-a_zp)*a_mul*2^-a_shift, b_real similarly),
+    same shape [..., D] with per-token scales [..., 1] (a decoder residual adds a block output to
+    its input, both boundary form, DIFFERENT scales). Bring both to a common 2^-F domain with
+    F = max(a_shift, b_shift) -- the finer scale; the scale-up 2^(F - shift) is a power of two, so
+    lossless (no precision lost bringing the coarser operand up to the finer domain). int64 add,
+    then output via int8_output_requant_intscale (the shared Stage 1b, fresh per-token Q1.16
+    output scale for the next op). Pure-int throughout (the staged ref does residuals in fp32).
+
+      acc_a = (a_int-a_zp)*a_mul << (F - a_shift) ; acc_b = (b_int-b_zp)*b_mul << (F - b_shift)
+      acc   = acc_a + acc_b  @ 2^-F ;  out = int8_output_requant_intscale(acc, 1, 0, F, None)
+      (acc*2^-F = a_real + b_real exactly -- the power-of-two scale-up is lossless.)
+
+    Returns (y_int8 [..., D] int32, y_mul [..., 1] int32, y_shift [..., 1] int32, y_zp [..., 1]).
+    """
+    a64 = (a_int.to(torch.int64) - a_zp.to(torch.int64)) * a_mul.to(torch.int64)     # [..., D]
+    b64 = (b_int.to(torch.int64) - b_zp.to(torch.int64)) * b_mul.to(torch.int64)     # [..., D]
+    F = int(max(int(a_shift.max().item()), int(b_shift.max().item())))              # common finer domain
+    sa = (F - a_shift.to(torch.int64)).clamp(min=0)                                 # [..., 1] >= 0 (F >= a_shift)
+    sb = (F - b_shift.to(torch.int64)).clamp(min=0)
+    acc_a = a64 << sa                                                               # [..., D] @ 2^-F
+    acc_b = b64 << sb                                                               # [..., D] @ 2^-F
+    acc = acc_a + acc_b
+    lead, D = acc.shape[:-1], acc.shape[-1]
+    acc_flat = acc.reshape(-1, D)
+    ones = torch.ones(acc_flat.shape[0], 1, dtype=torch.int32)
+    zeros = torch.zeros(acc_flat.shape[0], 1, dtype=torch.int32)
+    y_int8_flat, y_mul_flat, y_shift_flat, y_zp_flat = int8_output_requant_intscale(
+        acc_flat, ones, zeros, F, None)
+    y_int8 = y_int8_flat.reshape(*lead, D)
+    y_mul = y_mul_flat.reshape(*lead, 1).to(torch.int32)
+    y_shift = y_shift_flat.reshape(*lead, 1).to(torch.int32)
+    y_zp = y_zp_flat.reshape(*lead, 1).to(torch.int32)
+    if return_intermediates:
+        inter = {"F": F, "acc_a": acc_a, "acc_b": acc_b, "acc": acc}
+        return y_int8, y_mul, y_shift, y_zp, inter
+    return y_int8, y_mul, y_shift, y_zp
+
+
 # --------------------------------------------------------------------------- #
 # A1 validation harness                                                        #
 # --------------------------------------------------------------------------- #
