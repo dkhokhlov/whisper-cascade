@@ -712,3 +712,71 @@ def test_linear_intscale_differential_vs_a71():
         worst = max(worst, int((y - y_ref).abs().max()))
     assert tot_y / tot_n < 1e-3, f"linear y_int8 mismatch rate {tot_y/tot_n} > 0.1%"
     assert worst <= 1, f"linear y_int8 worst |d| {worst} > 1 LSB"
+
+
+def _head_merge_inputs(B=2, H=6, Tq=8, d=64, sigma=2.0, seed=0):
+    """H per-head boundary operands [B,Tq,d] each with its own per-[B,Tq,1] scale (different per
+    head, as int8_pv_matmul_intscale produces). Returns (reals [H,B,Tq,d], int8_list, zp_list,
+    mul_list, shift_list)."""
+    torch.manual_seed(seed)
+    reals = torch.randn(H, B, Tq, d) * sigma
+    int8_list, zp_list, mul_list, shift_list = [], [], [], []
+    for h in range(H):
+        hi, hm, hsh, hzp = i8.quantize_act_per_token_intscale(reals[h])   # [B,Tq,d] + [B,Tq,1]
+        int8_list.append(hi); zp_list.append(hzp); mul_list.append(hm); shift_list.append(hsh)
+    return reals, int8_list, zp_list, mul_list, shift_list
+
+
+def test_concat_boundary_intscale_in_range():
+    """acc int64 < 2^62; y_int8 in int8; y_mul in [2^15,2^16); F = max over all H head shifts."""
+    for seed in (0, 1, 2):
+        for sig in (0.5, 2.0, 8.0):
+            _, int8_list, zp_list, mul_list, shift_list = _head_merge_inputs(sigma=sig, seed=seed)
+            y_int8, y_mul, y_shift, y_zp, inter = i8.int8_concat_boundary_intscale(
+                int8_list, zp_list, mul_list, shift_list, dim=-1, return_intermediates=True)
+            assert int(inter["acc"].abs().max()) < (1 << 62), "head-merge acc int64 overflow"
+            assert int(y_int8.min()) >= -128 and int(y_int8.max()) <= 127, "y_int8 out of int8"
+            assert int(y_mul.min()) >= (1 << 15) and int(y_mul.max()) < (1 << 16), \
+                "y_mul out of [2^15,2^16)"
+            assert inter["F"] == int(max(int(s.max()) for s in shift_list)), "F = max shift over heads"
+            assert y_int8.shape == (int8_list[0].shape[0], int8_list[0].shape[1],
+                                     sum(t.shape[-1] for t in int8_list)), "concat shape"
+            assert y_mul.shape == (int8_list[0].shape[0], int8_list[0].shape[1], 1), "one scale per token"
+
+
+def test_concat_boundary_intscale_self_consistent():
+    """Re-dequant of the merged output matches the common-domain concat (acc*2^-F) within one int8
+    step -- the power-of-two scale-up to the common domain is lossless, so the only error is the
+    output int8 requant."""
+    for seed in (0, 1, 2):
+        _, int8_list, zp_list, mul_list, shift_list = _head_merge_inputs(seed=seed)
+        y_int8, y_mul, y_shift, y_zp, inter = i8.int8_concat_boundary_intscale(
+            int8_list, zp_list, mul_list, shift_list, dim=-1, return_intermediates=True)
+        scale = y_mul.to(torch.float64) * (2.0 ** (-y_shift.to(torch.float64)))
+        recon = (y_int8.to(torch.float64) - y_zp.to(torch.float64)) * scale
+        pre = inter["acc"].to(torch.float64) * (2.0 ** -inter["F"])        # common-domain concat
+        step = (pre.amax(-1, keepdim=True) - pre.amin(-1, keepdim=True)) / 255.0
+        err = (recon - pre).abs()
+        assert bool((err < step + 1e-6).all()), \
+            f"head-merge self-consistency err {err.max().item()} >= step {step.max().item()}"
+
+
+def test_concat_boundary_intscale_vs_fp():
+    """Merged boundary dequant vs the fp concat of the per-head reals (each head dequanted under its
+    own scale, then concatenated) -- the only error is the common-domain requant. rel_err < 2%."""
+    worst = 0.0
+    for seed in (0, 1, 2, 3):
+        reals, int8_list, zp_list, mul_list, shift_list = _head_merge_inputs(sigma=2.0, seed=seed)
+        y_int8, y_mul, y_shift, y_zp = i8.int8_concat_boundary_intscale(
+            int8_list, zp_list, mul_list, shift_list, dim=-1)
+        scale = y_mul.to(torch.float64) * (2.0 ** (-y_shift.to(torch.float64)))
+        recon = (y_int8.to(torch.float64) - y_zp.to(torch.float64)) * scale       # [B,Tq,D]
+        # fp reference: dequant each head under its own scale, concat -> [B,Tq,D]
+        heads_fp = []
+        for h in range(reals.shape[0]):
+            hs = mul_list[h].to(torch.float64) * (2.0 ** (-shift_list[h].to(torch.float64)))
+            heads_fp.append((int8_list[h].to(torch.float64) - zp_list[h].to(torch.float64)) * hs)
+        fp_concat = torch.cat(heads_fp, dim=-1)
+        denom = fp_concat.abs().amax() + 1e-6
+        worst = max(worst, float((recon - fp_concat).abs().max() / denom))
+    assert worst < 0.02, f"head-merge vs fp rel_err {worst} >= 2%"

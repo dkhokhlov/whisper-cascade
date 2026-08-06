@@ -1389,6 +1389,47 @@ def int8_linear_intscale(x_int, x_zp, x_mul, x_shift, qr, zero, scale, bias, gro
     return y_int8, y_mul, y_shift, y_zp
 
 
+def int8_concat_boundary_intscale(int8_list, zp_list, mul_list, shift_list, dim=-1,
+                                  return_intermediates=False):
+    """Int-canonical boundary-form concat to a common scale (A8.5) -- the multi-head merge.
+
+    N int8 operands each in its own boundary form (val_real = (val_int-val_zp)*mul*2^-shift),
+    the SAME shape except along `dim`. Bring all to a common 2^-F domain (F = max shift over all
+    operands -- the finer scale; the scale-up 2^(F - shift) is a power of two, lossless), int64,
+    then CONCAT along `dim`, then output via int8_output_requant_intscale (fresh per-token Q1.16
+    output scale). Used to merge the H per-head attention outputs (each [B,H,Tq,d] with scale
+    [B,H,Tq,1]) into the [B,Tq,D=H*d] out_proj input with one per-[B,Tq] scale -- the same
+    common-domain requant as the residual add (A8.4), but concat instead of sum. Pure-int.
+
+    int8_list[i] [..., S_i, ...] int32; zp_list/mul_list/shift_list[i] [..., 1] int32. Returns
+    (y_int8 [..., sum S_i, ...] int32, y_mul [..., 1] int32 Q1.16, y_shift [..., 1] int32,
+    y_zp [..., 1] int32). The non-concat dims must broadcast-match across operands (e.g. all
+    [B,Tq,d] across heads -> concat dim=-1 -> [B,Tq,H*d]).
+    """
+    F = int(max(int(s.max()) for s in shift_list))
+    accs = []
+    for v, z, m, s in zip(int8_list, zp_list, mul_list, shift_list):
+        vi = (v.to(torch.int64) - z.to(torch.int64)) * m.to(torch.int64)     # [..., S_i]
+        sh = (F - s.to(torch.int64)).clamp(min=0)                              # [..., 1] >= 0
+        accs.append(vi << sh)                                                 # [..., S_i] @ 2^-F
+    acc = torch.cat(accs, dim=dim)                                            # [..., sum S_i] @ 2^-F
+    D = acc.shape[-1]
+    acc_flat = acc.reshape(-1, D)
+    ones = torch.ones(acc_flat.shape[0], 1, dtype=torch.int32)
+    zeros = torch.zeros(acc_flat.shape[0], 1, dtype=torch.int32)
+    y_int8_flat, y_mul_flat, y_shift_flat, y_zp_flat = int8_output_requant_intscale(
+        acc_flat, ones, zeros, F, None)
+    y_int8 = y_int8_flat.reshape(acc.shape)
+    # one output scale per flat row [N,1] -> reshape to acc's leading dims + [1] (one scale per
+    # non-concat-token row; for the head-merge the scale is per [B,Tq,1], the concat dim = D).
+    y_mul = y_mul_flat.reshape(*acc.shape[:-1], 1).to(torch.int32)
+    y_shift = y_shift_flat.reshape(*acc.shape[:-1], 1).to(torch.int32)
+    y_zp = y_zp_flat.reshape(*acc.shape[:-1], 1).to(torch.int32)
+    if return_intermediates:
+        return y_int8, y_mul, y_shift, y_zp, {"F": F, "accs": accs, "acc": acc}
+    return y_int8, y_mul, y_shift, y_zp
+
+
 # --------------------------------------------------------------------------- #
 # A1 validation harness                                                        #
 # --------------------------------------------------------------------------- #
