@@ -191,3 +191,62 @@ def test_layernorm_intscale_vs_fp_within_tolerance():
         y_fp = i8.fp_layernorm_ref(x_recon, gamma, beta, eps)
         worst = max(worst, float((y_recon - y_fp).abs().max()))
     assert worst < 0.1, f"int-canonical LN abs err {worst} >= 0.1"
+
+
+# --------------------------------------------------------------------------- #
+# A3 (int-canonical): pure-int GELU oracle (int8_gelu_intscale) -- the spec the  #
+# ONNX GELU mirrors bit-exactly. GELU(x) = x*Phi(x), Phi from the int LUT; the   #
+# index round and the x*Phi multiply are fixed-point (integer input scale).     #
+# --------------------------------------------------------------------------- #
+
+def _gelu_inputs(D=1536, B=3, sigma=4.0, seed=0):
+    torch.manual_seed(seed)
+    x = torch.randn(B, D) * sigma
+    return i8.quantize_act_per_token_intscale(x)   # xi, am, sh, xz
+
+
+def test_gelu_intscale_index_in_range():
+    """The LUT index is clamped to [0, T-1] and phi_int in [0, 2^S] for all magnitudes (the
+    large-tail cases saturate idx to 0/T-1 where Phi -> 0/1)."""
+    T, S = i8._GELU_T, i8._GELU_S
+    for seed in (0, 1, 2):
+        for sig in (0.3, 4.0, 8.0, 50.0):
+            xi, am, sh, xz = _gelu_inputs(seed=seed, sigma=sig)
+            _, _, _, _, inter = i8.int8_gelu_intscale(xi, xz, am, sh, return_intermediates=True)
+            assert int(inter["idx"].min()) >= 0 and int(inter["idx"].max()) <= T - 1
+            assert int(inter["phi_int"].min()) >= 0 and int(inter["phi_int"].max()) <= (1 << S)
+            assert int(inter["acc"].abs().max()) < (1 << 62), "acc overflow"
+            assert int(inter["num"].abs().max()) < (1 << 62), "num overflow"
+
+
+def test_gelu_intscale_self_consistent():
+    """Dequant of (y_int8, y_mul, y_shift, y_zp) matches the pre-requant GELU (acc*y_mul*2^-(S+shift))
+    within one int8 step."""
+    for seed in (0, 1, 2):
+        xi, am, sh, xz = _gelu_inputs(seed=seed)
+        y_int8, ym, ys, yzp, inter = i8.int8_gelu_intscale(xi, xz, am, sh, return_intermediates=True)
+        scale = ym.float().reshape(-1, 1) * (2.0 ** (-ys.float().reshape(-1, 1)))
+        y_recon = (y_int8.float() - yzp.float().reshape(-1, 1)) * scale
+        # pre-requant real GELU = acc * y_mul * 2^-(S + y_shift) = (u*phi_int)*y_mul*2^-(S+y_shift)
+        gelu_prereq = inter["acc"].float() * am.float().reshape(-1, 1) \
+            * (2.0 ** -(i8._GELU_S + sh.float().reshape(-1, 1)))
+        step = (gelu_prereq.amax(-1, keepdim=True) - gelu_prereq.amin(-1, keepdim=True)) / 255.0
+        err = (y_recon - gelu_prereq).abs()
+        assert bool((err < step + 1e-6).all()), f"self-consistency err {err.max().item()} >= step {step.max().item()}"
+
+
+def test_gelu_intscale_vs_fp_erf_pre_requant():
+    """The PRE-requant LUT+index GELU vs fp erf GELU: abs err < 0.001 (the Phi LUT is near-exact;
+    the int index round is ~1 LUT LSB). The output int8 requant step is gated separately
+    (shared with the linear/LN, WER-neutral; the A3 staged WER gate already passed at +gelu)."""
+    worst = 0.0
+    for seed in (0, 1, 2, 3):
+        xi, am, sh, xz = _gelu_inputs(seed=seed)
+        _, _, _, _, inter = i8.int8_gelu_intscale(xi, xz, am, sh, return_intermediates=True)
+        x_real = (xi.float() - xz.float().reshape(-1, 1)) * am.float().reshape(-1, 1) \
+            * (2.0 ** (-sh.float().reshape(-1, 1)))
+        phi_real = inter["phi_int"].float() * (2.0 ** -i8._GELU_S)
+        gelu_prereq = x_real * phi_real
+        gelu_fp = i8.fp_gelu_ref(x_real)
+        worst = max(worst, float((gelu_prereq - gelu_fp).abs().max()))
+    assert worst < 1e-2, f"pre-requant LUT/index abs err {worst} >= 0.01"

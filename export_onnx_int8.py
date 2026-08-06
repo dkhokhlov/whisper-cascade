@@ -683,6 +683,103 @@ def build_int8_layernorm_onnx(ln_module, model_name="int8_layernorm", emit_inter
     return m
 
 
+# ---- GELU (Q6): int-canonical, pure-int, mirrors int8_gelu_intscale ----
+# GELU(x) = x*Phi(x), Phi from the int LUT (_phi_lut, Phi*2^S over [-Lx,Lx]). The LUT index
+# round and the x*Phi multiply are fixed-point (integer input scale, no runtime fp).
+_GELU_T, _GELU_S = 4096, 16            # LUT entries, Phi fixed-point bits (match int8_compute)
+_GELU_IDX_Q = 16                       # the LUT index multiplier fixed-point Q
+_GELU_IDX_MUL = 22369621               # round((T/(2*Lx)) * 2^IDX_Q) = round((1024/3)*2^16)
+
+
+def _emit_gelu_int8(b, x_int, x_zp, y_mul_in, y_shift_in, phi_lut, D,
+                    T=_GELU_T, S=_GELU_S, idx_q=_GELU_IDX_Q, idx_mul=_GELU_IDX_MUL):
+    """Append the int-canonical GELU (mirrors int8_compute.int8_gelu_intscale) to builder `b`.
+    Consumes the previous op's int8 output (x_int [B,D], x_zp [B,1], y_mul_in [B,1],
+    y_shift_in [B,1]); emits (y_int8 [B,D], y_mul [B,1], y_shift [B,1], y_zp [B,1]). `phi_lut`
+    is the int64 [T] Phi LUT (Phi*2^S); `D` is the feature dim. Returns the 4 output names.
+
+    Pure-int: u = x_int - x_zp; idx = clamp(rhu(u*ym*IDX_MUL, 2^(IDX_Q+ys)) + T//2, 0, T-1);
+    phi_int = Gather(LUT, idx); acc = u*phi_int (@ 2^S); the output reuses _emit_output_requant
+    with F = S and the per-token input scale (y_mul, y_shift) folded in as the act scale. All
+    GELU node names are 'gelu_'-prefixed; the index _rhu uses tag 'gelu_idx' (the requant's
+    _rhu calls use tags mul0_m/mul1_m/zp/y, and _clz_ladder uses the default 'clz' tag -- no
+    collisions). See int8_compute.int8_gelu_intscale for the bit-exact spec."""
+    P = "gelu_"
+    b.init("zero_i64", np.array([0], dtype=np.int64), INT64)
+    b.init(f"{P}iq", np.array([idx_q], dtype=np.int64), INT64)
+    b.init(f"{P}imul", np.array([idx_mul], dtype=np.int64), INT64)
+    b.init(f"{P}T_half", np.array([T // 2], dtype=np.int64), INT64)
+    b.init(f"{P}T_m1", np.array([T - 1], dtype=np.int64), INT64)
+    b.init("one_u64", np.array([1], dtype=np.uint64), UINT64)
+    # u = x_int - x_zp  [B,D] int64
+    x64 = b.node("Cast", [x_int], [f"{P}x64"], f"{P}x_cast", to=INT64)
+    xz64 = b.node("Cast", [x_zp], [f"{P}xz64"], f"{P}xz_cast", to=INT64)
+    u = b.node("Sub", [x64, xz64], [f"{P}u"], f"{P}u_sub")                          # [B,D]
+    ym = b.node("Cast", [y_mul_in], [f"{P}ym"], f"{P}ym_cast", to=INT64)            # [B,1]
+    ys = b.node("Cast", [y_shift_in], [f"{P}ys"], f"{P}ys_cast", to=INT64)          # [B,1]
+    # num = u * y_mul * IDX_MUL  [B,D]
+    uym = b.node("Mul", [u, ym], [f"{P}uym"], f"{P}uym_mul")                        # [B,D]*[B,1]
+    num = b.node("Mul", [uym, f"{P}imul"], [f"{P}num"], f"{P}num_mul")              # [B,D]*[1]
+    # den = 2^(IDX_Q + y_shift)  [B,1] (per-token power-of-two)
+    s_idx = b.node("Add", [ys, f"{P}iq"], [f"{P}s_idx"], f"{P}s_idx")               # [B,1]
+    s_idx_u = b.node("Cast", [s_idx], [f"{P}s_idx_u"], f"{P}s_idx_cast", to=UINT64)
+    den_u = b.node("BitShift", ["one_u64", s_idx_u], [f"{P}den_u"], f"{P}den_shift", direction="LEFT")
+    den = b.node("Cast", [den_u], [f"{P}den"], f"{P}den_cast", to=INT64)            # [B,1]
+    # idx = clamp(round_half_up(num, den) + T//2, 0, T-1)
+    idx_pre = _rhu(b, num, den, f"{P}idx")                                          # [B,D]
+    idx_plus = b.node("Add", [idx_pre, f"{P}T_half"], [f"{P}idx_plus"], f"{P}idx_plus")
+    idx_lo = b.node("Max", [idx_plus, "zero_i64"], [f"{P}idx_lo"], f"{P}idx_lo")
+    idx = b.node("Min", [idx_lo, f"{P}T_m1"], [f"{P}idx"], f"{P}idx_hi")            # [B,D] int64
+    # phi_int = Gather(LUT, idx)  [B,D] int64
+    b.init(f"{P}lut", phi_lut.astype(np.int64), INT64)                              # [T] Phi*2^S
+    phi32 = b.node("Gather", [f"{P}lut", idx], [f"{P}phi"], f"{P}gather", axis=0)   # [B,D] int64
+    # acc = u * phi_int  [B,D] @ 2^S
+    acc = b.node("Mul", [u, phi32], [f"{P}acc"], f"{P}acc_mul")                     # [B,D]
+    # output requant: F = S, per-token input scale folded in (act_mul=y_mul, act_shift=y_shift)
+    y_out, y_mul, y_shift, y_zp = _emit_output_requant(
+        b, acc, y_mul_in, y_shift_in, S, None, D)
+    return y_out, y_mul, y_shift, y_zp
+
+
+def build_int8_gelu_onnx(model_name="int8_gelu", emit_intermediates=False, D=1536):
+    """Build the int-canonical GELU ONNX (mirrors int8_compute.int8_gelu_intscale).
+
+    GELU is parameter-free (one function for fc1/fc2 in every layer), so no module is loaded;
+    `D` is the feature dim (default 1536 = whisper-tiny fc1; tests override). The Phi LUT is
+    baked as an int64 [T] initializer (bit-identical to int8_compute._phi_lut, loaded lazily).
+
+    Inputs (the previous op's int8 output, zero runtime fp):
+      x_int [B, D] int8, x_zp [B, 1] int32, x_mul [B, 1] int32 (Q1.16 input scale),
+      x_shift [B, 1] int32.
+    Outputs: y_int8 [B, D] int8, y_mul [B, 1] int32, y_shift [B, 1] int32, y_zp [B, 1] int32.
+    With emit_intermediates the graph also outputs u, num, den, idx, phi, acc for bit-exact
+    verification vs the torch reference.
+    """
+    import int8_compute as i8
+    phi_lut = i8._phi_lut().numpy().astype(np.int64)                                # [T] Phi*2^S
+    b = _Builder()
+    out_names = _emit_gelu_int8(b, "x_int", "x_zp", "x_mul", "x_shift", phi_lut, D)
+    y_out, y_mul, y_shift, y_zp = out_names
+    inputs = [
+        helper.make_tensor_value_info("x_int", INT8, ["B", D]),
+        helper.make_tensor_value_info("x_zp", INT32, ["B", 1]),
+        helper.make_tensor_value_info("x_mul", INT32, ["B", 1]),
+        helper.make_tensor_value_info("x_shift", INT32, ["B", 1]),
+    ]
+    vi = helper.make_tensor_value_info
+    outputs = [vi("y_int8", INT8, ["B", D]), vi("y_mul", INT32, ["B", 1]),
+               vi("y_shift", INT32, ["B", 1]), vi("y_zp", INT32, ["B", 1])]
+    if emit_intermediates:
+        outputs += [vi("gelu_u", INT64, ["B", D]), vi("gelu_num", INT64, ["B", D]),
+                    vi("gelu_den", INT64, ["B", 1]), vi("gelu_idx", INT64, ["B", D]),
+                    vi("gelu_phi", INT64, ["B", D]), vi("gelu_acc", INT64, ["B", D])]
+    g_ = helper.make_graph(b.nodes, model_name, inputs, outputs, initializer=b.inits)
+    m = helper.make_model(g_, opset_imports=[helper.make_opsetid("", 18)])
+    m.ir_version = 9
+    onnx.checker.check_model(m)
+    return m
+
+
 # ---- recursive zero-fp audit (Q4) ----
 # Tensor elem types that are legal in a zero-fp graph: integers, bool, string. Any float
 # (fp32/fp16/bfloat16/float8*) is a violation. Unknown/UNDEFINED types fail closed.

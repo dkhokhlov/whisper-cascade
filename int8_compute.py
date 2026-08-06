@@ -705,6 +705,59 @@ def int8_gelu(x_int: torch.Tensor, x_scale: torch.Tensor, x_zp: torch.Tensor, st
 
 
 # --------------------------------------------------------------------------- #
+# A3 (int-canonical): pure-int GELU oracle for the zero-fp ONNX emission       #
+# (codex+claude consensus 2026-08-05). The Phase-A int8_gelu uses runtime fp   #
+# (x_scale fp, fp index round), so it is a DIFFERENT algorithm, not a bit-exact #
+# oracle. This reference is pure-int throughout and is the spec the ONNX GELU   #
+# mirrors bit-exactly. Same Phi LUT (x*Phi(x)); the index round and the         #
+# x*Phi multiply are fixed-point (integer input scale).                         #
+# --------------------------------------------------------------------------- #
+
+# Fixed-point for the LUT index: x_real * T/(2*Lx) = u*y_mul*2^-y_shift * (1024/3) (T=4096,
+# 2*Lx=12). Fold 1024/3 into a Q_IDX fixed-point multiplier; the ONNX emits the same constant.
+_GELU_IDX_Q = 16
+_GELU_IDX_MUL = int(round((1024.0 / 3.0) * (2 ** _GELU_IDX_Q)))   # 22369621
+
+
+def int8_gelu_intscale(x_int, x_zp, y_mul_in, y_shift_in, return_intermediates=False):
+    """Int-canonical pure-int GELU -- the zero-fp oracle the ONNX GELU mirrors.
+
+    Input: the previous op's int8 output as (x_int [B,D], x_zp [B,1], y_mul_in [B,1] Q1.16,
+    y_shift_in [B,1]); x_real = (x_int - x_zp)*y_mul*2^-y_shift. GELU(x) = x*Phi(x), Phi from
+    the int LUT (_phi_lut, Phi*2^S over [-Lx,Lx]). Pure-int throughout (no runtime fp):
+      u = x_int - x_zp                                           (int64 [B,D])
+      idx = clamp(round_half_up(u*y_mul*IDX_MUL, 2^(IDX_Q+y_shift)) + T//2, 0, T-1)
+      phi_int = LUT[idx]                                          (int64 [B,D] = Phi*2^S)
+      acc = u * phi_int                                           (int64 [B,D] @ 2^S)
+      out = int8_output_requant_intscale(acc, y_mul, y_shift, F=S, bias=None)
+    The per-token input scale (y_mul, y_shift) is folded into the requant as the act scale, so
+    acc @ 2^S and the output y_shift = sh + S + y_shift. acc ~ |u|*2^S <= 255*2^16 ~ 2^24;
+    out_int = acc*y_mul ~ 2^39 < 2^63 (int64-safe).
+
+    Returns (y_int8 [B,D] int32, y_mul [B,1] int32, y_shift [B,1] int32, y_zp [B,1] int32);
+    with return_intermediates, also a dict of the int intermediates for bit-exact verification.
+    """
+    T, S = _GELU_T, _GELU_S
+    u = x_int.to(torch.int64) - x_zp.to(torch.int64).reshape(-1, 1)          # [B,D]
+    ym = y_mul_in.to(torch.int64).reshape(-1, 1)                              # [B,1]
+    ys = y_shift_in.to(torch.int64).reshape(-1, 1)                            # [B,1]
+    num = u * ym * _GELU_IDX_MUL                                             # [B,D] int64
+    den = (torch.ones_like(ys) << (ys + _GELU_IDX_Q))                        # [B,1] = 2^(IDX_Q+ys)
+    idx_pre = _round_half_up(num, den)                                       # [B,D] = round_half_up(num/den)
+    idx = torch.clamp(idx_pre + T // 2, 0, T - 1)                            # [B,D]
+    lut = _phi_lut().to(torch.int64)                                         # [T] int64 (Phi*2^S)
+    phi_int = lut[idx]                                                       # [B,D] int64
+    acc = u * phi_int                                                        # [B,D] @ 2^S
+    y_int8, y_mul, y_shift, y_zp = int8_output_requant_intscale(
+        acc, ym.to(torch.int32), ys.to(torch.int32), S, None)
+    if return_intermediates:
+        inter = {"u": u, "num": num, "den": den, "idx": idx,
+                 "phi_int": phi_int, "acc": acc}
+        return y_int8, y_mul, y_shift, y_zp, inter
+    return y_int8, y_mul, y_shift, y_zp
+
+
+# --------------------------------------------------------------------------- #
 # A4: int8 softmax (subtract-max + exp LUT + int reciprocal + requant)         #
 # --------------------------------------------------------------------------- #
 

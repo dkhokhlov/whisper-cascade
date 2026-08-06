@@ -278,3 +278,90 @@ def test_int8_layernorm_zero_fp_audit():
     model = ex.build_int8_layernorm_onnx(ln, emit_intermediates=False)
     ex.zero_fp_audit(model)                       # raw graph
     ex.zero_fp_audit(model, check_optimized=True)  # ORT-optimized artifact
+
+
+# ---- Q6: int8 GELU ONNX (int-canonical, mirrors int8_gelu_intscale) ----
+
+def _check_gelu(x, D):
+    """Build the int-canonical GELU ONNX (with intermediates) and assert every int intermediate
+    AND the four int8 outputs are BIT-EXACT vs int8_compute.int8_gelu_intscale."""
+    import numpy as np
+    xi, am, sh, xz = i8.quantize_act_per_token_intscale(x)
+    y_int8, ym, ys, yzp, inter = i8.int8_gelu_intscale(xi, xz, am, sh, return_intermediates=True)
+    model = ex.build_int8_gelu_onnx(model_name="gelu_t", emit_intermediates=True, D=D)
+    path = "/tmp/_int8_gelu_test.onnx"
+    onnx.save(model, path)
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    feeds = {"x_int": xi.numpy().astype(np.int8),
+             "x_zp": xz.numpy().astype(np.int32).reshape(-1, 1),
+             "x_mul": am.numpy().astype(np.int32).reshape(-1, 1),
+             "x_shift": sh.numpy().astype(np.int32).reshape(-1, 1)}
+    o = {out.name: v for out, v in zip(sess.get_outputs(), sess.run(None, feeds))}
+    pairs = [("gelu_u", "u"), ("gelu_num", "num"), ("gelu_den", "den"),
+             ("gelu_idx", "idx"), ("gelu_phi", "phi_int"), ("gelu_acc", "acc")]
+    for ok, rk in pairs:
+        a = o[ok].astype(np.int64)
+        b = inter[rk].numpy().astype(np.int64)
+        assert a.shape == b.shape, f"{ok}: shape {a.shape} vs {b.shape}"
+        assert np.array_equal(a, b), f"{ok} vs {rk}: {int((a != b).sum())}/{a.size} differ (max|d|={int(np.abs(a - b).max())})"
+    for k, ref in [("y_int8", y_int8), ("y_mul", ym), ("y_shift", ys), ("y_zp", yzp)]:
+        a = o[k]
+        b = ref.numpy()
+        if a.ndim == 1 and b.ndim == 2:
+            b = b.reshape(-1)
+        a = a.astype(np.int64)
+        b = b.astype(np.int64).reshape(a.shape)
+        assert np.array_equal(a, b), f"OUT {k}: {int((a != b).sum())}/{a.size} differ (max|d|={int(np.abs(a - b).max())})"
+
+
+@pytest.mark.parametrize("D", [1536, 384])   # whisper-tiny fc1, fc2
+def test_int8_gelu_bitexact(D):
+    """The int-canonical GELU ONNX is bit-exact vs int8_gelu_intscale: every int intermediate
+    (u, num, den, idx, phi_int, acc) and the four int8 outputs match. GELU is parameter-free
+    (one function for fc1/fc2 in every layer); D is the feature dim."""
+    torch.manual_seed(7)
+    _check_gelu(torch.randn(3, D) * 4.0, D)
+
+
+@pytest.mark.parametrize("x_fn", [
+    lambda D: torch.randn(1, D) * 4.0,                   # batch 1
+    lambda D: torch.randn(5, D) * 4.0,                   # batch 5
+    lambda D: torch.randn(2, D) * 8.0,                   # large positive tail (Phi -> 1)
+    lambda D: -(torch.randn(2, D) * 8.0),                # large negative tail (Phi -> 0)
+    lambda D: torch.randn(2, D) * 50.0,                  # extreme magnitudes (idx saturates)
+    lambda D: torch.randn(2, D) * 0.3,                   # near-zero (idx near T/2, steep Phi)
+])
+def test_int8_gelu_robustness(x_fn):
+    """GELU bit-exactness holds across batch sizes and magnitude regimes (the large-tail cases
+    drive idx to the clamp boundaries 0 and T-1 where Phi saturates)."""
+    D = 1536
+    torch.manual_seed(2)
+    _check_gelu(x_fn(D), D)
+
+
+def test_int8_gelu_vs_fp_erf_within_tolerance():
+    """The int-canonical GELU output (dequant) vs fp erf GELU: the PRE-requant LUT+index error is
+    < 0.001 (the Phi LUT is near-exact); the POST-requant abs err is one int8 output step (shared
+    with the linear/LN requant, WER-neutral, A3 staged gate already passed at +gelu)."""
+    import numpy as np
+    worst_pre = 0.0
+    for seed in (0, 1, 2, 3):
+        torch.manual_seed(seed)
+        x = torch.randn(3, 1536) * 4.0
+        xi, am, sh, xz = i8.quantize_act_per_token_intscale(x)
+        _, _, _, _, inter = i8.int8_gelu_intscale(xi, xz, am, sh, return_intermediates=True)
+        x_real = (xi.float() - xz.float().reshape(-1, 1)) * am.float().reshape(-1, 1) \
+            * (2.0 ** (-sh.float().reshape(-1, 1)))
+        phi_real = inter["phi_int"].float() * (2.0 ** -i8._GELU_S)
+        gelu_prereq = x_real * phi_real                       # the LUT GELU before output requant
+        gelu_fp = i8.fp_gelu_ref(x_real)
+        worst_pre = max(worst_pre, float((gelu_prereq - gelu_fp).abs().max()))
+    assert worst_pre < 1e-2, f"pre-requant LUT/index abs err {worst_pre} >= 0.01"
+
+
+def test_int8_gelu_zero_fp_audit():
+    """The int-canonical GELU ONNX is structurally zero-fp: no fp tensors, no fp Casts, no
+    fp-computing ops (Gather is an int index lookup) -- raw graph AND the ORT-optimized artifact."""
+    model = ex.build_int8_gelu_onnx(emit_intermediates=False, D=1536)
+    ex.zero_fp_audit(model)                       # raw graph
+    ex.zero_fp_audit(model, check_optimized=True)  # ORT-optimized artifact

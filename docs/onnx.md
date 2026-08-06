@@ -472,7 +472,23 @@ ORT_DISABLE_ALL. New module `export_onnx_int8.py`.
    (default fmod=0) returns the EUCLIDEAN remainder (sign of divisor, >= 0 for d > 0), so
    `_floor_div_pos`'s negative-dividend correction must key off the NUMERATOR sign (`a < 0`), not
    the remainder sign (`r < 0`, never true) -- else mean_K = trunc = ceil (off by +1 for S1 < 0).
-   `tests/test_int8_onnx.py` now has 26 tests. **Next: the remaining Q6 sub-modules -- exact-Phi
-   GELU LUT, one softmax row, one ConvInteger, one If, one Loop with int loop-carried cache
-   (each bit-exact vs a pure-int reference + raw/optimized audit); then 1-layer decoder -> full
-   encoder + merged-decoder.**
+   `tests/test_int8_onnx.py` now has 26 tests.
+
+   **Q6 int-canonical GELU ONNX emission -- VERIFIED BIT-EXACT (2026-08-05).**
+   `build_int8_gelu_onnx` (`export_onnx_int8.py`) mirrors `int8_gelu_intscale` bit-exactly:
+   GELU(x) = x*Phi(x), Phi from the int LUT (_phi_lut, Phi*2^S over [-Lx,Lx], baked as an int64
+   [T] initializer bit-identical to the reference). Pure-int: u = x_int - x_zp; the LUT index
+   idx = clamp(round_half_up(u*y_mul*IDX_MUL, 2^(IDX_Q+y_shift)) + T//2, 0, T-1) where IDX_MUL =
+   round((T/(2*Lx))*2^IDX_Q) = round((1024/3)*2^16) = 22369621 folds the /3 into fixed-point;
+   phi_int = Gather(LUT, idx); acc = u*phi_int (@ 2^S); the output reuses _emit_output_requant
+   (F=S=16) with the per-token input scale (y_mul, y_shift) folded in as the act scale. GELU is
+   parameter-free (one function for fc1/fc2 in every layer). Verified bit-exact vs the torch
+   reference across 4 seeds x 8 cases (D=1536/384, batch 1..5, magnitudes 0.3..50) -- EVERY int
+   intermediate (u, num, den, idx, phi_int, acc) AND the four int8 outputs match. Zero-fp audit
+   passes raw + ORT-optimized (Gather is an int index lookup, no fp). Pre-requant LUT+index error
+   vs fp erf GELU is 0.0008 (the Phi LUT is near-exact); the post-requant abs err is one int8
+   output step (shared with the linear/LN, WER-neutral, A3 staged gate already passed at +gelu).
+   `tests/test_int8_onnx.py` now has 36 tests; `tests/test_int8_compute.py` has 12. **Next: the
+   remaining Q6 sub-modules -- one softmax row, one ConvInteger, one If, one Loop with int
+   loop-carried cache (each bit-exact vs a pure-int reference + raw/optimized audit); then
+   1-layer decoder -> full encoder + merged-decoder.**
