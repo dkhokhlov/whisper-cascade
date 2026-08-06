@@ -396,3 +396,89 @@ def test_conv1d_intscale_vs_fp_within_tolerance():
             y_fp = F.conv1d(x_real, w, bias, stride=stride, padding=1)
             worst = max(worst, i8._rel_err(y_recon, y_fp))
     assert worst < 0.05, f"int-canonical conv rel err {worst} >= 5%"
+
+
+# --------------------------------------------------------------------------- #
+# A8.1 (int-canonical): int8 Q.K^T + score path (int8_qk_matmul_intscale) --    #
+# the zero-fp attention-matmul oracle the ONNX decoder mirrors. Pure-int: int8  #
+# Q.K^T (int32 scores), integer score scale = q_scale*k_scale combined to a    #
+# single Q1.16, exact >>3 attn scale. Static per-(layer,head) K scale -> the   #
+# append-only KV cache form; per-token K scale (per-row score requant) is the  #
+# other A8.6 variable, added before the gate.                                  #
+# --------------------------------------------------------------------------- #
+
+def _qk_inputs(B=2, H=6, Tq=8, Tk=64, d=64, sigma=2.0, seed=0):
+    torch.manual_seed(seed)
+    q = torch.randn(B, H, Tq, d) * sigma
+    k = torch.randn(B, H, Tk, d) * sigma
+    # Q: per-query-token Q1.16 quant over d (last dim) -> scales [B,H,Tq,1]
+    q_int, q_mul, q_shift, q_zp = i8.quantize_act_per_token_intscale(q)
+    # K: static per-head symmetric Q1.16 -> scales [1,H,1,1] (the append-only cache form)
+    k_int, k_mul, k_shift, k_zp = i8.quantize_kv_static_per_head_intscale(k)
+    return q, k, q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_shift
+
+
+def test_combine_scales_q116_normalized():
+    """The product of two Q1.16 scales renormalizes to Q1.16 in [2^15,2^16), pure-int, and equals
+    scale_a*scale_b to ~2^-16 (one LSB of the Q1.16 mantissa)."""
+    torch.manual_seed(0)
+    for _ in range(20):
+        sa = torch.rand(4) * 0.05 + 1e-3            # act scales < 1
+        sb = torch.rand(4) * 0.05 + 1e-3
+        qa, ea = torch.frexp(sa.to(torch.float64)); ma = torch.round(qa * (2 ** 16)).to(torch.int32); sha = (16 - ea).to(torch.int32)
+        qb, eb = torch.frexp(sb.to(torch.float64)); mb = torch.round(qb * (2 ** 16)).to(torch.int32); shb = (16 - eb).to(torch.int32)
+        mo, sho = i8._combine_scales_q116(ma, sha, mb, shb)
+        assert int(mo.min()) >= (1 << 15) and int(mo.max()) < (1 << 16), "combined mul out of [2^15,2^16)"
+        prod = (ma.float() * 2.0 ** (-sha.float())) * (mb.float() * 2.0 ** (-shb.float()))
+        got = mo.float() * 2.0 ** (-sho.float())
+        assert float((got - prod).abs().max() / prod.abs().amax()) < 2e-5, "combined scale rel err"
+
+
+def test_qk_intscale_in_range():
+    """scores int64 < 2^62; scaled int32 fits; s_mul in [2^15,2^16); the attn-scale >>3 reduces
+    the score magnitude ~8x so the softmax LUT index stays in range (shifted ~2^17)."""
+    for seed in (0, 1, 2):
+        for sig in (0.5, 2.0, 8.0):
+            _, _, q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_shift = _qk_inputs(sigma=sig, seed=seed)
+            s_int, s_zp, s_mul, s_shift, inter = i8.int8_qk_matmul_intscale(
+                q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_shift,
+                d_head=64, return_intermediates=True)
+            assert int(inter["scores"].abs().max()) < (1 << 62), "scores int64 overflow"
+            assert int(s_int.min()) >= -(2 ** 31) and int(s_int.max()) <= 2 ** 31 - 1, "scaled int32 overflow"
+            assert int(s_mul.min()) >= (1 << 15) and int(s_mul.max()) < (1 << 16), "s_mul out of [2^15,2^16)"
+            assert int((s_zp == 0).all()), "score zp must be 0 (softmax subtract-max cancels it)"
+
+
+def test_qk_intscale_vs_fp_attention():
+    """Int-canonical score (dequant) vs fp Q.K^T/sqrt(d) on the SAME int8-quantized operands: the
+    only error is the attn-scale >>3 round (0.5 LSB) + the combine_scales Q1.16 renorm (~2^-16).
+    rel_err < 1e-3 (a generous regression guard; the real bound is ~2e-5)."""
+    import math
+    worst = 0.0
+    for seed in (0, 1, 2, 3):
+        for sig in (0.5, 2.0, 8.0):
+            _, _, q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_shift = _qk_inputs(sigma=sig, seed=seed)
+            s_int, s_zp, s_mul, s_shift, inter = i8.int8_qk_matmul_intscale(
+                q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_shift,
+                d_head=64, return_intermediates=True)
+            # int path: score_real = scaled_int * s_mul * 2^-s_shift
+            score_int = s_int.to(torch.float64) * s_mul.to(torch.float64) \
+                * (2.0 ** (-s_shift.to(torch.float64)))
+            # fp path: raw = einsum(uq,uk)*q_scale*k_scale ; scaled = raw/sqrt(d)
+            q_scale = q_mul.to(torch.float64) * (2.0 ** (-q_shift.to(torch.float64)))   # [B,H,Tq,1]
+            k_scale = k_mul.to(torch.float64) * (2.0 ** (-k_shift.to(torch.float64)))   # [1,H,1,1]
+            uq = (q_int - q_zp).to(torch.float64)
+            uk = (k_int - k_zp).to(torch.float64)
+            scores_fp = torch.einsum("bhtd,bhud->bhtu", uq, uk) \
+                * q_scale * k_scale / math.sqrt(64)
+            worst = max(worst, i8._rel_err(score_int, scores_fp))
+    assert worst < 1e-3, f"int-canonical Q.K^T rel err {worst} >= 1e-3"
+
+
+def test_qk_intscale_pertoken_not_implemented():
+    """The per-token K scale path (per-row score requant) is the other A8.6 variable; it is not
+    yet implemented. Guard that it raises (so the A8.6 gate cannot run an unvalidated path)."""
+    _, _, q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_shift = _qk_inputs()
+    with pytest.raises(NotImplementedError):
+        i8.int8_qk_matmul_intscale(q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_shift,
+                                   d_head=64, kv_scale="pertoken")

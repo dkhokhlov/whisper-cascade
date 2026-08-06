@@ -1133,6 +1133,111 @@ def int_attn_scale(scores_int: torch.Tensor, score_scale: torch.Tensor, d_head: 
 
 
 # --------------------------------------------------------------------------- #
+# A8 (int-canonical): int8 attention matmuls + int8 KV cache + the chained     #
+# boundary-form decoder -- the zero-fp oracle the ONNX decoder mirrors         #
+# (codex+claude consensus 2026-08-06). The Phase-A Int8Attention is fp at       #
+# Q.K^T and P.V and the KV cache (int8_forward.py:221,270,82-83); only softmax  #
+# + attn-scale are int8. A8 builds the int8 Q.K^T/P.V, the int8 KV cache, the   #
+# residual add, and the chained boundary-form 1-layer decoder, WER-gated       #
+# (BOTH K/V scale granularities) before any decoder ONNX (Phase B).             #
+# --------------------------------------------------------------------------- #
+
+
+def _combine_scales_q116(mul_a, shift_a, mul_b, shift_b):
+    """Product of two Q1.16 fixed-point scales as a single Q1.16 scale, pure-int.
+
+    (mul_a*2^-shift_a)*(mul_b*2^-shift_b) = mul_out*2^-shift_out. mul_a, mul_b in [2^15, 2^16)
+    (Q1.16); the product mantissa M = mul_a*mul_b is in [2^30, 2^32), normalized back to Q1.16
+    via a pure-int bitlen (the CLZ ladder) + round-half-up shift. Returns (mul_out, shift_out)
+    int32, the broadcast shape of the inputs. Used by A8.1 (score scale = q_scale*k_scale) and
+    A8.2 (attn-output scale = p_scale*v_scale) -- the only place two boundary scales multiply.
+    """
+    M = mul_a.to(torch.int64) * mul_b.to(torch.int64)                # product mantissa ~2^32
+    bitlen = _int_bitlen(M)                                          # floor(log2(M))+1, ~31..32
+    norm = (bitlen - 16).clamp(min=0)                                # right-shift to reach Q1.16
+    mul_out = _round_half_up(M, torch.ones_like(M) << norm).to(torch.int32)
+    shift_out = (shift_a.to(torch.int64) + shift_b.to(torch.int64) - norm.to(torch.int64)).to(torch.int32)
+    return mul_out, shift_out
+
+
+def quantize_kv_static_per_head_intscale(k: torch.Tensor):
+    """Static per-(layer,head) SYMMETRIC int8 quant -- the append-only KV cache form (A8.3).
+
+    k [B,H,T,d] -> (k_int [B,H,T,d] int32 in [-127,127], k_mul [1,H,1,1] int32 Q1.16,
+    k_shift [1,H,1,1] int32, k_zp [1,H,1,1] int32 = 0). ONE scale per head from the per-head
+    amax over (B,T,d); zp=0 (symmetric -- K/V projections are near-symmetric). The scale is
+    FIXED, so a new token's K/V quantizes under the SAME scale -> append-only int8 Concat, no
+    past-token requant, bit-exact across iterations. The A7 boundary round (integer scale
+    decides the int8 bin) applies as in quantize_act_per_token_intscale.
+
+    This is the static granularity A8.6 gates; the per-token form (quantize_act_per_token_intscale
+    over d, per [B,H,T,1]) is the other measured variable and needs the per-row score requant.
+    """
+    H = k.shape[1]
+    amax = k.abs().amax(dim=(0, 2, 3)).clamp(min=1e-8)               # [H]
+    scale = amax / 127.0                                            # [H] fp (intermediate)
+    q, exp = torch.frexp(scale.to(torch.float64))                   # scale = q*2^exp, q in [0.5,1)
+    mul = torch.round(q * (2 ** 16)).clamp(0, 2 ** 16 - 1).to(torch.int32)  # Q1.16 [H]
+    shift = (16 - exp).to(torch.int32)                              # [H]
+    scale_int = (mul.to(torch.float64) * 2.0 ** (-shift.to(torch.float64))).clamp(min=1e-12)
+    k_int = torch.round(k / scale_int.view(1, H, 1, 1)).clamp(-127, 127).to(torch.int32)
+    k_mul = mul.view(1, H, 1, 1)
+    k_shift = shift.view(1, H, 1, 1)
+    k_zp = torch.zeros(1, H, 1, 1, dtype=torch.int32)
+    return k_int, k_mul, k_shift, k_zp
+
+
+def int8_qk_matmul_intscale(q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_shift,
+                            d_head=64, kv_scale="static", return_intermediates=False):
+    """Int-canonical int8 Q.K^T + score path (A8.1) -- the zero-fp oracle the ONNX mirrors.
+
+    Q [B,H,Tq,d] int32 (int8-range); q_zp/q_mul/q_shift per [B,H,Tq,1] (per-query-token Q1.16,
+    from quantize_act_per_token_intscale over d). K [B,H,Tk,d] int32; k_zp/k_mul/k_shift:
+      kv_scale="static":  per [1,H,1,1] (one FIXED K scale per head -- the append-only cache
+        form, from quantize_kv_static_per_head_intscale). The score scale is per [B,H,Tq,1] =
+        q_scale*k_static -> feeds int8_softmax_intscale directly, per-row (no score requant).
+      kv_scale="pertoken": per [B,H,Tk,1] (each K token its own scale). The score scale is per
+        [B,H,Tq,Tk] -> a per-row requant of the int32 scores to a common [B,H,Tq,1] scale is
+        REQUIRED before the softmax (codex's caveat); NOT YET implemented (raises -- added
+        before the A8.6 gate).
+
+    scores_int [B,H,Tq,Tk] = sum_d (q_int-q_zp)*(k_int-k_zp)  (int32, int64 accumulator). attn
+    scale 1/sqrt(d_head): for d_head=64 an exact >>3 (round-half-up) on scores_int; the score
+    scale is unchanged (the shift only discards bits below the matmul precision). Output boundary
+    form for int8_softmax_intscale: (s_int [B,H,Tq,Tk] int32, s_zp [B,H,Tq,1]=0, s_mul [B,H,Tq,1]
+    int32 Q1.16, s_shift [B,H,Tq,1] int32). Pure-int throughout (no runtime fp).
+    """
+    import math
+    if kv_scale == "pertoken":
+        raise NotImplementedError("int8_qk_matmul_intscale: kv_scale='pertoken' (per-row score "
+                                 "requant) -- A8 static path first; pertoken added before A8.6.")
+    # centered int operands (int64 so the d-fold sum stays exact before the attn-scale shift)
+    uq = q_int.to(torch.int64) - q_zp.to(torch.int64)                # [B,H,Tq,d]
+    uk = k_int.to(torch.int64) - k_zp.to(torch.int64)               # [B,H,Tk,d]
+    scores = torch.einsum("bhtd,bhud->bhtu", uq, uk)                # [B,H,Tq,Tk] int64
+    # attn scale 1/sqrt(d_head): exact integer shift for a power-of-two perfect square (tiny: 64)
+    s = math.isqrt(d_head)
+    if not (s * s == d_head and (s & (s - 1) == 0)):
+        raise NotImplementedError(f"int8_qk_matmul_intscale: d_head={d_head} not a power-of-two "
+                                 f"perfect square (tiny uses 64); general case = fixed-point mul.")
+    shift = int(math.log2(s))                                       # 3 for d_head=64
+    scaled = _rshift_round(scores, shift).to(torch.int32)           # [B,H,Tq,Tk]
+    # score scale = q_scale*k_scale -> single Q1.16 per [B,H,Tq,1] (k scale broadcast over Tk)
+    s_mul, s_shift = _combine_scales_q116(
+        q_mul.to(torch.int64), q_shift.to(torch.int64),
+        k_mul.to(torch.int64), k_shift.to(torch.int64),
+    )                                                               # [B,H,Tq,1] int32 each
+    s_mul = s_mul.to(torch.int32)
+    s_shift = s_shift.to(torch.int32)
+    s_zp = torch.zeros(*s_mul.shape, dtype=torch.int32)             # [B,H,Tq,1]
+    if return_intermediates:
+        inter = {"uq": uq, "uk": uk, "scores": scores, "scaled": scaled,
+                 "s_mul": s_mul, "s_shift": s_shift, "attn_shift": shift}
+        return scaled, s_zp, s_mul, s_shift, inter
+    return scaled, s_zp, s_mul, s_shift
+
+
+# --------------------------------------------------------------------------- #
 # A1 validation harness                                                        #
 # --------------------------------------------------------------------------- #
 
