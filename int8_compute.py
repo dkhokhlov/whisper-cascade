@@ -324,6 +324,101 @@ def int8_matmul_fixed_point(
 
 
 # --------------------------------------------------------------------------- #
+# Stage 1b: int-canonical output requant (the zero-fp boundary)                #
+# --------------------------------------------------------------------------- #
+
+def _round_half_up(num: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
+    """Round half up (toward +inf at a tie) of num/den, den > 0, all signs.
+
+    floor(num/den + 0.5) = (2*num + den) // (2*den). torch int // is floor division, so this
+    holds for negative num too. This is the canonical int round the ONNX graph emits; it
+    replaces torch.round (half-to-even) at the zero-fp boundary so the reference and the
+    deployed graph agree by construction.
+    """
+    num = num.to(torch.int64)
+    den = den.to(torch.int64).clamp(min=1)
+    return torch.div(2 * num + den, 2 * den, rounding_mode="floor")
+
+
+def int8_output_requant_intscale(
+    acc: torch.Tensor, act_mul: torch.Tensor, act_shift: torch.Tensor,
+    F: int, bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stage 1b int-canonical output requant -- the true zero-fp boundary.
+
+    Takes the per-group matmul accumulator (int64 @ 2^-F) + the Q1.16 input act scale
+    (act_mul, act_shift, [B]) + bias, and produces the int8 output + its Q1.16 scale, ALL
+    in integer (no runtime fp). The next op consumes the result as its activation:
+      (x_int, act_mul, act_shift, x_zp) = (y_int8, y_mul, y_shift, y_zp).
+
+    out_int_scaled[b,o] = acc[b,o]*act_mul[b] + (bias_fixed[o] << act_shift[b])  [int64]
+      bias_fixed[o] = round_half_up(bias[o]*2^F); out_fp = out_int_scaled / 2^(F+act_shift[b]).
+    Per-token output Q1.16 from the EXACT int range (not a float amax):
+      range = rmax - rmin (>=1); e = bit_length(range) - 8 (CLZ; the float64 log2 only needs
+      the power-of-two interval, which is exact even when range > 2^53);
+      mul = round_half_up(range * 2^(16-e) / 255) via int Mul + int Div, normalized to
+      [2^15, 2^16) (the 255-not-2^8 boundary can need one e += 1 adjust);
+      y_shift = (16-e) + F + act_shift.
+      y_zp = round_half_up(-rmin * 2^(16-e) / mul) - 128;
+      y_int8 = clamp(round_half_up(out_int_scaled * 2^(16-e) / mul) + y_zp, -128, 127).
+
+    Returns (y_int8 [B,O] int32, y_mul [B,1] int32, y_shift [B,1] int32, y_zp [B,1] int32).
+
+    Differential vs the A7.1 float32 reference (quantize_act_per_token_intscale(out_fp),
+    half-to-even): ~0.0004% of y_int8 differ by 1 LSB (ties + float32-vs-exact-int range),
+    WER-neutral. The int path rounds the EXACT int (the A7.1 path rounds the float32-rounded
+    out_fp), so the deployed graph is equal-or-better. Inter-op int8 is gated at Phase B
+    Gate 2 (ORT WER == A7.1 torch WER), not here. (codex+claude consensus, 2026-08-05.)
+    """
+    am = act_mul.to(torch.int64).reshape(-1, 1)                       # [B,1]
+    ash = act_shift.to(torch.int64).reshape(-1, 1)                    # [B,1]
+    out_int = acc.to(torch.int64) * am                                 # [B,O] int64 @ 2^-F
+    if bias is not None:
+        bias_fixed = torch.floor(bias.to(torch.float64) * (2.0 ** F) + 0.5).to(torch.int64)
+        out_int = out_int + (bias_fixed.unsqueeze(0) << ash)           # bias in the 2^-(F+ash) domain
+    rmax = out_int.max(dim=-1, keepdim=True).values                    # [B,1]
+    rmin = out_int.min(dim=-1, keepdim=True).values                    # [B,1]
+    R = (rmax - rmin).clamp(min=1)                                    # [B,1] >=1
+
+    # exponent e: bit_length(R) - 8. float64 log2 is exact for the power-of-two interval
+    # even when R > 2^53 (the rounding never crosses a 2^k boundary). Mantissa is computed
+    # from the EXACT int R below, so float64-precision of R itself is irrelevant.
+    bitlen = torch.floor(torch.log2(R.to(torch.float64))).to(torch.int64) + 1
+    e = bitlen - 8                                                    # [B,1]
+    sh = (16 - e)                                                     # [B,1] = 16-e (can be negative)
+
+    def _mul(num_in, sh_in):
+        # mul = round_half_up(num_in * 2^sh_in / 255) ; sh_in may be negative
+        pos = sh_in >= 0
+        num = torch.where(pos, num_in << sh_in.clamp(min=0), num_in)
+        den = torch.where(pos, torch.full_like(sh_in, 255), (255 << (-sh_in).clamp(min=0)))
+        return _round_half_up(num, den)
+
+    mul = _mul(R, sh)                                                 # [B,1] int64
+    # normalize mul to [2^15, 2^16) -- the 255-not-2^8 boundary can need one e += 1 step
+    too_small = mul < (1 << 15)
+    too_big = mul >= (1 << 16)
+    sh = torch.where(too_small, sh + 1, sh)
+    sh = torch.where(too_big, sh - 1, sh)
+    mul = _mul(R, sh)
+
+    # zp = round_half_up(-rmin * 2^sh / mul) - 128  (sh == 16-e)
+    pos = sh >= 0
+    num_z = torch.where(pos, (-rmin) << sh.clamp(min=0), (-rmin).to(torch.int64))
+    den_z = torch.where(pos, mul, mul << (-sh).clamp(min=0))
+    y_zp = (_round_half_up(num_z, den_z) - 128).to(torch.int32)        # [B,1]
+
+    # y_int8 = round_half_up(out_int * 2^sh / mul) + y_zp, clamped
+    num_y = torch.where(pos, out_int << sh.clamp(min=0), out_int)
+    den_y = torch.where(pos, mul, mul << (-sh).clamp(min=0))
+    y_arg = _round_half_up(num_y, den_y)                              # [B,O] int64
+    y_int8 = (y_arg + y_zp.to(torch.int64)).clamp(-128, 127).to(torch.int32)
+
+    y_shift = (sh + F + ash).to(torch.int32)                          # [B,1]
+    return y_int8, mul.to(torch.int32), y_shift, y_zp
+
+
+# --------------------------------------------------------------------------- #
 # A2: int8 LayerNorm (fixed-point mean/var + integer rsqrt + fixed-point g/b)   #
 # --------------------------------------------------------------------------- #
 

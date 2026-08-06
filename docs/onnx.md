@@ -395,3 +395,18 @@ ORT_DISABLE_ALL. New module `export_onnx_int8.py`.
    `tests/test_int8_onnx.py` covers both tiers. **Next: Stage 1b -- the output requant (int8
    out + out scale, the true zero-fp boundary) and the raw + optimized zero-fp audit; then
    LN/GELU/softmax/conv/Loop.**
+
+   Stage 1b reference -- DONE (int8_compute.int8_output_requant_intscale, codex+claude
+   consensus 2026-08-05). The int-canonical output requant: `out_int_scaled[b,o] =
+   acc*act_mul + (bias_fixed<<act_shift)` (int64); per-token Q1.16 from the EXACT int range
+   (`e=bit_length(range)-8`, `mul=round_half_up(range*2^(16-e)/255)` normalized to [2^15,2^16),
+   round-half-up = `(2*num+den)//(2*den)`); outputs `(y_int8, y_mul, y_shift, y_zp)` consumed
+   by the next op. Locks option (A) int-emulated Q1.16 (the canonical oracle, not an fp-frexp
+   approximation); skips pure-power-of-two (B, harsher, needs its own WER gate) and symmetric
+   (C, wastes affine range). Differential vs the A7.1 float32 reference: ~0.0004% of y_int8
+   differ by 1 LSB (ties + float32-vs-exact-int range), WER-neutral -- the int path rounds the
+   exact int, the A7.1 path rounds the float32-rounded out_fp, so the deployed graph is
+   equal-or-better. Inter-op int8 is gated at Phase B Gate 2 (ORT WER == A7.1 torch WER).
+   Validated in `tests/test_int8_compute.py` (self-consistency within one int8 step; 0.0004%
+   differential). The ONNX emission (CLZ ladder + int Mul/Div-by-255 + round-half-up + zp +
+   clamp) is the remaining Stage 1b step.
