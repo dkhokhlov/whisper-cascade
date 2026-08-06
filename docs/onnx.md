@@ -308,3 +308,90 @@ for this legacy transformers). Do not leave `optimum-onnx` or `hqq` unpinned.
 - Compact-runtime-RAM optimization.
 - Any change to the canonical HQQ path (`load_whisper_hqq`, `quantize_whisper`, the three
   published models/cards, the `HQQ_OUT` directories).
+---
+
+# Zero-fp int8-compute ONNX (Phase B, in progress)
+
+The published ONNX above is **fp16-storage / fp32-compute** — host-validation only. The
+deployment HW has **no fp16 and no fp32 unit**, so compute must be **int8** (int8 weights +
+int8 activations, int32/int64 accumulators, zero fp16/fp32 in the graph). This section
+tracks the zero-fp int8-compute export. Work is on the `onnx-8b-compute` branch; the
+storage target is **3-bit** (`build/whisper-tiny-hqq-3bit`): 2-bit is broken (WER 0.77),
+3-bit == 4-bit WER (0.16) at ~half the storage.
+
+## Reference: torch int8-compute (Phase A + A7) — DONE, gated
+
+A torch reference (`int8_compute.py`) mirrors the int8-compute path so WER is validated
+in torch before any ONNX. Each block was staged one family at a time (matmul -> +ln ->
++gelu -> +sm -> +conv), paired vs the same-model fp HQQ baseline, gate +0.02 abs.
+
+- A1 per-group int8 matmul: dequant HQQ W_q -> int8 weight + per-group fixed-point scale
+  (int mul + right-shift); int8 act x int8 weight -> int32 -> per-group fixed-point scale
+  -> int32 bias -> requant. Fractional-bit retention + round-half-up `_rshift_round`;
+  requant in int64 (int32 x 2^31 overflows).
+- A2 int8 layernorm: fixed-point mean/var (Q16) + int rsqrt (Newton, Q20) + fixed-point
+  gamma/beta (Q15). x_scale cancels in normalization (eps' = eps/x_scale^2).
+- A3 int8 GELU: `x*Phi(x)` via an exact normal-CDF LUT (4096 entries Q16 over [-6,6]); Phi
+  saturates outside so `x*LUT` keeps the tail exact. (The sigmoid(1.702x) approximation
+  BROKE the staged gate; the exact-Phi LUT fixed it. The fix was the LUT content, not
+  resolution.)
+- A4 int8 softmax: subtract-max + exp LUT (Q15) + int reciprocal (Newton) + requant.
+- A5 int8 conv: per-BATCH act quant (per-token not factorable across the conv window);
+  per-channel int8 weight; int32 window matmul; conv2 stride 2. Integer attention scale
+  1/sqrt(64) = 1/8 = exact >>3.
+- A6 full int8-compute forward, staged + n=100 gate (fp act scale): fp 0.1542, int8 0.1495,
+  delta -0.0047, 56/100 identical, bootstrap 95% CI [-0.0141, +0.004] -- upper bound
+  +0.004 << +0.02. Phase A complete.
+- **A7 integer-state reference + WER gate** (consensus-inserted before Phase B; codex+claude
+  review). Phase A used RUNTIME fp per-token act scales; the zero-fp ONNX must use INTEGER
+  act scales. A7 gates the fp->int act-scale conversion. Q1.16 fixed-point act scale (int64-
+  overflow bound, not precision, sets Q; 2^-16 << int8's 2^-7 -> ~lossless). The boundary
+  round uses the INTEGER scale (else A7 is optimistic vs the deployed graph's integer
+  requant). The matmul dequant applies the int scale as int Mul + power-of-two shift,
+  dequant without integer rounding loss (the round lives at the next op's input quant -- one
+  round per boundary, matching ONNX). Firm n=100 gate (3-bit, int-act): fp 0.1542, int8
+  0.1542, delta 0.0000, 55/100 identical, CI [-0.0091, +0.0106] -- upper bound +0.0106 <<
+  +0.02. The int-act path is WER-equivalent to both the fp-act int8 path and the fp HQQ
+  baseline. Remaining A7 items are NOT new WER gates: gamma/beta/bias are export-time
+  fp->int bakes (low-risk, validated for weight scale in A1); the int KV cache reuses the
+  same per-token act-quant pattern gated here (gate under Phase B Gate 2).
+
+## Phase B emission — in progress (Q6 minimal-linear first)
+
+Design (codex+claude consensus): per-group int8 matmul as standard ONNX int ops -- batched
+`MatMulInteger` with G as the batch dim (mirror the reference `einsum("ogi,bgi->bog")`);
+flatten-then-scale is impossible (the I contraction is inside MatMulInteger; the group axis
+is gone before the per-group scale applies). Do NOT use MatMulInteger's scalar zero_point
+(ORT 1.19.2 accepts only a SCALAR b_zp; HQQ zero is per-(o,g)) -- pass zp=0, emit the
+`-x_zp*B` / `zero*(C-x_zp*D)` corrections explicitly. Requant in int64. 8-bit weights bake
+to int8 (`w = qr - 128`) with a `+128*C` correction: ORT 1.19.2 implements batched
+MatMulInteger only when BOTH inputs share a dtype (int8/uint8 is NOT_IMPLEMENTED), and
+activations are int8, so the uint8 levels 0..255 cannot feed MatMulInteger directly. Nonlinear ops as int subgraphs (LUTs as
+int initializers; avoid DynamicQuantizeLinear/QLinearMatMul/QLinearSoftmax/Round/standard
+Conv/signed BitShift). int KV cache as loop-carried vars. Recursive zero-fp audit incl the
+ORT-optimized artifact (ORT can inject fp Casts/fuse LN at load); validate under
+ORT_DISABLE_ALL. New module `export_onnx_int8.py`.
+
+**Build order (de-risk, do NOT build the merged-decoder Loop first):**
+1. Q6 minimal ONNX of ONE real HQQ linear: packed W_q -> unpack -> batched MatMulInteger
+   -> zp correction -> int per-group fixed-point -> int bias -> requant. Compare EVERY
+   intermediate vs the torch int reference. Test batch 1&2, negatives, uint8 weights,
+   extreme zps, all shift directions. onnx.checker + ORT CPU + raw zero-fp audit + optimized
+   zero-fp audit. **Status: Stage 1a VERIFIED bit-exact (2026-08-05).** The 3-bit k_proj
+   (`decoder.layers.0.self_attn.k_proj`, packing `3bit_32`, W_q int32 [461,32]) built by hand
+   with `onnx.helper` (opset 18, ORT 1.19.2): 3-bit unpack via Div/Mod (W_q>=0); batched-over-G
+   `MatMulInteger` (A=[G,B,gs] int8, B=[G,gs,O] int8 -> [G,B,O] -> [B,O,G]); the four terms
+   A/Bt/C/D; the `-x_zp*B` / `zero*(C-x_zp*D)` zp corrections (zp=0 in MatMulInteger; HQQ zero
+   is per-(o,g)); the int per-group fixed-point scale (precomputed int64 `half`/`p`
+   initializers + Div/Mod signed-floor + round-half-up via `q - (neg & rem!=0)`); int act scale
+   (Q1.16) as int Mul + power-of-two shift, dequant to fp (Stage 1a reference interface).
+   **Every int intermediate is BIT-EXACT vs the torch `int8_matmul_fixed_point` int-act path**
+   (qr_g, A, Bt, C, T1, T2, p1, p2, acc; 24..147456 elems). The fp output matches within
+   float32 noise (rel ~1e-8). Robustness: B=1/2/3, all-positive (zp near -128), all-negative
+   (zp near 127), extreme magnitudes -- `acc` bit-exact in every case. The signed rshift_round
+   emulation is bit-exact incl the s=0 edge. The **8-bit path** (encoder+fc1 tier, packing
+   `8bit_u8`) is also bit-exact: weights bake to int8 (`qr-128`) with a `+128*C` correction
+   (ORT 1.19.2 batched MatMulInteger needs matching dtypes; int8/uint8 is NOT_IMPLEMENTED).
+   `tests/test_int8_onnx.py` covers both tiers. **Next: Stage 1b -- the output requant (int8
+   out + out scale, the true zero-fp boundary) and the raw + optimized zero-fp audit; then
+   LN/GELU/softmax/conv/Loop.**
