@@ -508,6 +508,37 @@ ORT_DISABLE_ALL. New module `export_onnx_int8.py`.
    vs fp softmax is 1.0e-3 (the exp LUT nearest-neighbor grid spacing L/T = 0.003 -> ~0.5 grid;
    the int reciprocal is 5e-6); post-requant is the int8 output step (WER-neutral, A4 staged gate
    already passed at +softmax). `tests/test_int8_onnx.py` now has 46 tests;
-   `tests/test_int8_compute.py` has 15. **Next: the remaining Q6 sub-modules -- one ConvInteger,
-   one If, one Loop with int loop-carried cache (each bit-exact vs a pure-int reference +
-   raw/optimized audit); then 1-layer decoder -> full encoder + merged-decoder.**
+   `tests/test_int8_compute.py` has 15.
+
+   **Q6 int-canonical Conv1d ONNX emission -- VERIFIED BIT-EXACT (2026-08-06).**
+   `build_int8_conv1d_onnx` (`export_onnx_int8.py`) mirrors `int8_conv1d_intscale`
+   bit-exactly: Conv1d via ConvInteger UINT8 (ORT 1.19.2 has NO int8 ConvInteger CPU
+   kernel; uint8 works -- x_u8 = x_int+128, w_u8 = w_int+128, x_zp_u8 = w_zp_u8 = 128 ->
+   sum (x_u8-128)*(w_u8-128) = sum x_int*w_int = acc0). The per-BATCH Q1.16 act scale
+   (`quantize_act_per_batch_intscale`) is the conv-window-factorable choice (per-token is
+   NOT factorable across the kernel window; A5). Per-channel Q0.15 weight scale
+   (`fixed_point_per_group` now Q-parameterized: Q=15 for conv, Q=31 default for linear) --
+   Q0.15 not Q0.31 because the conv accumulates the FULL int32 acc BEFORE the scale
+   (mul_w ~2^15 * acc <=2^31 * x_mul ~2^16 <= 2^62 < 2^63; Q0.31 would hit 2^78); Q0.15 is
+   2^8 finer than the int8 weight quant, WER-neutral. ConvInteger pads with 0 (-> x_int=-128
+   at pad) which does NOT match the reference's pad-centered-with-0 (-> x_int=x_zp at pad,
+   contributing 0), so the pad is applied manually: Concat x_u8 with a per-batch (x_zp+128)
+   column on each side (the [B,1,1]->[B,in,1] broadcast is in INT32 -- Mul with ones_i32 then
+   Cast to uint8; ORT 1.19.2 has no uint8 Mul kernel), then ConvInteger runs VALID. The
+   per-batch zp correction acc = acc0 - x_zp*w_sum (int32, bit-identical to the reference's
+   pre-matmul centering) cancels the pad column at every position (interior + edge both
+   reduce to sum (x_int-x_zp)*w_int). Pre-folded int bias (BitShift LEFT on uint64; the
+   requant's per-feature bias path assumes [1,O] but conv bias is per-channel [out]),
+   flatten [B,out,T_out]->[B*out,T_out], expand x_shift via Tile, shared per-(b,o) requant.
+   Output is the FLAT [B*out,T_out] / [B*out,1] form (the conv->encoder transpose is an
+   assembly step); T is baked, B symbolic. Verified bit-exact vs the torch reference on real
+   whisper-tiny conv1 (stride 1, T_out=3000) and conv2 (stride 2, T_out=1500) weights: acc0
+   (raw ConvInteger, reconstructed as acc + x_zp*w_sum), acc, acc_w (Q0.15 rshift_round),
+   acc_wb (pre-folded bias) AND the four int8 outputs all match. Zero-fp audit passes raw +
+   ORT-optimized for both convs. Self-consistency (re-dequant == acc_real_w*x_scale + bias
+   within one int8 step) holds; vs fp Conv1d the global rel_err is ~1.2% (conv1) / ~3.2%
+   (conv2) -- the per-batch int8 act quant + per-channel int8 weight quant budget, WER-neutral
+   (A5 staged gate already passed at +conv). `tests/test_int8_onnx.py` now has 54 tests;
+   `tests/test_int8_compute.py` has 18. **Next: the remaining Q6 sub-modules -- one If, one
+   Loop with int loop-carried cache (each bit-exact vs a pure-int reference + raw/optimized
+   audit); then 1-layer decoder -> full encoder (4 layers) + merged-decoder.**
