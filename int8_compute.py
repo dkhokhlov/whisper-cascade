@@ -272,7 +272,8 @@ def int8_matmul_fixed_point(
     qr: torch.Tensor, zero: torch.Tensor, scale: torch.Tensor,
     bias: torch.Tensor | None, group_size: int,
     act_mul: torch.Tensor | None = None, act_shift: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_intermediates: bool = False,
+):
     """Stage 4: per-group fp scale AND fp zero as fixed-point, with fractional-bit retention.
 
     A true zero-fp graph needs both scale and zero as int. The per-group prod terms cancel
@@ -286,6 +287,12 @@ def int8_matmul_fixed_point(
     out[b,o] = x_scale[b] * rshift_round( sum_g [ p1 - p2 ], F ) + bias
       p1[o,g,b] = rshift_round( T1 * mul_scale, sh_scale - F )    # T1 = A - x_zp*B  (int32)
       p2[o,g,b] = rshift_round( T2 * mul_zero,  sh_zero  - F )    # T2 = C - x_zp*D  (int32)
+
+    return_intermediates=True returns (acc, F) -- the int64 accumulator @ 2^-F (PRE-bias) and
+    the common fractional bits -- so the int-canonical chained linear (int8_linear_intscale)
+    can feed them to int8_output_requant_intscale(acc, act_mul, act_shift, F, bias) and produce
+    the boundary-form output (the bias is applied in the requant, not here). Default False keeps
+    the A6/A7 fp-output behavior (existing callers unaffected).
     """
     A, Bt, C, D = _per_group_int_terms(x_int, qr, group_size)        # int32
     O, I = qr.shape
@@ -313,6 +320,8 @@ def int8_matmul_fixed_point(
     p1 = _rshift_round(T1 * mul_s.unsqueeze(0).to(torch.int64), sh1)  # [B,O,G] int64 @ 2^-F
     p2 = _rshift_round(T2 * mul_z.unsqueeze(0).to(torch.int64), sh2)  # [B,1,G] int64 @ 2^-F
     acc = (p1 - p2).sum(dim=-1).to(torch.int64)                      # [B,O] int64 @ 2^-F
+    if return_intermediates:
+        return acc, F                                                # pre-bias; requant applies bias
     if act_mul is not None:
         # A7 integer activation scale: out_real = acc * act_mul * 2^-(F + act_shift).
         # The act scale is applied as an int Mul (acc * am, both int) against the
@@ -1351,6 +1360,32 @@ def int8_residual_add_intscale(a_int, a_zp, a_mul, a_shift, b_int, b_zp, b_mul, 
     if return_intermediates:
         inter = {"F": F, "acc_a": acc_a, "acc_b": acc_b, "acc": acc}
         return y_int8, y_mul, y_shift, y_zp, inter
+    return y_int8, y_mul, y_shift, y_zp
+
+
+def int8_linear_intscale(x_int, x_zp, x_mul, x_shift, qr, zero, scale, bias, group_size,
+                        return_intermediates=False):
+    """Int-canonical int8 Linear (A8.5) -- the chained linear: boundary-form in -> boundary-form
+    out, pure-int. Composes the DONE int8 matmul block (int8_matmul_fixed_point, returning the
+    int acc @ 2^-F + F pre-bias) with the shared Stage 1b requant (int8_output_requant_intscale,
+    applying the input Q1.16 act scale + the baked bias). The output (y_int8, y_mul, y_shift,
+    y_zp) is the next op's activation -- NO fp dequant/re-quant between blocks (the form the ONNX
+    decoder chain mirrors). This is the chain's first link; q/k/v/out_proj/fc1/fc2 all use it.
+
+    x_int [B,I] int32 (int8-range); x_zp/x_mul/x_shift [B,1] (per-token Q1.16, the previous op's
+    boundary output). qr [O,I] int32 (HQQ levels); zero/scale [N,1] flat fp (baked to fixed-point
+    inside int8_matmul_fixed_point); bias [O] fp (baked in the requant). Returns (y_int8 [B,O]
+    int32, y_mul [B,1] int32 Q1.16, y_shift [B,1] int32, y_zp [B,1] int32). Pure-int throughout.
+    """
+    acc, F = int8_matmul_fixed_point(
+        x_int, None, x_zp, qr, zero, scale, None, group_size,
+        act_mul=x_mul, act_shift=x_shift, return_intermediates=True,
+    )                                                                # acc [B,O] @ 2^-F, pre-bias
+    y_int8, y_mul, y_shift, y_zp = int8_output_requant_intscale(
+        acc, x_mul.to(torch.int32), x_shift.to(torch.int32), F, bias,
+    )
+    if return_intermediates:
+        return y_int8, y_mul, y_shift, y_zp, {"acc": acc, "F": F}
     return y_int8, y_mul, y_shift, y_zp
 
 

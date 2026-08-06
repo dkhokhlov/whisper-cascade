@@ -654,3 +654,61 @@ def test_residual_add_intscale_vs_fp():
         b_real = (b_int - b_zp).to(torch.float64) * b_mul.to(torch.float64) * (2.0 ** (-b_shift.to(torch.float64)))
         worst = max(worst, i8._rel_err(recon, a_real + b_real))
     assert worst < 0.02, f"int-canonical residual rel err {worst} >= 2%"
+
+
+# --------------------------------------------------------------------------- #
+# A8.5a (int-canonical): int8_linear_intscale -- the chained linear              #
+# (boundary-form in -> boundary-form out, pure-int). Composes the DONE int8     #
+# matmul block (int8_matmul_fixed_point -> acc @ 2^-F + F) with the shared       #
+# Stage 1b requant (int8_output_requant_intscale + the input Q1.16 act scale +  #
+# baked bias). The output is the next op's activation -- no fp between blocks.    #
+# --------------------------------------------------------------------------- #
+
+def _linear_params(mod):
+    O, I = (int(s) for s in mod.meta["shape"]); g = int(mod.meta["group_size"])
+    qr = i8.unpack_levels(mod.W_q, int(mod.meta["nbits"]), mod.meta["packing"], (O, I), g, 1).to(torch.int32)
+    zero = mod.meta["zero"].to(torch.float32).reshape(-1, 1)
+    scale = mod.meta["scale"].to(torch.float32).reshape(-1, 1)
+    return qr, zero, scale, mod.bias, g, O, I
+
+
+def test_linear_intscale_self_consistent():
+    """Re-dequant of (y_int8,y_mul,y_shift,y_zp) == the A7 fp matmul output (int8_matmul_fixed_point
+    with the int act scale + bias) within one int8 step -- the chained linear's boundary output is
+    the Stage 1b requant of the SAME acc. Real whisper-tiny HQQ weights."""
+    torch.manual_seed(0)
+    for _name, mod in _first_layers(4):
+        qr, zero, scale, bias, g, O, I = _linear_params(mod)
+        x = torch.randn(8, I) * 2.0
+        xi, am, sh, xz = i8.quantize_act_per_token_intscale(x)
+        y, ym, ys, yzp = i8.int8_linear_intscale(xi, xz, am, sh, qr, zero, scale, bias, g)
+        out_fp = i8.int8_matmul_fixed_point(xi, None, xz, qr, zero, scale, bias, g,
+                                           act_mul=am, act_shift=sh)
+        scale_o = ym.to(torch.float64).reshape(-1, 1) * (2.0 ** (-ys.to(torch.float64).reshape(-1, 1)))
+        recon = (y.to(torch.float64) - yzp.to(torch.float64).reshape(-1, 1)) * scale_o
+        step = (out_fp.amax(-1, keepdim=True).to(torch.float64)
+                - out_fp.amin(-1, keepdim=True).to(torch.float64)) / 255.0
+        err = (recon - out_fp.to(torch.float64)).abs()
+        assert bool((err < step + 1e-6).all()), \
+            f"{_name}: linear self-consistency err {err.max().item()} >= step {step.max().item()}"
+
+
+def test_linear_intscale_differential_vs_a71():
+    """y_int8 vs the A7.1 float32 reference (quantize_act_per_token_intscale(out_fp)) <= 0.1%
+    differ by 1 LSB (ties) -- the Stage 1b differential (already gated), since int8_linear_intscale
+    reuses the SAME shared int8_output_requant_intscale."""
+    torch.manual_seed(0)
+    tot_y = tot_n = 0
+    worst = 0
+    for _name, mod in _first_layers(4):
+        qr, zero, scale, bias, g, O, I = _linear_params(mod)
+        x = torch.randn(8, I) * 2.0
+        xi, am, sh, xz = i8.quantize_act_per_token_intscale(x)
+        y, _, _, _ = i8.int8_linear_intscale(xi, xz, am, sh, qr, zero, scale, bias, g)
+        out_fp = i8.int8_matmul_fixed_point(xi, None, xz, qr, zero, scale, bias, g,
+                                           act_mul=am, act_shift=sh)
+        y_ref, _, _, _ = i8.quantize_act_per_token_intscale(out_fp)
+        tot_y += int((y != y_ref).sum()); tot_n += y.numel()
+        worst = max(worst, int((y - y_ref).abs().max()))
+    assert tot_y / tot_n < 1e-3, f"linear y_int8 mismatch rate {tot_y/tot_n} > 0.1%"
+    assert worst <= 1, f"linear y_int8 worst |d| {worst} > 1 LSB"
