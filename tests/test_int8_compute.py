@@ -482,3 +482,72 @@ def test_qk_intscale_pertoken_not_implemented():
     with pytest.raises(NotImplementedError):
         i8.int8_qk_matmul_intscale(q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_shift,
                                    d_head=64, kv_scale="pertoken")
+
+
+# --------------------------------------------------------------------------- #
+# A8.2 (int-canonical): int8 P.V (int8_pv_matmul_intscale) -- the zero-fp        #
+# attention-output oracle the ONNX decoder mirrors. P (softmax boundary form) #
+# x V (static per-head) -> int32 attn, scale = p_scale*v_scale combined to     #
+# Q1.16, output requant via the shared Stage 1b (fresh per-row scale for       #
+# out_proj). Pure-int throughout.                                               #
+# --------------------------------------------------------------------------- #
+
+def _pv_inputs(B=2, H=6, Tq=8, Tk=64, d=64, sigma=2.0, seed=0):
+    torch.manual_seed(seed)
+    logits = torch.randn(B, H, Tq, Tk) * sigma
+    probs = torch.softmax(logits, dim=-1)                          # [B,H,Tq,Tk] in [0,1]
+    p_int, p_mul, p_shift, p_zp = i8.quantize_act_per_token_intscale(probs)   # [B,H,Tq,1]
+    v = torch.randn(B, H, Tk, d) * sigma
+    v_int, v_mul, v_shift, v_zp = i8.quantize_kv_static_per_head_intscale(v)  # [1,H,1,1]
+    return p_int, p_zp, p_mul, p_shift, v_int, v_zp, v_mul, v_shift, d
+
+
+def test_pv_intscale_in_range():
+    """attn int64 < 2^62; y_mul in [2^15,2^16); the flatten/reshape round-trips the shape."""
+    for seed in (0, 1, 2):
+        for sig in (0.5, 2.0, 8.0):
+            p_int, p_zp, p_mul, p_shift, v_int, v_zp, v_mul, v_shift, d = _pv_inputs(sigma=sig, seed=seed)
+            B, H, Tq, Tk = p_int.shape
+            y_int8, y_mul, y_shift, y_zp, inter = i8.int8_pv_matmul_intscale(
+                p_int, p_zp, p_mul, p_shift, v_int, v_zp, v_mul, v_shift, return_intermediates=True)
+            assert y_int8.shape == (B, H, Tq, d), "P.V output shape"
+            assert int(inter["attn"].abs().max()) < (1 << 62), "attn int64 overflow"
+            assert int(y_int8.min()) >= -128 and int(y_int8.max()) <= 127, "y_int8 out of int8"
+            assert int(y_mul.min()) >= (1 << 15) and int(y_mul.max()) < (1 << 16), "y_mul out of [2^15,2^16)"
+
+
+def test_pv_intscale_self_consistent():
+    """Re-dequant of (y_int8,y_mul,y_shift,y_zp) matches the pre-requant attn output
+    (attn_int * out_mul * 2^-out_shift) within one int8 step (per-(B,H,Tq) row step)."""
+    for seed in (0, 1, 2):
+        p_int, p_zp, p_mul, p_shift, v_int, v_zp, v_mul, v_shift, d = _pv_inputs(seed=seed)
+        y_int8, y_mul, y_shift, y_zp, inter = i8.int8_pv_matmul_intscale(
+            p_int, p_zp, p_mul, p_shift, v_int, v_zp, v_mul, v_shift, return_intermediates=True)
+        scale = y_mul.to(torch.float64) * (2.0 ** (-y_shift.to(torch.float64)))      # [B,H,Tq,1]
+        recon = (y_int8.to(torch.float64) - y_zp.to(torch.float64)) * scale          # [B,H,Tq,d]
+        pre = inter["attn"].to(torch.float64) * inter["out_mul"].to(torch.float64) \
+            * (2.0 ** (-inter["out_shift"].to(torch.float64)))                        # [B,H,Tq,d]
+        step = (pre.amax(-1, keepdim=True) - pre.amin(-1, keepdim=True)) / 255.0
+        err = (recon - pre).abs()
+        assert bool((err < step + 1e-6).all()), \
+            f"P.V self-consistency err {err.max().item()} >= step {step.max().item()}"
+
+
+def test_pv_intscale_vs_fp_attention():
+    """Int-canonical P.V output (dequant) vs fp P.V on the SAME int8-quantized operands: the
+    P per-token int8 + V static-per-head int8 + the output requant. rel_err < 5% (the P/V int8
+    quant budget; the A8 staged WER gate measures the real cost)."""
+    worst = 0.0
+    for seed in (0, 1, 2, 3):
+        p_int, p_zp, p_mul, p_shift, v_int, v_zp, v_mul, v_shift, d = _pv_inputs(sigma=2.0, seed=seed)
+        y_int8, y_mul, y_shift, y_zp = i8.int8_pv_matmul_intscale(
+            p_int, p_zp, p_mul, p_shift, v_int, v_zp, v_mul, v_shift)
+        scale = y_mul.to(torch.float64) * (2.0 ** (-y_shift.to(torch.float64)))
+        recon = (y_int8.to(torch.float64) - y_zp.to(torch.float64)) * scale
+        p_scale = p_mul.to(torch.float64) * (2.0 ** (-p_shift.to(torch.float64)))   # [B,H,Tq,1]
+        v_scale = v_mul.to(torch.float64) * (2.0 ** (-v_shift.to(torch.float64)))   # [1,H,1,1]
+        up = (p_int - p_zp).to(torch.float64)
+        uv = (v_int - v_zp).to(torch.float64)
+        attn_fp = torch.einsum("bhtu,bhud->bhtd", up, uv) * p_scale * v_scale
+        worst = max(worst, i8._rel_err(recon, attn_fp))
+    assert worst < 0.05, f"int-canonical P.V rel err {worst} >= 5%"

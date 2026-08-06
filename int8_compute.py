@@ -1237,6 +1237,49 @@ def int8_qk_matmul_intscale(q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_s
     return scaled, s_zp, s_mul, s_shift
 
 
+def int8_pv_matmul_intscale(p_int, p_zp, p_mul, p_shift, v_int, v_zp, v_mul, v_shift,
+                            return_intermediates=False):
+    """Int-canonical int8 P.V (A8.2) -- the zero-fp oracle the ONNX mirrors.
+
+    P [B,H,Tq,Tk] int32 (int8-range, the int8_softmax_intscale output boundary form);
+    p_zp/p_mul/p_shift per [B,H,Tq,1] (per-query-token Q1.16). V [B,H,Tk,d] int32 (int8-range,
+    static per-head symmetric, v_zp=0; v_mul/v_shift per [1,H,1,1], the same granularity as K).
+    attn_int [B,H,Tq,d] = sum_tk (p_int-p_zp)*(v_int-v_zp)  (int64 accumulator). The attn-output
+    scale = p_scale*v_scale combined to a single Q1.16 per [B,H,Tq,1] (v scale broadcast over Tk).
+    Output boundary form via int8_output_requant_intscale (the shared Stage 1b), flattened
+    [B,H,Tq,d]->[B*H*Tq,d] (row b*H*Tq+tq); act_mul=combined scale, F=0, bias=None. The output
+    gets a fresh per-row scale for the next op (out_proj), which consumes it as its activation.
+
+    Returns (y_int8 [B,H,Tq,d] int32, y_mul [B,H,Tq,1] int32, y_shift [B,H,Tq,1] int32,
+    y_zp [B,H,Tq,1] int32). Pure-int throughout (no runtime fp).
+    """
+    B, H, Tq, Tk = p_int.shape
+    d = v_int.shape[-1]
+    up = p_int.to(torch.int64) - p_zp.to(torch.int64)               # [B,H,Tq,Tk]
+    uv = v_int.to(torch.int64) - v_zp.to(torch.int64)               # [B,H,Tk,d]
+    attn = torch.einsum("bhtu,bhud->bhtd", up, uv)                  # [B,H,Tq,d] int64
+    # attn-output scale = p_scale*v_scale -> single Q1.16 per [B,H,Tq,1]
+    out_mul, out_shift = _combine_scales_q116(
+        p_mul.to(torch.int64), p_shift.to(torch.int64),
+        v_mul.to(torch.int64), v_shift.to(torch.int64),
+    )                                                               # [B,H,Tq,1] int32 each
+    # flatten -> shared per-row requant (F=0, no bias); reshape back to [B,H,Tq,*]
+    attn_flat = attn.reshape(B * H * Tq, d)
+    out_mul_flat = out_mul.to(torch.int32).reshape(B * H * Tq, 1)
+    out_shift_flat = out_shift.to(torch.int32).reshape(B * H * Tq, 1)
+    y_int8_flat, y_mul_flat, y_shift_flat, y_zp_flat = int8_output_requant_intscale(
+        attn_flat, out_mul_flat, out_shift_flat, 0, None)
+    y_int8 = y_int8_flat.reshape(B, H, Tq, d)
+    y_mul = y_mul_flat.reshape(B, H, Tq, 1).to(torch.int32)
+    y_shift = y_shift_flat.reshape(B, H, Tq, 1).to(torch.int32)
+    y_zp = y_zp_flat.reshape(B, H, Tq, 1).to(torch.int32)
+    if return_intermediates:
+        inter = {"up": up, "uv": uv, "attn": attn,
+                 "out_mul": out_mul.to(torch.int32), "out_shift": out_shift.to(torch.int32)}
+        return y_int8, y_mul, y_shift, y_zp, inter
+    return y_int8, y_mul, y_shift, y_zp
+
+
 # --------------------------------------------------------------------------- #
 # A1 validation harness                                                        #
 # --------------------------------------------------------------------------- #
