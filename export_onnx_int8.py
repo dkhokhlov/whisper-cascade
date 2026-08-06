@@ -11,9 +11,18 @@ Stage 1a (this module): one int8-compute LINEAR -- int inputs (x_int8, x_zp, act
 act_shift) -> fp output (the A7.1 reference dequant). Every int intermediate (unpack, the four
 MatMulInteger terms A/Bt/C/D, the zp corrections T1/T2, the signed fixed-point rshift_round
 p1/p2, the accumulator) is BIT-EXACT vs int8_compute.int8_matmul_fixed_point (int-act path),
-verified in tests/test_int8_onnx.py on a real 3-bit k_proj. Stage 1b (output requant to int8 +
-int output scale, the true zero-fp boundary) is the next step; the design is being settled
-with codex+claude review.
+verified in tests/test_int8_onnx.py on a real 3-bit k_proj.
+
+Stage 1b (this module, emit_output_requant=True): the same linear emits the int-canonical
+output requant (the true zero-fp boundary) -> (y_int8, y_mul, y_shift, y_zp), all integer.
+Mirrors int8_compute.int8_output_requant_intscale bit-exactly: out_int = acc*act_mul +
+(bias_fixed << act_shift); R = rmax-rmin clamped to [1, 2^62); e = bit_length(R)-8 via a CLZ
+ladder (no CLZ/log2-int in ONNX); mul = round_half_up(R*2^sh/255) normalized to [2^15,2^16);
+zp = round_half_up(-rmin*2^sh/mul)-128; y_int8 = clamp(round_half_up(out_int*2^sh/mul)+zp).
+Round-half-up = floor((2*num+den)/(2*den)) with a signed-floor correction (ONNX Div truncates
+toward 0). Bit-exact vs the reference across 3-bit + 8-bit layers, batch 1/2/3, extremes
+(all-positive, all-negative, large magnitude). The remaining Q6 sub-modules (LN, exact-Phi
+GELU LUT, softmax, ConvInteger, Loop) and the full recursive zero-fp audit are next.
 
 Key ONNX facts (opset 18, ORT 1.19.2) learned and encoded here:
   * 3-bit/2-bit unpack via Div/Mod (W_q >= 0 so floor == trunc); BitShift is unsigned-only.
@@ -75,8 +84,12 @@ class _Builder:
         self.inits = []
         self.nodes = []
         self._n = 0
+        self._seen = set()
 
     def init(self, name, arr, dtype):
+        if name in self._seen:
+            return name
+        self._seen.add(name)
         arr = np.asarray(arr)
         self.inits.append(helper.make_tensor(name, dtype, arr.shape, arr.flatten().tolist()))
         return name
@@ -159,7 +172,170 @@ def _rshift_round(b, v, mul, half, p, tag):
     return f"{tag}_out"
 
 
-def build_int8_linear_onnx(hqq_linear, model_name="int8_linear", emit_intermediates=True):
+def _rhu(b, num, den, tag):
+    """Integer round-half-up of num/den = floor((2*num+den)/(2*den)) with signed-floor
+    correction. ONNX Div truncates toward 0 (ceil for negatives); subtract 1 when the
+    numerator is negative and the remainder is nonzero -> floor = round-half-up. Mirrors
+    int8_compute._round_half_up exactly. All arithmetic in int64."""
+    b.init("c2_i64", np.array([2], dtype=np.int64), INT64)
+    b.init("zero_i64", np.array([0], dtype=np.int64), INT64)
+    a = b.node("Mul", [num, "c2_i64"], [f"{tag}_2n"], f"{tag}_2n")           # 2*num
+    a = b.node("Add", [a, den], [f"{tag}_a"], f"{tag}_a")                    # 2*num+den
+    p = b.node("Mul", [den, "c2_i64"], [f"{tag}_p"], f"{tag}_p")             # 2*den
+    q = b.node("Div", [a, p], [f"{tag}_q"], f"{tag}_div")
+    r = b.node("Mod", [a, p], [f"{tag}_r"], f"{tag}_mod")
+    neg = b.node("Less", [a, "zero_i64"], [f"{tag}_neg"], f"{tag}_less")
+    eq = b.node("Equal", [r, "zero_i64"], [f"{tag}_eq"], f"{tag}_eq")
+    nz = b.node("Not", [eq], [f"{tag}_nz"], f"{tag}_nz")
+    cb = b.node("And", [neg, nz], [f"{tag}_cb"], f"{tag}_and")
+    corr = b.node("Cast", [cb], [f"{tag}_c"], f"{tag}_cast", to=INT64)
+    return b.node("Sub", [q, corr], [f"{tag}_out"], f"{tag}_sub")
+
+
+def _clz_ladder(b, R):
+    """floor(log2(R)) + 1 = bit-length, via a binary-search CLZ ladder (no CLZ/log2-int in
+    ONNX). R is int64 [*,1], 1 <= R < 2^62 (the cap62 guard). Returns the int64 bit-length.
+    Thresholds are built as uint64 BitShift(1, k) then cast to int64 for the < comparison;
+    the largest threshold reached is 2^62 (R < 2^62 by cap, so the 2^63 step is never taken,
+    avoiding the int64-overflow cast of 2^63)."""
+    b.init("zero_i64", np.array([0], dtype=np.int64), INT64)
+    b.init("one_u64", np.array([1], dtype=np.uint64), UINT64)
+    b.init("one_i64", np.array([1], dtype=np.int64), INT64)
+    b.init("k32_i64", np.array([32], dtype=np.int64), INT64)
+    b.init("k32_u64", np.array([32], dtype=np.uint64), UINT64)
+    for k in (16, 8, 4, 2, 1):
+        b.init(f"k{k}_i64", np.array([k], dtype=np.int64), INT64)
+        b.init(f"k{k}_u64", np.array([k], dtype=np.uint64), UINT64)
+    # level 1: 2^32. R < 2^32 -> bitlen < 33 (base 0); else base 32.
+    t = b.node("BitShift", ["one_u64", "k32_u64"], ["clz_t1u"], "clz_t1u", direction="LEFT")
+    t = b.node("Cast", [t], ["clz_tA"], "clz_tA", to=INT64)
+    lt = b.node("Less", [R, t], ["clz_ltA"], "clz_ltA")
+    ge = b.node("Not", [lt], ["clz_geA"], "clz_geA")
+    b0 = b.node("Where", [ge, "k32_i64", "zero_i64"], ["clz_bbase"], "clz_bbase")
+    bcur = "clz_bbase"
+    for lvl, k in enumerate([16, 8, 4, 2, 1]):
+        bk = b.node("Add", [bcur, f"k{k}_i64"], [f"clz_bk{lvl}"], f"clz_bk{lvl}")
+        bku = b.node("Cast", [bk], [f"clz_bku{lvl}"], f"clz_bku{lvl}", to=UINT64)
+        tu = b.node("BitShift", ["one_u64", bku], [f"clz_tu{lvl}"], f"clz_tu{lvl}", direction="LEFT")
+        ti = b.node("Cast", [tu], [f"clz_ti{lvl}"], f"clz_ti{lvl}", to=INT64)
+        lt = b.node("Less", [R, ti], [f"clz_lt{lvl}"], f"clz_lt{lvl}")
+        ge = b.node("Not", [lt], [f"clz_ge{lvl}"], f"clz_ge{lvl}")
+        w = b.node("Where", [ge, f"k{k}_i64", "zero_i64"], [f"clz_w{lvl}"], f"clz_w{lvl}")
+        bcur = b.node("Add", [bcur, w], [f"clz_b{lvl}"], f"clz_b{lvl}")
+    return b.node("Add", [bcur, "one_i64"], ["clz_bitlen"], "clz_bitlen")   # bitlen = b+1
+
+
+def _emit_output_requant(b, acc, act_mul, act_shift, F, bias, O):
+    """Stage 1b int-canonical output requant (the true zero-fp boundary). Consumes the
+    int64 accumulator `acc` [B,O] @ 2^-F, the per-token int act scale (act_mul, act_shift),
+    and the export-time-baked int bias; produces (y_int8 [B,O], y_mul [B,1], y_shift [B,1],
+    y_zp [B,1]) all integer. Mirrors int8_compute.int8_output_requant_intscale bit-exactly:
+      out_int = acc*act_mul + (bias_fixed << act_shift)          (int64)
+      R = max(out_int)-min(out_int), clamped to [1, 2^62)
+      e = bit_length(R) - 8 ;  sh = 16 - e
+      mul = round_half_up(R * 2^sh / 255) ;  normalize mul to [2^15, 2^16) (adjust sh by +-1)
+      zp = round_half_up(-rmin * 2^sh / mul) - 128
+      y_int8 = clamp(round_half_up(out_int * 2^sh / mul) + zp, -128, 127)
+      y_shift = sh + F + act_shift
+    All runtime ops are integer (int64 mul/shift, uint64 BitShift for the left shifts,
+    round-half-up via int Div/Mod + signed-floor correction). F is baked as an int64
+    initializer (export-time fp->int, not runtime fp). Returns the 4 output tensor names.
+    """
+    b.init("zero_i64", np.array([0], dtype=np.int64), INT64)
+    b.init("one_i64", np.array([1], dtype=np.int64), INT64)
+    b.init("F_i64", np.array([F], dtype=np.int64), INT64)
+    b.init("c255_i64", np.array([255], dtype=np.int64), INT64)
+    b.init("c255_u", np.array([255], dtype=np.uint64), UINT64)
+    b.init("c128_i64", np.array([128], dtype=np.int64), INT64)
+    b.init("lo15_i64", np.array([1 << 15], dtype=np.int64), INT64)
+    b.init("hi16_i64", np.array([1 << 16], dtype=np.int64), INT64)
+    b.init("lo128_i64", np.array([-128], dtype=np.int64), INT64)
+    b.init("hi127_i64", np.array([127], dtype=np.int64), INT64)
+    b.init("cap62_i64", np.array([(1 << 62) - 1], dtype=np.int64), INT64)
+    b.init("axes_neg1", np.array([-1], dtype=np.int64), INT64)
+    # out_int = acc*am + (bias_fixed << act_shift)
+    am64 = b.node("Cast", [act_mul], ["am64"], "am64", to=INT64)
+    ash64 = b.node("Cast", [act_shift], ["ash64"], "ash64", to=INT64)
+    accam = b.node("Mul", [acc, am64], ["accam"], "accam")                  # [B,O] int64
+    if bias is not None:
+        bf = np.floor(bias.astype(np.float64) * (2.0 ** F) + 0.5).astype(np.int64)
+        b.init("bf", bf.reshape(1, O), INT64)                               # [1,O]
+        ash64u = b.node("Cast", [ash64], ["ash64u_bf"], "ash64u_bf", to=UINT64)
+        bf_u = b.node("Cast", ["bf"], ["bf_u"], "bf_u", to=UINT64)
+        bfterm = b.node("BitShift", [bf_u, ash64u], ["bfterm"], "bfterm", direction="LEFT")
+        bfterm_i = b.node("Cast", [bfterm], ["bfterm_i"], "bfterm_i", to=INT64)
+        out_int = b.node("Add", [accam, bfterm_i], ["out_int"], "out_int")
+    else:
+        out_int = b.node("Identity", [accam], ["out_int"], "out_int")
+    # rmax/rmin/R
+    rmax = b.node("ReduceMax", [out_int, "axes_neg1"], ["rmax"], "rmax", keepdims=1)
+    rmin = b.node("ReduceMin", [out_int, "axes_neg1"], ["rmin"], "rmin", keepdims=1)
+    Rraw = b.node("Sub", [rmax, rmin], ["Rraw"], "Rraw")
+    R = b.node("Max", [Rraw, "one_i64"], ["R"], "R")
+    R = b.node("Min", [R, "cap62_i64"], ["Rc"], "Rc")                       # [B,1] < 2^62
+    # e = bitlen(R) - 8 ; sh = 16 - e
+    bitlen = _clz_ladder(b, R)
+    e = b.node("Sub", [bitlen, "k8_i64"], ["e"], "e")
+    c16_i64 = b.init("c16_i64", np.array([16], dtype=np.int64), INT64)
+    sh = b.node("Sub", [c16_i64, e], ["sh"], "sh")
+
+    def _mul_at(sh_name, tag):
+        pos = b.node("Not", [b.node("Less", [sh_name, "zero_i64"], [f"{tag}_plt"], f"{tag}_plt")],
+                     [f"{tag}_pos"], f"{tag}_pos")
+        shp = b.node("Max", [sh_name, "zero_i64"], [f"{tag}_shp"], f"{tag}_shp")
+        neg_sh = b.node("Sub", ["zero_i64", sh_name], [f"{tag}_nsh"], f"{tag}_nsh")
+        shn = b.node("Max", ["zero_i64", neg_sh], [f"{tag}_shn"], f"{tag}_shn")
+        Ru = b.node("Cast", [R], [f"{tag}_Ru"], f"{tag}_Ru", to=UINT64)
+        shp_u = b.node("Cast", [shp], [f"{tag}_shpu"], f"{tag}_shpu", to=UINT64)
+        shn_u = b.node("Cast", [shn], [f"{tag}_shnu"], f"{tag}_shnu", to=UINT64)
+        rs = b.node("BitShift", [Ru, shp_u], [f"{tag}_rs"], f"{tag}_rs", direction="LEFT")
+        ds = b.node("BitShift", ["c255_u", shn_u], [f"{tag}_ds"], f"{tag}_ds", direction="LEFT")
+        rs_i = b.node("Cast", [rs], [f"{tag}_rsi"], f"{tag}_rsi", to=INT64)
+        ds_i = b.node("Cast", [ds], [f"{tag}_dsi"], f"{tag}_dsi", to=INT64)
+        num_m = b.node("Where", [pos, rs_i, R], [f"{tag}_num"], f"{tag}_num")
+        den_m = b.node("Where", [pos, "c255_i64", ds_i], [f"{tag}_den"], f"{tag}_den")
+        return _rhu(b, num_m, den_m, f"{tag}_m"), pos, shp_u, shn_u
+
+    mul, _pos, _shp_u, _shn_u = _mul_at(sh, "mul0")
+    # normalize mul to [2^15, 2^16): if mul<2^15 sh+=1 ; if mul>=2^16 sh-=1 ; recompute
+    ts = b.node("Less", [mul, "lo15_i64"], ["ts"], "ts")
+    tb = b.node("Not", [b.node("Less", [mul, "hi16_i64"], ["tb_lt"], "tb_lt")], ["tb"], "tb")
+    sh = b.node("Where", [ts, b.node("Add", [sh, "one_i64"], ["sh_p1"], "sh_p1"), sh], ["sh_a"], "sh_a")
+    sh = b.node("Where", [tb, b.node("Sub", [sh, "one_i64"], ["sh_m1"], "sh_m1"), sh], ["sh_n"], "sh_n")
+    mul, _pos3, shp3_u, shn3_u = _mul_at(sh, "mul1")
+    # zp = rhu(-rmin * 2^sh / mul) - 128
+    neg_rmin = b.node("Sub", ["zero_i64", rmin], ["neg_rmin"], "neg_rmin")
+    neg_rmin_u = b.node("Cast", [neg_rmin], ["neg_rmin_u"], "neg_rmin_u", to=UINT64)
+    nz_shift = b.node("BitShift", [neg_rmin_u, shp3_u], ["nz_shift"], "nz_shift", direction="LEFT")
+    nz_shift_i = b.node("Cast", [nz_shift], ["nz_shift_i"], "nz_shift_i", to=INT64)
+    num_z = b.node("Where", [_pos3, nz_shift_i, neg_rmin], ["num_z"], "num_z")
+    mul_u = b.node("Cast", [mul], ["mul_u"], "mul_u", to=UINT64)
+    mul_shn3 = b.node("BitShift", [mul_u, shn3_u], ["mul_shn3"], "mul_shn3", direction="LEFT")
+    mul_shn3_i = b.node("Cast", [mul_shn3], ["mul_shn3_i"], "mul_shn3_i", to=INT64)
+    den_z = b.node("Where", [_pos3, mul, mul_shn3_i], ["den_z"], "den_z")
+    zp = b.node("Sub", [_rhu(b, num_z, den_z, "zp"), "c128_i64"], ["zp"], "zp_final")
+    # y_int8 = clamp(rhu(out_int * 2^sh / mul) + zp, -128, 127)
+    out_int_u = b.node("Cast", [out_int], ["out_int_u"], "out_int_u", to=UINT64)
+    oy_shift = b.node("BitShift", [out_int_u, shp3_u], ["oy_shift"], "oy_shift", direction="LEFT")
+    oy_shift_i = b.node("Cast", [oy_shift], ["oy_shift_i"], "oy_shift_i", to=INT64)
+    num_y = b.node("Where", [_pos3, oy_shift_i, out_int], ["num_y"], "num_y")
+    den_y = b.node("Where", [_pos3, mul, mul_shn3_i], ["den_y"], "den_y")
+    y_arg = _rhu(b, num_y, den_y, "y")
+    y_plus = b.node("Add", [y_arg, zp], ["y_plus"], "y_plus")
+    y_lo = b.node("Max", [y_plus, "lo128_i64"], ["y_lo"], "y_lo")
+    y_hi = b.node("Min", [y_lo, "hi127_i64"], ["y_hi"], "y_hi")
+    y_int8 = b.node("Cast", [y_hi], ["y_int8"], "y_int8", to=INT8)
+    # y_shift = sh + F + act_shift ; y_mul = mul ; y_zp = zp  (all to int32)
+    y_sh_f = b.node("Add", [sh, "F_i64"], ["y_sh_F"], "y_sh_F")
+    y_sh_pre = b.node("Add", [y_sh_f, ash64], ["y_shift_pre"], "y_shift_pre")
+    y_mul = b.node("Cast", [mul], ["y_mul"], "y_mul", to=INT32)
+    y_zp = b.node("Cast", [zp], ["y_zp"], "y_zp", to=INT32)
+    y_shift = b.node("Cast", [y_sh_pre], ["y_shift"], "y_shift", to=INT32)
+    return "y_int8", "y_mul", "y_shift", "y_zp"
+
+
+def build_int8_linear_onnx(hqq_linear, model_name="int8_linear", emit_intermediates=True,
+                           emit_output_requant=False):
     """Build the Stage 1a int8-compute linear ONNX (int inputs -> fp output).
 
     Inputs (int, zero runtime fp):
@@ -260,20 +436,23 @@ def build_int8_linear_onnx(hqq_linear, model_name="int8_linear", emit_intermedia
     b.node("Sub", [p1, p2], ["pdiff"], "pdiff")
     b.node("ReduceSum", ["pdiff", "axes2"], ["acc"], "acc_sum", keepdims=0)   # [B,O] int64
 
-    # ---- 8) out = (acc * act_mul) / 2^(F+act_shift) + bias  (Stage 1a fp dequant) ----
-    b.node("Cast", ["acc"], ["acc_f"], "acc_castf", to=FLOAT)
-    b.node("Cast", ["act_mul"], ["am_f"], "am_castf", to=FLOAT)
-    b.node("Mul", ["acc_f", "am_f"], ["accam_f"], "out_mul")
-    b.node("Add", ["Fconst", "act_shift"], ["tot_shift"], "ts_add")          # [B,1] int32
-    b.node("Cast", ["tot_shift"], ["ts_u64"], "ts_u64", to=UINT64)
-    b.node("BitShift", ["one_u64", "ts_u64"], ["denom_u64"], "denom_shift", direction="LEFT")
-    b.node("Cast", ["denom_u64"], ["denom_f"], "denom_castf", to=FLOAT)
-    b.node("Div", ["accam_f", "denom_f"], ["out_pre"], "out_div")
-    if meta["bias"] is not None:
-        b.init("bias", meta["bias"].astype(np.float32), FLOAT)
-        b.node("Add", ["out_pre", "bias"], ["out"], "out_bias")
+    # ---- 8) output: Stage 1a fp dequant OR Stage 1b int output requant ----
+    if emit_output_requant:
+        _emit_output_requant(b, "acc", "act_mul", "act_shift", F, meta["bias"], O)
     else:
-        b.node("Identity", ["out_pre"], ["out"], "out_id")
+        b.node("Cast", ["acc"], ["acc_f"], "acc_castf", to=FLOAT)
+        b.node("Cast", ["act_mul"], ["am_f"], "am_castf", to=FLOAT)
+        b.node("Mul", ["acc_f", "am_f"], ["accam_f"], "out_mul")
+        b.node("Add", ["Fconst", "act_shift"], ["tot_shift"], "ts_add")          # [B,1] int32
+        b.node("Cast", ["tot_shift"], ["ts_u64"], "ts_u64", to=UINT64)
+        b.node("BitShift", ["one_u64", "ts_u64"], ["denom_u64"], "denom_shift", direction="LEFT")
+        b.node("Cast", ["denom_u64"], ["denom_f"], "denom_castf", to=FLOAT)
+        b.node("Div", ["accam_f", "denom_f"], ["out_pre"], "out_div")
+        if meta["bias"] is not None:
+            b.init("bias", meta["bias"].astype(np.float32), FLOAT)
+            b.node("Add", ["out_pre", "bias"], ["out"], "out_bias")
+        else:
+            b.node("Identity", ["out_pre"], ["out"], "out_id")
 
     # ---- graph ----
     inputs = [
@@ -283,7 +462,15 @@ def build_int8_linear_onnx(hqq_linear, model_name="int8_linear", emit_intermedia
         helper.make_tensor_value_info("act_shift", INT32, ["B", 1]),
     ]
     vi = helper.make_tensor_value_info
-    outputs = [vi("out", FLOAT, ["B", O])]
+    if emit_output_requant:
+        outputs = [
+            vi("y_int8", INT8, ["B", O]),
+            vi("y_mul", INT32, ["B", 1]),
+            vi("y_shift", INT32, ["B", 1]),
+            vi("y_zp", INT32, ["B", 1]),
+        ]
+    else:
+        outputs = [vi("out", FLOAT, ["B", O])]
     if emit_intermediates:
         outputs += [
             vi("qr_g", INT32, [O, G, g]),

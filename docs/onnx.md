@@ -392,9 +392,7 @@ ORT_DISABLE_ALL. New module `export_onnx_int8.py`.
    emulation is bit-exact incl the s=0 edge. The **8-bit path** (encoder+fc1 tier, packing
    `8bit_u8`) is also bit-exact: weights bake to int8 (`qr-128`) with a `+128*C` correction
    (ORT 1.19.2 batched MatMulInteger needs matching dtypes; int8/uint8 is NOT_IMPLEMENTED).
-   `tests/test_int8_onnx.py` covers both tiers. **Next: Stage 1b -- the output requant (int8
-   out + out scale, the true zero-fp boundary) and the raw + optimized zero-fp audit; then
-   LN/GELU/softmax/conv/Loop.**
+   `tests/test_int8_onnx.py` covers both tiers.
 
    Stage 1b reference -- DONE (int8_compute.int8_output_requant_intscale, codex+claude
    consensus 2026-08-05). The int-canonical output requant: `out_int_scaled[b,o] =
@@ -408,5 +406,30 @@ ORT_DISABLE_ALL. New module `export_onnx_int8.py`.
    exact int, the A7.1 path rounds the float32-rounded out_fp, so the deployed graph is
    equal-or-better. Inter-op int8 is gated at Phase B Gate 2 (ORT WER == A7.1 torch WER).
    Validated in `tests/test_int8_compute.py` (self-consistency within one int8 step; 0.0004%
-   differential). The ONNX emission (CLZ ladder + int Mul/Div-by-255 + round-half-up + zp +
-   clamp) is the remaining Stage 1b step.
+   differential).
+
+   **Stage 1b ONNX emission -- VERIFIED BIT-EXACT (2026-08-05).** `build_int8_linear_onnx(
+   emit_output_requant=True)` emits the int-canonical output requant as standard ONNX int ops
+   (opset 18, ORT 1.19.2): `out_int = acc*act_mul + (bias_fixed<<act_shift)` (int64; the bias
+   left-shift via uint64 BitShift -- left shift is bit-pattern preserving, and act_shift is
+   always large positive since the act scale ~1/amax ≪ 1 so `shift=16-frexp_exp` >= 0); `R =
+   rmax-rmin` clamped to `[1, 2^62)` (the cap guards the CLZ ladder's int64 threshold casts;
+   R ~ 2^55-2^56 for fc1, well under 2^62); `e = bit_length(R)-8` via a 6-level binary-search
+   CLZ ladder (no CLZ/log2-int in ONNX -- thresholds built as uint64 `BitShift(1,k)` then
+   cast to int64 for the `<` compare; the largest reached is 2^62, R<2^62 by cap so the 2^63
+   step -- which would overflow the int64 cast -- is never taken); `mul = round_half_up(
+   R*2^sh/255)` with the negative-shift branch (`sh<0` for these large ranges: `num=R,
+   den=255<<(-sh)`) then normalized to `[2^15,2^16)` (adjust `sh` by +-1 and recompute);
+   `zp = round_half_up(-rmin*2^sh/mul)-128`; `y_int8 = clamp(round_half_up(out_int*2^sh/mul)+zp,
+   -128,127)`; `y_shift = sh+F+act_shift`. Round-half-up = `floor((2*num+den)/(2*den))` with a
+   signed-floor correction (ONNX `Div` truncates toward 0 -> ceil for negatives, so subtract 1
+   when the numerator is negative and the remainder is nonzero). All runtime ops are integer;
+   F and bias_fixed are baked as int initializers (export-time fp->int, not runtime fp).
+   **BIT-EXACT vs the reference across 3-bit + 8-bit layers, batch 1/2/3, extremes
+   (all-positive, all-negative, large magnitude) -- 0 mismatches in y_int8, y_mul, y_shift,
+   y_zp over 96768 elements (11 sampled layers x 3 seeds x 3 batches).** ORT gotchas hit:
+   `GreaterEqual` is not registered in ORT 1.19.2 (neither uint64 nor int64) -- use
+   `Not(Less(...))`; `BitShift` requires both inputs the SAME unsigned type (uint64); SSA form
+   is enforced (no duplicate output/node names); `Clamp` is not in the int opset used here --
+   clamp via `Max`/`Min`. `tests/test_int8_onnx.py` covers both tiers (Stage 1a + 1b, 14 tests).
+   **Next: the raw + optimized zero-fp audit (recursive), then LN/GELU/softmax/conv/Loop.**

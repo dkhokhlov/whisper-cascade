@@ -58,9 +58,30 @@ def _torch_intermediates(mod, x):
     p1 = i8._rshift_round(T1 * ms.unsqueeze(0).to(torch.int64), (msh - F).unsqueeze(0).to(torch.int64))
     p2 = i8._rshift_round(T2 * mz.unsqueeze(0).to(torch.int64), (mzh - F).unsqueeze(0).to(torch.int64))
     acc = (p1 - p2).sum(-1).to(torch.int64)
+    yr, mr, sr, zr = i8.int8_output_requant_intscale(acc, am, sh, F, mod.bias)
     return {"qr_g": qr.reshape(O, I // g, g), "A": A.to(torch.int64), "Bt": Bt.to(torch.int64),
             "C": C.to(torch.int64), "T1": T1, "T2": T2, "p1_out": p1, "p2_out": p2,
-            "acc": acc, "out": out, "xi": xi, "xz": xz, "am": am, "sh": sh}
+            "acc": acc, "out": out, "xi": xi, "xz": xz, "am": am, "sh": sh,
+            "y_int8": yr, "y_mul": mr, "y_shift": sr, "y_zp": zr}
+
+
+def _check_requant(mod, x):
+    """Stage 1b: emit_output_requant=True -> (y_int8, y_mul, y_shift, y_zp) bit-exact vs
+    int8_compute.int8_output_requant_intscale (the int-canonical zero-fp boundary)."""
+    import numpy as np
+    model = ex.build_int8_linear_onnx(mod, model_name="t1b", emit_intermediates=False,
+                                      emit_output_requant=True)
+    path = "/tmp/_int8_requant_test.onnx"
+    onnx.save(model, path)
+    t = _torch_intermediates(mod, x)
+    o = _run_ort(path, t["xi"], t["xz"], t["am"], t["sh"])
+    for k, ref in [("y_int8", "y_int8"), ("y_mul", "y_mul"), ("y_shift", "y_shift"), ("y_zp", "y_zp")]:
+        a = o[k].astype(np.int64)
+        b = t[ref].numpy().astype(np.int64)
+        if a.ndim == 1:  # ORT may flatten the [B,1] outputs depending on shape inference
+            b = b.reshape(-1)
+        assert a.shape == b.shape, f"{k}: shape {a.shape} vs {b.shape}"
+        assert np.array_equal(a, b), f"{k}: {int((a != b).sum())}/{a.size} differ (max|d|={int(np.abs(a - b).max())})"
 
 
 def _run_ort(onnx_path, xi, xz, am, sh):
@@ -113,3 +134,32 @@ def test_8bit_linear_bitexact():
     mod = _load_first_linear(8)
     torch.manual_seed(3)
     _check(mod, torch.randn(2, int(mod.meta["shape"][1])) * 2.0)
+
+
+# ---- Stage 1b: int output requant (the true zero-fp boundary) ----
+
+def test_3bit_output_requant_bitexact():
+    mod = _load_first_linear(3)
+    torch.manual_seed(1)
+    _check_requant(mod, torch.randn(2, int(mod.meta["shape"][1])) * 2.0)
+
+
+@pytest.mark.parametrize("x_fn", [
+    lambda I: torch.randn(1, I) * 2.0,                    # batch 1
+    lambda I: torch.randn(3, I) * 5.0,                   # batch 3, large
+    lambda I: torch.rand(2, I) * 3.0 + 0.5,              # all-positive (zp near -128)
+    lambda I: -(torch.rand(2, I) * 3.0 + 0.5),           # all-negative (zp near 127)
+    lambda I: torch.randn(2, I) * 50.0,                  # extreme magnitudes
+])
+def test_3bit_output_requant_robustness(x_fn):
+    mod = _load_first_linear(3)
+    torch.manual_seed(2)
+    _check_requant(mod, x_fn(int(mod.meta["shape"][1])))
+
+
+def test_8bit_output_requant_bitexact():
+    """8-bit tier output requant (bias present; large out_int range ~2^55 exercises the
+    CLZ ladder and the negative-shift branch of the Q1.16 output scale)."""
+    mod = _load_first_linear(8)
+    torch.manual_seed(3)
+    _check_requant(mod, torch.randn(2, int(mod.meta["shape"][1])) * 2.0)
