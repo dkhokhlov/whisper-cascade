@@ -457,5 +457,22 @@ ORT_DISABLE_ALL. New module `export_onnx_int8.py`.
    4 Newton iters (s_K*r^2 = 2^56 invariant, peak 2^57, int64-safe); output REUSES
    `int8_output_requant_intscale` with F = K+R+G = 51. Validated: CLZ boundaries PASS, rsqrt
    rel err 7e-7, self-consistency within one int8 step, vs fp LN abs err < 0.1 (median 0.02).
-   `tests/test_int8_compute.py` has 9 tests. **Next: emit the ONNX LayerNorm mirroring this
-   reference (reuse the Stage 1b _clz_ladder + _rhu + output requant), bit-exact verify + audit.**
+   `tests/test_int8_compute.py` has 9 tests.
+
+   **Q6 int-canonical LayerNorm ONNX emission -- VERIFIED BIT-EXACT (2026-08-05).**
+   `build_int8_layernorm_onnx` (`export_onnx_int8.py`) mirrors `int8_layernorm_intscale`
+   bit-exactly: u/S1/S2, floor_div mean_K/var_K, eps_K (p/q form), s_K (clamp [1,2^62)),
+   pure-int CLZ bitlen (`_clz_ladder` tag="ln_clz"), int rsqrt seed + 4 Newton iters, gamma/beta
+   baked Q15, y_int @ Q(K+R+G), then reuses `_emit_output_requant` (F=51, act_mul=1, act_shift=0)
+   for (y_int8, y_mul, y_shift, y_zp). Inputs are x_int/x_zp/x_mul/x_shift (NOT y_mul/y_shift --
+   those collide with the requant's same-named outputs, SSA). Verified bit-exact vs the torch
+   reference across 4 encoder LayerNorms x 3 seeds x batch 1/2/3/5 -- EVERY int intermediate (u,
+   S1, S2, mean_K, var_K, eps_K, s_K, r, y_int) AND the four int8 outputs match. Zero-fp audit
+   passes raw + ORT-optimized (ORT injects no fp into the pure-int LN). Key fix: ONNX `Mod`
+   (default fmod=0) returns the EUCLIDEAN remainder (sign of divisor, >= 0 for d > 0), so
+   `_floor_div_pos`'s negative-dividend correction must key off the NUMERATOR sign (`a < 0`), not
+   the remainder sign (`r < 0`, never true) -- else mean_K = trunc = ceil (off by +1 for S1 < 0).
+   `tests/test_int8_onnx.py` now has 26 tests. **Next: the remaining Q6 sub-modules -- exact-Phi
+   GELU LUT, one softmax row, one ConvInteger, one If, one Loop with int loop-carried cache
+   (each bit-exact vs a pure-int reference + raw/optimized audit); then 1-layer decoder -> full
+   encoder + merged-decoder.**

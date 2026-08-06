@@ -186,3 +186,95 @@ def test_zero_fp_audit_stage1a_fails():
     with pytest.raises(AssertionError) as exc:
         ex.zero_fp_audit(model)
     assert "FLOAT" in str(exc.value), "audit must flag the fp output"
+
+
+# ---- Q6: int8 LayerNorm ONNX (int-canonical, mirrors int8_layernorm_intscale) ----
+
+def _load_ln(name):
+    m = hqq_asr.load_whisper_hqq(MODEL, device="cpu", compute_dtype=torch.float32)
+    ln = dict(m.named_modules()).get(name)
+    if ln is None:
+        pytest.skip(f"no {name} in {MODEL}")
+    return ln
+
+
+def _run_ort_ln(onnx_path, xi, xz, am, sh):
+    import numpy as np
+    sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    feeds = {"x_int": xi.numpy().astype(np.int8),
+             "x_zp": xz.numpy().astype(np.int32).reshape(-1, 1),
+             "x_mul": am.numpy().astype(np.int32).reshape(-1, 1),
+             "x_shift": sh.numpy().astype(np.int32).reshape(-1, 1)}
+    return {o.name: v for o, v in zip(sess.get_outputs(), sess.run(None, feeds))}
+
+
+def _check_ln(ln, x):
+    """Build the int-canonical LN ONNX (with intermediates) and assert every int intermediate
+    AND the four int8 outputs are BIT-EXACT vs int8_compute.int8_layernorm_intscale."""
+    import numpy as np
+    D = int(ln.normalized_shape[0])
+    xi, am, sh, xz = i8.quantize_act_per_token_intscale(x)
+    y_int8, ym, ys, yzp, inter = i8.int8_layernorm_intscale(
+        xi, xz, am, sh, ln.weight.detach(), ln.bias.detach(), ln.eps, return_intermediates=True)
+    model = ex.build_int8_layernorm_onnx(ln, model_name="ln_t", emit_intermediates=True)
+    path = "/tmp/_int8_ln_test.onnx"
+    onnx.save(model, path)
+    o = _run_ort_ln(path, xi, xz, am, sh)
+    pairs = [("ln_u", "u"), ("ln_S1", "S1"), ("ln_S2", "S2"), ("ln_mean_out", "mean_K"),
+             ("ln_var_K", "var_K"), ("ln_eps_K", "eps_K"), ("ln_s_K", "s_K"),
+             ("ln_r3_i", "r"), ("ln_y_int", "y_int")]
+    for ok, rk in pairs:
+        a = o[ok].astype(np.int64)
+        b = inter[rk].numpy().astype(np.int64)
+        assert a.shape == b.shape, f"{ok}: shape {a.shape} vs {b.shape}"
+        assert np.array_equal(a, b), f"{ok} vs {rk}: {int((a != b).sum())}/{a.size} differ (max|d|={int(np.abs(a - b).max())})"
+    for k, ref in [("y_int8", y_int8), ("y_mul", ym), ("y_shift", ys), ("y_zp", yzp)]:
+        a = o[k]
+        b = ref.numpy()
+        if a.ndim == 1 and b.ndim == 2:
+            b = b.reshape(-1)
+        a = a.astype(np.int64)
+        b = b.astype(np.int64).reshape(a.shape)
+        assert np.array_equal(a, b), f"OUT {k}: {int((a != b).sum())}/{a.size} differ (max|d|={int(np.abs(a - b).max())})"
+
+
+_LN_NAMES = ["model.encoder.layers.0.self_attn_layer_norm",
+             "model.encoder.layers.0.final_layer_norm",
+             "model.encoder.layers.1.self_attn_layer_norm",
+             "model.encoder.layers.3.final_layer_norm"]
+
+
+@pytest.mark.parametrize("ln_name", _LN_NAMES)
+def test_int8_layernorm_bitexact(ln_name):
+    """The int-canonical LN ONNX is bit-exact vs int8_layernorm_intscale: every int intermediate
+    (u, S1, S2, mean_K, var_K, eps_K, s_K, r, y_int) and the four int8 outputs (y_int8, y_mul,
+    y_shift, y_zp) match across real whisper-tiny encoder LayerNorms. The negative-S1 token
+    exercises _floor_div_pos (ONNX Mod is Euclidean -> correction keys off the numerator sign)."""
+    ln = _load_ln(ln_name)
+    torch.manual_seed(7)
+    _check_ln(ln, torch.randn(3, int(ln.normalized_shape[0])) * 4.0)
+
+
+@pytest.mark.parametrize("x_fn", [
+    lambda D: torch.randn(1, D) * 4.0,                   # batch 1
+    lambda D: torch.randn(5, D) * 4.0,                   # batch 5
+    lambda D: torch.rand(2, D) * 3.0 + 0.5,              # all-positive (S1 > 0)
+    lambda D: -(torch.rand(2, D) * 3.0 + 0.5),           # all-negative (S1 < 0 -> floor_div branch)
+    lambda D: torch.randn(2, D) * 50.0,                  # extreme magnitudes
+])
+def test_int8_layernorm_robustness(x_fn):
+    """LN bit-exactness holds across batch sizes and sign/magnitude regimes (the all-negative
+    case drives S1 << 0, the floor_div correction that broke before the numerator-sign fix)."""
+    ln = _load_ln("model.encoder.layers.0.self_attn_layer_norm")
+    torch.manual_seed(2)
+    _check_ln(ln, x_fn(int(ln.normalized_shape[0])))
+
+
+def test_int8_layernorm_zero_fp_audit():
+    """The int-canonical LN ONNX is structurally zero-fp: no fp tensors, no fp Casts, no
+    fp-computing ops -- raw graph AND the ORT-optimized artifact (ORT_ENABLE_ALL must not fuse
+    LayerNormalization into fp on this pure-int graph)."""
+    ln = _load_ln("model.encoder.layers.0.self_attn_layer_norm")
+    model = ex.build_int8_layernorm_onnx(ln, emit_intermediates=False)
+    ex.zero_fp_audit(model)                       # raw graph
+    ex.zero_fp_audit(model, check_optimized=True)  # ORT-optimized artifact

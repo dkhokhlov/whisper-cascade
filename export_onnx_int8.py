@@ -192,12 +192,14 @@ def _rhu(b, num, den, tag):
     return b.node("Sub", [q, corr], [f"{tag}_out"], f"{tag}_sub")
 
 
-def _clz_ladder(b, R):
+def _clz_ladder(b, R, tag="clz"):
     """floor(log2(R)) + 1 = bit-length, via a binary-search CLZ ladder (no CLZ/log2-int in
     ONNX). R is int64 [*,1], 1 <= R < 2^62 (the cap62 guard). Returns the int64 bit-length.
     Thresholds are built as uint64 BitShift(1, k) then cast to int64 for the < comparison;
     the largest threshold reached is 2^62 (R < 2^62 by cap, so the 2^63 step is never taken,
-    avoiding the int64-overflow cast of 2^63)."""
+    avoiding the int64-overflow cast of 2^63). `tag` namespaces the node names so the ladder
+    can be emitted more than once in one graph (e.g. the LayerNorm emits it for s_K AND the
+    output requant emits it again for R) without SSA name collisions."""
     b.init("zero_i64", np.array([0], dtype=np.int64), INT64)
     b.init("one_u64", np.array([1], dtype=np.uint64), UINT64)
     b.init("one_i64", np.array([1], dtype=np.int64), INT64)
@@ -206,23 +208,24 @@ def _clz_ladder(b, R):
     for k in (16, 8, 4, 2, 1):
         b.init(f"k{k}_i64", np.array([k], dtype=np.int64), INT64)
         b.init(f"k{k}_u64", np.array([k], dtype=np.uint64), UINT64)
+    p = f"{tag}_"
     # level 1: 2^32. R < 2^32 -> bitlen < 33 (base 0); else base 32.
-    t = b.node("BitShift", ["one_u64", "k32_u64"], ["clz_t1u"], "clz_t1u", direction="LEFT")
-    t = b.node("Cast", [t], ["clz_tA"], "clz_tA", to=INT64)
-    lt = b.node("Less", [R, t], ["clz_ltA"], "clz_ltA")
-    ge = b.node("Not", [lt], ["clz_geA"], "clz_geA")
-    b0 = b.node("Where", [ge, "k32_i64", "zero_i64"], ["clz_bbase"], "clz_bbase")
-    bcur = "clz_bbase"
+    t = b.node("BitShift", ["one_u64", "k32_u64"], [f"{p}t1u"], f"{p}t1u", direction="LEFT")
+    t = b.node("Cast", [t], [f"{p}tA"], f"{p}tA", to=INT64)
+    lt = b.node("Less", [R, t], [f"{p}ltA"], f"{p}ltA")
+    ge = b.node("Not", [lt], [f"{p}geA"], f"{p}geA")
+    b.node("Where", [ge, "k32_i64", "zero_i64"], [f"{p}bbase"], f"{p}bbase")
+    bcur = f"{p}bbase"
     for lvl, k in enumerate([16, 8, 4, 2, 1]):
-        bk = b.node("Add", [bcur, f"k{k}_i64"], [f"clz_bk{lvl}"], f"clz_bk{lvl}")
-        bku = b.node("Cast", [bk], [f"clz_bku{lvl}"], f"clz_bku{lvl}", to=UINT64)
-        tu = b.node("BitShift", ["one_u64", bku], [f"clz_tu{lvl}"], f"clz_tu{lvl}", direction="LEFT")
-        ti = b.node("Cast", [tu], [f"clz_ti{lvl}"], f"clz_ti{lvl}", to=INT64)
-        lt = b.node("Less", [R, ti], [f"clz_lt{lvl}"], f"clz_lt{lvl}")
-        ge = b.node("Not", [lt], [f"clz_ge{lvl}"], f"clz_ge{lvl}")
-        w = b.node("Where", [ge, f"k{k}_i64", "zero_i64"], [f"clz_w{lvl}"], f"clz_w{lvl}")
-        bcur = b.node("Add", [bcur, w], [f"clz_b{lvl}"], f"clz_b{lvl}")
-    return b.node("Add", [bcur, "one_i64"], ["clz_bitlen"], "clz_bitlen")   # bitlen = b+1
+        bk = b.node("Add", [bcur, f"k{k}_i64"], [f"{p}bk{lvl}"], f"{p}bk{lvl}")
+        bku = b.node("Cast", [bk], [f"{p}bku{lvl}"], f"{p}bku{lvl}", to=UINT64)
+        tu = b.node("BitShift", ["one_u64", bku], [f"{p}tu{lvl}"], f"{p}tu{lvl}", direction="LEFT")
+        ti = b.node("Cast", [tu], [f"{p}ti{lvl}"], f"{p}ti{lvl}", to=INT64)
+        lt = b.node("Less", [R, ti], [f"{p}lt{lvl}"], f"{p}lt{lvl}")
+        ge = b.node("Not", [lt], [f"{p}ge{lvl}"], f"{p}ge{lvl}")
+        w = b.node("Where", [ge, f"k{k}_i64", "zero_i64"], [f"{p}w{lvl}"], f"{p}w{lvl}")
+        bcur = b.node("Add", [bcur, w], [f"{p}b{lvl}"], f"{p}b{lvl}")
+    return b.node("Add", [bcur, "one_i64"], [f"{p}bitlen"], f"{p}bitlen")   # bitlen = b+1
 
 
 def _emit_output_requant(b, acc, act_mul, act_shift, F, bias, O):
@@ -483,6 +486,196 @@ def build_int8_linear_onnx(hqq_linear, model_name="int8_linear", emit_intermedia
             vi("p2_out", INT64, ["B", O, G]),
             vi("acc", INT64, ["B", O]),
         ]
+    g_ = helper.make_graph(b.nodes, model_name, inputs, outputs, initializer=b.inits)
+    m = helper.make_model(g_, opset_imports=[helper.make_opsetid("", 18)])
+    m.ir_version = 9
+    onnx.checker.check_model(m)
+    return m
+
+
+# ---- LayerNorm (Q6): int-canonical, pure-int, mirrors int8_layernorm_intscale ----
+
+_LN_K, _LN_R, _LN_G = 16, 20, 15   # mean/var Q16, rsqrt Q20, gamma/beta Q15 (match int8_compute)
+_SQRT2_Q20 = 1482910               # round(sqrt(2) * 2^20)
+
+
+def _floor_div_pos(b, a, d_pos, tag):
+    """floor(a / d) for d > 0. ONNX Div truncates toward 0 (ceil for a < 0); ONNX Mod (default
+    fmod=0) returns the EUCLIDEAN remainder (sign of the divisor, >= 0 for d > 0), so r < 0 is
+    never true -- the correction must key off the NUMERATOR sign, not the remainder sign. Subtract
+    1 when a < 0 and a is not an exact multiple of d (Euclidean r == 0 iff d | a). Mirrors _rhu."""
+    b.init("zero_i64", np.array([0], dtype=np.int64), INT64)
+    q = b.node("Div", [a, d_pos], [f"{tag}_q"], f"{tag}_div")
+    r = b.node("Mod", [a, d_pos], [f"{tag}_r"], f"{tag}_mod")
+    neg = b.node("Less", [a, "zero_i64"], [f"{tag}_neg"], f"{tag}_less")
+    eq = b.node("Equal", [r, "zero_i64"], [f"{tag}_eq"], f"{tag}_eq")
+    nz = b.node("Not", [eq], [f"{tag}_nz"], f"{tag}_nz")
+    cb = b.node("And", [neg, nz], [f"{tag}_cb"], f"{tag}_and")
+    corr = b.node("Cast", [cb], [f"{tag}_c"], f"{tag}_cast", to=INT64)
+    return b.node("Sub", [q, corr], [f"{tag}_out"], f"{tag}_sub")
+
+
+def _emit_layernorm_int8(b, x_int, x_zp, y_mul_in, y_shift_in, gamma_int, beta_int, D,
+                         K=_LN_K, R=_LN_R, G=_LN_G, eps_q=100000):
+    """Append the int-canonical LayerNorm (mirrors int8_compute.int8_layernorm_intscale) to
+    builder `b`. Consumes the previous op's int8 output (x_int [B,D], x_zp [B,1], y_mul_in
+    [B,1], y_shift_in [B,1]); emits (y_int8 [B,D], y_mul [B,1], y_shift [B,1], y_zp [B,1]).
+    eps = 1/eps_q (whisper eps=1e-5 -> eps_q=100000). Returns the 4 output tensor names.
+
+    Pure-int throughout: eps_K from the int act scale, pure-int CLZ rsqrt seed (no fp
+    fallback), 4 Newton iters; the output reuses _emit_output_requant with F = K+R+G. All
+    LN-specific node names are 'ln_'-prefixed to avoid SSA collisions with the requant's
+    internal names; _clz_ladder is emitted with tag='ln_clz' (the requant emits it again with
+    tag='clz'). See int8_compute.int8_layernorm_intscale for the bit-exact spec."""
+    P = "ln_"
+    b.init("zero_i64", np.array([0], dtype=np.int64), INT64)
+    b.init("one_i64", np.array([1], dtype=np.int64), INT64)
+    b.init("c2_i64", np.array([2], dtype=np.int64), INT64)
+    b.init(f"{P}K_i64", np.array([K], dtype=np.int64), INT64)
+    b.init(f"{P}R_i64", np.array([R], dtype=np.int64), INT64)
+    b.init(f"{P}D_i64", np.array([D], dtype=np.int64), INT64)
+    b.init("axes_neg1", np.array([-1], dtype=np.int64), INT64)
+    for s in (K, K + R, R + 1):
+        b.init(f"{P}sh{s}_u64", np.array([s], dtype=np.uint64), UINT64)
+    # u = x_int - x_zp  [B,D] int64
+    x64 = b.node("Cast", [x_int], [f"{P}x64"], f"{P}x_cast", to=INT64)
+    xz64 = b.node("Cast", [x_zp], [f"{P}xz64"], f"{P}xz_cast", to=INT64)
+    u = b.node("Sub", [x64, xz64], [f"{P}u"], f"{P}u_sub")                       # [B,D]
+    # S1 = sum(u) ; S2 = sum(u*u)
+    S1 = b.node("ReduceSum", [u, "axes_neg1"], [f"{P}S1"], f"{P}S1", keepdims=1)  # [B,1]
+    u2 = b.node("Mul", [u, u], [f"{P}u2"], f"{P}u2_mul")
+    S2 = b.node("ReduceSum", [u2, "axes_neg1"], [f"{P}S2"], f"{P}S2", keepdims=1)  # [B,1]
+    # mean_K = floor_div(S1<<K, D) ; var_K = floor_div(S2<<K, D) - (mean_K^2 >> K)
+    S1u = b.node("Cast", [S1], [f"{P}S1u"], f"{P}S1u_cast", to=UINT64)
+    S1s = b.node("BitShift", [S1u, f"{P}sh{K}_u64"], [f"{P}S1s"], f"{P}S1s", direction="LEFT")
+    S1s_i = b.node("Cast", [S1s], [f"{P}S1s_i"], f"{P}S1s_i", to=INT64)
+    mean_K = _floor_div_pos(b, S1s_i, f"{P}D_i64", f"{P}mean")                  # floor((S1<<K)/D)
+    S2u = b.node("Cast", [S2], [f"{P}S2u"], f"{P}S2u_cast", to=UINT64)
+    S2s = b.node("BitShift", [S2u, f"{P}sh{K}_u64"], [f"{P}S2s"], f"{P}S2s", direction="LEFT")
+    S2s_i = b.node("Cast", [S2s], [f"{P}S2s_i"], f"{P}S2s_i", to=INT64)
+    var_hi = _floor_div_pos(b, S2s_i, f"{P}D_i64", f"{P}varhi")                 # floor((S2<<K)/D)
+    mK2 = b.node("Mul", [mean_K, mean_K], [f"{P}mK2"], f"{P}mK2_mul")
+    mK2u = b.node("Cast", [mK2], [f"{P}mK2u"], f"{P}mK2u_cast", to=UINT64)
+    mK2r = b.node("BitShift", [mK2u, f"{P}sh{K}_u64"], [f"{P}mK2r"], f"{P}mK2r", direction="RIGHT")
+    mK2r_i = b.node("Cast", [mK2r], [f"{P}mK2r_i"], f"{P}mK2r_i", to=INT64)
+    var_K = b.node("Sub", [var_hi, mK2r_i], [f"{P}var_K"], f"{P}var_sub")        # [B,1]
+    # eps_K = round_half_up(p*2^(K+2*y_shift) / (q*y_mul^2)); max(eps_K, 1)
+    ys = b.node("Cast", [y_shift_in], [f"{P}ys"], f"{P}ys_cast", to=INT64)
+    ym = b.node("Cast", [y_mul_in], [f"{P}ym"], f"{P}ym_cast", to=INT64)
+    two_ys = b.node("Mul", [ys, "c2_i64"], [f"{P}two_ys"], f"{P}two_ys")           # 2*y_shift
+    h = b.node("Add", [two_ys, f"{P}K_i64"], [f"{P}h"], f"{P}h_add")             # K + 2*y_shift [B,1]
+    h_u = b.node("Cast", [h], [f"{P}h_u"], f"{P}h_cast", to=UINT64)
+    num = b.node("BitShift", ["one_u64", h_u], [f"{P}eps_num"], f"{P}eps_num", direction="LEFT")
+    num_i = b.node("Cast", [num], [f"{P}eps_num_i"], f"{P}eps_num_i", to=INT64)
+    ym2 = b.node("Mul", [ym, ym], [f"{P}ym2"], f"{P}ym2_mul")
+    b.init(f"{P}q_i64", np.array([eps_q], dtype=np.int64), INT64)
+    den = b.node("Mul", [ym2, f"{P}q_i64"], [f"{P}eps_den"], f"{P}eps_den")     # q * y_mul^2
+    eps_K = _rhu(b, num_i, den, f"{P}eps")                                       # round_half_up
+    eps_K = b.node("Max", [eps_K, "one_i64"], [f"{P}eps_K"], f"{P}eps_max")     # >= 1
+    # s_K = var_K + eps_K (clamp [1, 2^62))
+    s_K = b.node("Add", [var_K, eps_K], [f"{P}s_K_raw"], f"{P}sK_add")
+    s_K = b.node("Max", [s_K, "one_i64"], [f"{P}s_K1"], f"{P}sK_max1")
+    b.init("cap62_i64", np.array([(1 << 62) - 1], dtype=np.int64), INT64)
+    s_K = b.node("Min", [s_K, "cap62_i64"], [f"{P}s_K"], f"{P}sK_min")          # [B,1]
+    # rsqrt seed via pure-int CLZ bitlen
+    bitlen = _clz_ladder(b, s_K, tag=f"{P}clz")                                  # ln_clz_bitlen
+    bitpos = b.node("Sub", [bitlen, "one_i64"], [f"{P}bitpos"], f"{P}bitpos")
+    e = b.node("Sub", [f"{P}K_i64", bitpos], [f"{P}e"], f"{P}e")                 # K - bitpos
+    odd = b.node("BitwiseAnd", [e, "one_i64"], [f"{P}odd"], f"{P}odd")          # e & 1
+    e_minus_odd = b.node("Sub", [e, odd], [f"{P}e_mo"], f"{P}e_mo")
+    half = b.node("Div", [e_minus_odd, "c2_i64"], [f"{P}half"], f"{P}half")     # (e-odd)//2 (even -> trunc==floor)
+    a = b.node("Add", [f"{P}R_i64", half], [f"{P}a"], f"{P}a")                  # R + half [B,1]
+    # C = where(odd, 8409*sqrt2_Q20, 8409*2^20)
+    b.init(f"{P}Ceven", np.array([8409 * (1 << 20)], dtype=np.int64), INT64)
+    b.init(f"{P}Codd", np.array([8409 * _SQRT2_Q20], dtype=np.int64), INT64)
+    is_odd = b.node("Equal", [odd, "one_i64"], [f"{P}is_odd"], f"{P}is_odd")
+    C = b.node("Where", [is_odd, f"{P}Codd", f"{P}Ceven"], [f"{P}C"], f"{P}C")   # [B,1]
+    # seed = round_half_up(C<<a, 10000*2^20); clamp a>=0 (matches the reference's a.clamp(min=0);
+    # a >= 12 always for |u| <= 255, but the clamp also guards the uint64 cast on negative a)
+    a_c = b.node("Max", [a, "zero_i64"], [f"{P}a_c"], f"{P}a_clamp")
+    a_u = b.node("Cast", [a_c], [f"{P}a_u"], f"{P}a_cast", to=UINT64)
+    Cu = b.node("Cast", [C], [f"{P}Cu"], f"{P}C_cast", to=UINT64)
+    Csh = b.node("BitShift", [Cu, a_u], [f"{P}Csh"], f"{P}Csh", direction="LEFT")
+    Csh_i = b.node("Cast", [Csh], [f"{P}Csh_i"], f"{P}Csh_i", to=INT64)
+    b.init(f"{P}den_seed", np.array([10000 * (1 << 20)], dtype=np.int64), INT64)
+    r = _rhu(b, Csh_i, f"{P}den_seed", f"{P}seed")                              # seed [B,1]
+    # 4 Newton iters: prod = (s_K*r)*r ; t = prod>>(K+R) ; r = (r*(3*2^R - t) + 2^(R-1))>>(R+1)
+    b.init(f"{P}three", np.array([3 * (1 << R)], dtype=np.int64), INT64)
+    b.init(f"{P}half_r", np.array([1 << (R - 1)], dtype=np.int64), INT64)
+    for i in range(4):
+        sr = b.node("Mul", [s_K, r], [f"{P}sr{i}"], f"{P}sr{i}")
+        prod = b.node("Mul", [sr, r], [f"{P}prod{i}"], f"{P}prod{i}")            # (s_K*r)*r
+        produ = b.node("Cast", [prod], [f"{P}produ{i}"], f"{P}produ{i}", to=UINT64)
+        tu = b.node("BitShift", [produ, f"{P}sh{K+R}_u64"], [f"{P}t{i}u"], f"{P}t{i}u", direction="RIGHT")
+        t = b.node("Cast", [tu], [f"{P}t{i}"], f"{P}t{i}", to=INT64)
+        tmt = b.node("Sub", [f"{P}three", t], [f"{P}3mt{i}"], f"{P}3mt{i}")     # 3*2^R - t
+        rt = b.node("Mul", [r, tmt], [f"{P}rt{i}"], f"{P}rt{i}")
+        rth = b.node("Add", [rt, f"{P}half_r"], [f"{P}rth{i}"], f"{P}rth{i}")
+        rthu = b.node("Cast", [rth], [f"{P}rth{i}u"], f"{P}rth{i}u", to=UINT64)
+        rsh = b.node("BitShift", [rthu, f"{P}sh{R+1}_u64"], [f"{P}r{i}"], f"{P}r{i}", direction="RIGHT")
+        r = b.node("Cast", [rsh], [f"{P}r{i}_i"], f"{P}r{i}_i", to=INT64)
+    r_final = r
+    # uK = (u<<K) - mean_K ; y_int = uK*r*gamma_int + (beta_int << (K+R))
+    uu = b.node("Cast", [u], [f"{P}uu"], f"{P}uu_cast", to=UINT64)
+    ush = b.node("BitShift", [uu, f"{P}sh{K}_u64"], [f"{P}ush"], f"{P}ush", direction="LEFT")
+    ush_i = b.node("Cast", [ush], [f"{P}ush_i"], f"{P}ush_i", to=INT64)
+    uK = b.node("Sub", [ush_i, mean_K], [f"{P}uK"], f"{P}uK")                   # [B,D] QK
+    uKr = b.node("Mul", [uK, r_final], [f"{P}uKr"], f"{P}uKr")                  # [B,D] * [B,1]
+    b.init(f"{P}gamma_int", gamma_int.reshape(1, D), INT64)                      # [1,D] QG (baked)
+    uKrg = b.node("Mul", [uKr, f"{P}gamma_int"], [f"{P}uKrg"], f"{P}uKrg")      # [B,D] Q(K+R+G)
+    b.init(f"{P}beta_int", beta_int.reshape(1, D), INT64)                        # [1,D] QG (baked)
+    bu = b.node("Cast", [f"{P}beta_int"], [f"{P}bu"], f"{P}bu_cast", to=UINT64)
+    bsh = b.node("BitShift", [bu, f"{P}sh{K+R}_u64"], [f"{P}bsh"], f"{P}bsh", direction="LEFT")
+    bsh_i = b.node("Cast", [bsh], [f"{P}bsh_i"], f"{P}bsh_i", to=INT64)          # [1,D] Q(K+R+G)
+    y_int_ln = b.node("Add", [uKrg, bsh_i], [f"{P}y_int"], f"{P}y_int")         # [B,D] Q(K+R+G)
+    # output requant: reuse Stage 1b with F = K+R+G, fresh per-token scale (act_mul=1, act_shift=0)
+    b.init(f"{P}am_one", np.array([1], dtype=np.int32), INT32)
+    b.init(f"{P}ash_zero", np.array([0], dtype=np.int32), INT32)
+    y_out, y_mul, y_shift, y_zp = _emit_output_requant(
+        b, y_int_ln, f"{P}am_one", f"{P}ash_zero", K + R + G, None, D)
+    return y_out, y_mul, y_shift, y_zp
+
+
+def build_int8_layernorm_onnx(ln_module, model_name="int8_layernorm", emit_intermediates=False,
+                               eps_q=100000):
+    """Build the int-canonical LayerNorm ONNX (mirrors int8_compute.int8_layernorm_intscale).
+
+    Inputs (the previous op's int8 output, zero runtime fp):
+      x_int [B, D] int8, x_zp [B, 1] int32, y_mul [B, 1] int32 (Q1.16 input scale),
+      y_shift [B, 1] int32.
+    Outputs: y_int8 [B, D] int8, y_mul [B, 1] int32, y_shift [B, 1] int32, y_zp [B, 1] int32.
+    `ln_module` is a torch nn.LayerNorm (gamma = .weight, beta = .bias, eps = .eps,
+    D = .normalized_shape[0]); gamma_int/beta_int are baked as int Q15 initializers.
+    `eps_q` is 1/eps (whisper eps=1e-5 -> 100000). With emit_intermediates the graph also
+    outputs the int LN intermediates (u, S1, S2, mean_K, var_K, eps_K, s_K, r, y_int) for
+    bit-exact verification vs the torch reference.
+    """
+    D = int(ln_module.normalized_shape[0])
+    gamma = ln_module.weight.detach().to(torch.float64).cpu()
+    beta = ln_module.bias.detach().to(torch.float64).cpu()
+    gamma_int = np.floor(gamma.numpy() * (2.0 ** _LN_G) + 0.5).astype(np.int64)
+    beta_int = np.floor(beta.numpy() * (2.0 ** _LN_G) + 0.5).astype(np.int64)
+    b = _Builder()
+    # inputs are named x_mul/x_shift (the previous op's OUTPUT scale = this LN's input scale);
+    # NOT y_mul/y_shift, which collide with the requant's same-named outputs (SSA).
+    out_names = _emit_layernorm_int8(b, "x_int", "x_zp", "x_mul", "x_shift", gamma_int, beta_int, D,
+                                      eps_q=eps_q)
+    y_out, y_mul, y_shift, y_zp = out_names
+    inputs = [
+        helper.make_tensor_value_info("x_int", INT8, ["B", D]),
+        helper.make_tensor_value_info("x_zp", INT32, ["B", 1]),
+        helper.make_tensor_value_info("x_mul", INT32, ["B", 1]),
+        helper.make_tensor_value_info("x_shift", INT32, ["B", 1]),
+    ]
+    vi = helper.make_tensor_value_info
+    outputs = [vi("y_int8", INT8, ["B", D]), vi("y_mul", INT32, ["B", 1]),
+               vi("y_shift", INT32, ["B", 1]), vi("y_zp", INT32, ["B", 1])]
+    if emit_intermediates:
+        outputs += [vi("ln_u", INT64, ["B", D]), vi("ln_S1", INT64, ["B", 1]),
+                    vi("ln_S2", INT64, ["B", 1]), vi("ln_mean_out", INT64, ["B", 1]),
+                    vi("ln_var_K", INT64, ["B", 1]), vi("ln_eps_K", INT64, ["B", 1]),
+                    vi("ln_s_K", INT64, ["B", 1]), vi("ln_r3_i", INT64, ["B", 1]),
+                    vi("ln_y_int", INT64, ["B", D])]
     g_ = helper.make_graph(b.nodes, model_name, inputs, outputs, initializer=b.inits)
     m = helper.make_model(g_, opset_imports=[helper.make_opsetid("", 18)])
     m.ir_version = 9
