@@ -193,6 +193,30 @@ def test_layernorm_intscale_vs_fp_within_tolerance():
     assert worst < 0.1, f"int-canonical LN abs err {worst} >= 0.1"
 
 
+def test_layernorm_intscale_large_act_shift():
+    """Small-magnitude activations (e.g. the decoder entry embeddings, amax ~0.05) quantize to a
+    per-token act shift y_shift ~27 -> K+2*y_shift > 62. The eps_K shift-both fix (sh = excess)
+    must handle this without overflow and still match fp (sh=0 path is bit-identical; sh>0 adds
+    only the <2^-bitlen(den) den-floor error). Regression guard for the A8.6a decoder entry."""
+    m = hqq_asr.load_whisper_hqq(MODEL, device="cpu", compute_dtype=torch.float32)
+    ln = dict(m.named_modules())["model.encoder.layers.0.self_attn_layer_norm"]
+    gamma, beta, eps = ln.weight.detach(), ln.bias.detach(), ln.eps
+    worst = 0.0
+    for seed in (0, 1, 2):
+        torch.manual_seed(seed)
+        x = torch.randn(8, 384) * 0.05                       # embedding-scale magnitude
+        xi, am, sh, xz = i8.quantize_act_per_token_intscale(x)
+        assert int(sh.max()) > 23, "test premise: y_shift must exceed 23 to exercise the fix"
+        y_int8, ym, ys, yzp = i8.int8_layernorm_intscale(xi, xz, am, sh, gamma, beta, eps)
+        scale = ym.float().reshape(-1, 1) * (2.0 ** (-ys.float().reshape(-1, 1)))
+        y_recon = (y_int8.float() - yzp.float().reshape(-1, 1)) * scale
+        x_recon = (xi.float() - xz.float().reshape(-1, 1)) * am.float().reshape(-1, 1) \
+            * (2.0 ** (-sh.float().reshape(-1, 1)))
+        y_fp = i8.fp_layernorm_ref(x_recon, gamma, beta, eps)
+        worst = max(worst, float((y_recon - y_fp).abs().max()))
+    assert worst < 0.1, f"int-canonical LN (large act shift) abs err {worst} >= 0.1"
+
+
 # --------------------------------------------------------------------------- #
 # A3 (int-canonical): pure-int GELU oracle (int8_gelu_intscale) -- the spec the  #
 # ONNX GELU mirrors bit-exactly. GELU(x) = x*Phi(x), Phi from the int LUT; the   #

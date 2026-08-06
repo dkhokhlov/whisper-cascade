@@ -560,6 +560,14 @@ def _emit_layernorm_int8(b, x_int, x_zp, y_mul_in, y_shift_in, gamma_int, beta_i
     mK2r_i = b.node("Cast", [mK2r], [f"{P}mK2r_i"], f"{P}mK2r_i", to=INT64)
     var_K = b.node("Sub", [var_hi, mK2r_i], [f"{P}var_K"], f"{P}var_sub")        # [B,1]
     # eps_K = round_half_up(p*2^(K+2*y_shift) / (q*y_mul^2)); max(eps_K, 1)
+    # NOTE: this forms p*2^(K+2*y_shift) directly, which overflows int64 for large y_shift
+    # (small-magnitude activations, e.g. the decoder entry embeddings at y_shift~27). The torch
+    # oracle (int8_compute.int8_layernorm_intscale) was fixed to shift BOTH num and den down by
+    # sh=max(0,K+2*y_shift-62) (bit-identical for sh=0). This ONNX emission still uses the
+    # unshifted form -- bit-exact for the sh=0 (magnitude-~1) case the Q6 tests cover, but it
+    # WILL diverge from the oracle for sh>0. When the int8 DECODER ONNX is built (#65/#66, the
+    # decoder entry feeds small-magnitude embeddings here), mirror the shift-both fix: sh =
+    # Max(0, h-62); num = BitShift(one, h-sh); den = BitShift(q*ym^2, -sh) (RightShift by sh).
     ys = b.node("Cast", [y_shift_in], [f"{P}ys"], f"{P}ys_cast", to=INT64)
     ym = b.node("Cast", [y_mul_in], [f"{P}ym"], f"{P}ym_cast", to=INT64)
     two_ys = b.node("Mul", [ys, "c2_i64"], [f"{P}two_ys"], f"{P}two_ys")           # 2*y_shift

@@ -595,7 +595,12 @@ def int8_layernorm_intscale(
       u = x_int - x_zp ; S1 = sum(u) ; S2 = sum(u*u)                  (int64; cast before u*u)
       mean_K = floor_div(S1<<K, D) ; var_K = floor_div(S2<<K, D) - (mean_K^2 >> K)
       eps_K = round_half_up(eps*2^(K+2*y_shift) / y_mul^2) ; max(eps_K, 1)
-            (p/q form, eps=1e-5 -> p=1, q=100000; GUARD K+2*y_shift <= 62)
+            (p/q form, eps=1e-5 -> p=1, q=100000; the numerator p*2^(K+2*y_shift) overflows
+            int64 for large y_shift (small-magnitude activations, e.g. the decoder entry
+            embeddings at y_shift~27); shift BOTH num and den down by sh=max(0,K+2*y_shift-62)
+            -- the result is unchanged up to a <2^-bitlen(den) relative error from the den
+            floor, negligible since eps_K is a stability term. sh=0 for K+2*y_shift<=62, so
+            the magnitude-~1 case is bit-identical to the unshifted form)
       s_K = var_K + eps_K (clamp [1, 2^62))
       bitlen = clz_ladder(s_K) ; bitpos = bitlen-1 ; e = K-bitpos ;
       odd = e & 1 ; half = (e - odd)//2 ; a = R+half
@@ -618,16 +623,20 @@ def int8_layernorm_intscale(
     D_i64 = torch.tensor(D, dtype=torch.int64)
     mean_K = torch.div(S1 << K, D_i64, rounding_mode="floor")                # QK floor (S1 signed)
     var_K = torch.div(S2 << K, D_i64, rounding_mode="floor") - (mean_K * mean_K >> K)
-    # eps_K = round_half_up(eps * 2^(K+2*y_shift) / y_mul^2); eps = p/q (eps=1e-5 -> q=100000)
+    # eps_K = round_half_up(eps * 2^(K+2*y_shift) / y_mul^2); eps = p/q (eps=1e-5 -> q=100000).
+    # The numerator p*2^(K+2*ys) overflows int64 for large y_shift (small-magnitude activations,
+    # e.g. the decoder entry embeddings at y_shift~27). Shift BOTH num and den down by the
+    # per-token excess sh = max(0, K+2*ys-62): num' = p*2^(K+2*ys-sh) (<= 2^62), den' =
+    # floor(q*y_mul^2 / 2^sh). The ratio is unchanged up to a <2^-bitlen(den') relative error
+    # from the den floor -- negligible (eps_K is a stability term). sh=0 for K+2*ys<=62, so the
+    # magnitude-~1 case (the A2 tests + the ONNX mirror) is bit-identical to the unshifted form.
     p, q = 1, int(round(1.0 / eps))
     ys = y_shift_in.to(torch.int64).reshape(-1, 1)
     ym = y_mul_in.to(torch.int64).reshape(-1, 1)
     h = K + 2 * ys
-    if int(h.max()) > 62:
-        raise ValueError(f"int8_layernorm_intscale: K+2*y_shift={int(h.max())} > 62 "
-                          f"(eps_K int64 overflow; require y_shift <= 23)")
-    num = (torch.ones_like(h) * p) << h                                      # p * 2^(K+2*ys), int64
-    den = (q * ym * ym).to(torch.int64)                                      # q * y_mul^2
+    sh = (h - 62).clamp(min=0)                                             # per-token excess over int64 cap
+    num = (torch.ones_like(h) * p) << (h - sh)                             # p * 2^(K+2*ys-sh), <= 2^62
+    den = ((q * ym * ym) >> sh).clamp(min=1)                               # floor(q*y_mul^2 / 2^sh)
     eps_K = torch.clamp(_round_half_up(num, den), min=1)
     s_K = torch.clamp(var_K + eps_K, min=1, max=(1 << 62) - 1)
     # int rsqrt seed via pure-int CLZ bitlen
