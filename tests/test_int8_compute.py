@@ -499,13 +499,95 @@ def test_qk_intscale_vs_fp_attention():
     assert worst < 1e-3, f"int-canonical Q.K^T rel err {worst} >= 1e-3"
 
 
-def test_qk_intscale_pertoken_not_implemented():
-    """The per-token K scale path (per-row score requant) is the other A8.6 variable; it is not
-    yet implemented. Guard that it raises (so the A8.6 gate cannot run an unvalidated path)."""
-    _, _, q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_shift = _qk_inputs()
-    with pytest.raises(NotImplementedError):
-        i8.int8_qk_matmul_intscale(q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_shift,
-                                   d_head=64, kv_scale="pertoken")
+def _kv_pertoken(x):
+    """Per-K/V-token SYMMETRIC (zp=0) int8 over the last dim, matching the layer's centering:
+    quantize_act_per_token_intscale (asymmetric) then center (x_int - x_zp) and clamp. The real
+    value (x_int - x_zp)*scale is unchanged (modulo the rare clamp). Returns (x_int, mul, shift)
+    with x_int in [-127,127], scales [...,T,1], zp=0."""
+    xi, xm, xsh, xz = i8.quantize_act_per_token_intscale(x)
+    return (xi - xz).clamp(-127, 127), xm, xsh
+
+
+def test_qk_intscale_pertoken_vs_fp():
+    """Pertoken K scale: the per-element score scale q_scale[tq]*k_scale[tk] is requanted to the
+    common row scale q_scale*max(k_scale) (ratio = k_scale[tk]/max in (0,1]). The max CEIL-cancels
+    in the dequant (ratio/common), so rel_err vs fp is ~the combine_scales Q1.16 round + the Q30
+    ratio round (~2e-5). Guard < 1e-3 (generous, like the static test)."""
+    import math
+    worst = 0.0
+    for seed in (0, 1, 2, 3):
+        for sig in (0.5, 2.0, 8.0):
+            torch.manual_seed(seed)
+            B, H, Tq, Tk, d = 2, 6, 8, 64, 64
+            q = torch.randn(B, H, Tq, d) * sig
+            k = torch.randn(B, H, Tk, d) * sig
+            q_int, q_mul, q_shift, q_zp = i8.quantize_act_per_token_intscale(q)
+            k_int, k_mul, k_shift = _kv_pertoken(k)                       # zp=0, [B,H,Tk,1]
+            s_int, s_zp, s_mul, s_shift = i8.int8_qk_matmul_intscale(
+                q_int, q_zp, q_mul, q_shift, k_int, torch.zeros_like(k_mul),
+                k_mul, k_shift, d_head=64, kv_scale="pertoken")
+            assert int(s_mul.min()) >= (1 << 15) and int(s_mul.max()) < (1 << 16), "pertoken s_mul out of Q1.16"
+            assert int(s_int.min()) >= -(2 ** 31) and int(s_int.max()) <= 2 ** 31 - 1, "pertoken s_int int32"
+            score_int = s_int.to(torch.float64) * s_mul.to(torch.float64) \
+                * (2.0 ** (-s_shift.to(torch.float64)))
+            q_scale = q_mul.to(torch.float64) * (2.0 ** (-q_shift.to(torch.float64)))   # [B,H,Tq,1]
+            k_scale = k_mul.to(torch.float64) * (2.0 ** (-k_shift.to(torch.float64)))   # [B,H,Tk,1]
+            uq = (q_int - q_zp).to(torch.float64)
+            # per-element score scale q_scale[tq]*k_scale[tk] -> [B,H,Tq,Tk] (transpose k to dim 3)
+            scores_fp = torch.einsum("bhtd,bhud->bhtu", uq, k_int.to(torch.float64)) \
+                * q_scale * k_scale.transpose(-1, -2) / math.sqrt(64)
+            worst = max(worst, i8._rel_err(score_int, scores_fp))
+    assert worst < 1e-3, f"pertoken Q.K^T rel err {worst} >= 1e-3"
+
+
+def test_pv_intscale_pertoken_vs_fp():
+    """Pertoken V scale: each per-term (p*v) product is requanted by ratio = v_scale[tk]/max BEFORE
+    the Tk sum (the per-term scale varies along the SUMMED dim). rel_err < 5% (the P/V int8 budget,
+    same as the static PV test; the A8.6b WER gate measures the real cost)."""
+    worst = 0.0
+    for seed in (0, 1, 2, 3):
+        torch.manual_seed(seed)
+        B, H, Tq, Tk, d = 2, 6, 8, 64, 64
+        logits = torch.randn(B, H, Tq, Tk) * 2.0
+        probs = torch.softmax(logits, dim=-1)
+        p_int, p_mul, p_shift, p_zp = i8.quantize_act_per_token_intscale(probs)   # [B,H,Tq,1]
+        v = torch.randn(B, H, Tk, d) * 2.0
+        v_int, v_mul, v_shift = _kv_pertoken(v)                           # zp=0, [B,H,Tk,1]
+        y_int8, y_mul, y_shift, y_zp = i8.int8_pv_matmul_intscale(
+            p_int, p_zp, p_mul, p_shift, v_int, torch.zeros_like(v_mul),
+            v_mul, v_shift, kv_scale="pertoken")
+        assert int(y_int8.min()) >= -128 and int(y_int8.max()) <= 127, "pertoken PV y out of int8"
+        scale = y_mul.to(torch.float64) * (2.0 ** (-y_shift.to(torch.float64)))
+        recon = (y_int8.to(torch.float64) - y_zp.to(torch.float64)) * scale
+        p_scale = p_mul.to(torch.float64) * (2.0 ** (-p_shift.to(torch.float64)))       # [B,H,Tq,1]
+        v_scale = v_mul.to(torch.float64) * (2.0 ** (-v_shift.to(torch.float64)))       # [B,H,Tk,1]
+        up = (p_int - p_zp).to(torch.float64)
+        # per-term scale p_scale[tq]*v_scale[tk] varies along Tk (the summed dim): apply v_scale
+        # inside the sum (per-tk), p_scale outside (per-tq).
+        term = up.unsqueeze(-1) * v_int.to(torch.float64).unsqueeze(2) \
+            * v_scale.unsqueeze(2)                                   # [B,H,Tq,Tk,d]
+        attn_fp = term.sum(dim=3) * p_scale                          # [B,H,Tq,d] * [B,H,Tq,1]
+        worst = max(worst, i8._rel_err(recon, attn_fp))
+    assert worst < 0.05, f"pertoken P.V rel err {worst} >= 5%"
+
+
+def test_kv_cache_pertoken_append_bitexact():
+    """Pertoken KV is also append-only: a new token's centered int8 + its per-token scale concat
+    without touching past tokens -> bit-exact across iterations (the defining cache property, held
+    by BOTH granularities). Quantize old + new SEPARATELY (centered, per-token), concat, and
+    compare to quantizing the full sequence at once (per-token, then split)."""
+    torch.manual_seed(0)
+    B, H, T_old, T_new, d = 2, 6, 10, 3, 64
+    k_full = torch.randn(B, H, T_old + T_new, d) * 2.0
+    ki_full, km_full, ksh_full = _kv_pertoken(k_full)
+    ki_old, km_old, ksh_old = _kv_pertoken(k_full[:, :, :T_old, :])
+    ki_new, km_new, ksh_new = _kv_pertoken(k_full[:, :, T_old:, :])
+    K = i8.kv_cache_concat(None, ki_old)
+    K = i8.kv_cache_concat(K, ki_new)
+    km = torch.cat([km_old, km_new], dim=2)
+    assert K.shape == (B, H, T_old + T_new, d)
+    assert torch.equal(K, ki_full), "pertoken append concat must equal full-sequence centered quant"
+    assert torch.equal(km, km_full), "pertoken scale concat must equal full-sequence scales"
 
 
 # --------------------------------------------------------------------------- #
@@ -928,3 +1010,81 @@ def test_decoder_layer_intscale_kv_cache():
     o2_dq = i8._dequant_boundary(oi2, oz2, om2, osh2).to(torch.float32)
     assert _corr(o2_dq, out_dec) > 0.99, \
         f"decoder-layer decode corr {_corr(o2_dq, out_dec)} <= 0.99"
+
+
+def test_decoder_layer_intscale_pertoken_vs_fp():
+    """Pertoken K/V path (A8.6b): the chained int8 layer with per-token K/V scales (centered,
+    per-row score requant + per-term PV requant) vs the real WhisperDecoderLayer. corr > 0.99
+    (per-token is a TIGHTER scale than static per-head, so quality is >= static)."""
+    L, _m = _load_decoder_layer()
+    P = _decoder_layer_params(L)
+    H, d = 6, 64
+    B, Tq, D, Src = 2, 8, 384, 30
+    worst_corr, worst_mae = 1.0, 0.0
+    for seed in (0, 1, 2):
+        torch.manual_seed(seed)
+        h_fp = torch.randn(B, Tq, D) * 1.0
+        enc_fp = torch.randn(B, Src, D) * 1.0
+        with torch.no_grad():
+            out_fp = L(h_fp, encoder_hidden_states=enc_fp)
+            out_fp = out_fp[0] if isinstance(out_fp, tuple) else out_fp
+            out_fp = out_fp.to(torch.float32)
+        hi, hm, hsh, hz = i8.quantize_act_per_token_intscale(h_fp)
+        ei, em, esh, ez = i8.quantize_act_per_token_intscale(enc_fp)
+        oi, oz, om, osh, skv, ckv = i8.int8_decoder_layer_intscale(
+            P, hi, hz, hm, hsh, ei, ez, em, esh, None, None,
+            num_heads=H, head_dim=d, is_prefill=True, kv_scale="pertoken")
+        o_dq = i8._dequant_boundary(oi, oz, om, osh).to(torch.float32)
+        worst_corr = min(worst_corr, _corr(o_dq, out_fp))
+        worst_mae = max(worst_mae, float((o_dq - out_fp).abs().mean()))
+        # pertoken cache: K/V [B,H,T,d]; per-token scales [B,1,T,1]
+        assert skv[0].shape == (B, H, Tq, d), f"pertoken self_kv K shape {skv[0].shape}"
+        assert skv[2].shape == (B, 1, Tq, 1), f"pertoken self_kv k_mul shape {skv[2].shape}"
+        assert ckv[0].shape == (B, H, Src, d), f"pertoken cross_kv K shape {ckv[0].shape}"
+    assert worst_corr > 0.99, f"pertoken decoder-layer prefill corr {worst_corr} <= 0.99"
+    assert worst_mae < 0.08, f"pertoken decoder-layer prefill mean_abserr {worst_mae} >= 0.08"
+
+
+def test_decoder_layer_intscale_pertoken_kv_cache():
+    """Pertoken KV cache is append-only too: self Tk grows Tq -> Tq+1 (per-token scales concat),
+    past tokens' int8 + scales unchanged (no requant); cross K/V computed once and carried
+    (identity + bit-identical); decode output matches the real layer (corr > 0.99)."""
+    from transformers.cache_utils import DynamicCache, EncoderDecoderCache
+    L, _m = _load_decoder_layer()
+    P = _decoder_layer_params(L)
+    H, d = 6, 64
+    B, Tq, D, Src = 2, 8, 384, 30
+    torch.manual_seed(0)
+    h_fp = torch.randn(B, Tq, D) * 1.0
+    enc_fp = torch.randn(B, Src, D) * 1.0
+    hi, hm, hsh, hz = i8.quantize_act_per_token_intscale(h_fp)
+    ei, em, esh, ez = i8.quantize_act_per_token_intscale(enc_fp)
+    oi, oz, om, osh, skv, ckv = i8.int8_decoder_layer_intscale(
+        P, hi, hz, hm, hsh, ei, ez, em, esh, None, None,
+        num_heads=H, head_dim=d, is_prefill=True, kv_scale="pertoken")
+    assert skv[0].shape[2] == Tq, "pertoken prefill self_kv Tk"
+    ck_k0, ck_v0, ck_km0 = ckv[0].clone(), ckv[1].clone(), ckv[2].clone()
+    torch.manual_seed(1)
+    h_dec = torch.randn(B, 1, D) * 1.0
+    dhi, dhm, dhsh, dhz = i8.quantize_act_per_token_intscale(h_dec)
+    oi2, oz2, om2, osh2, skv2, ckv2 = i8.int8_decoder_layer_intscale(
+        P, dhi, dhz, dhm, dhsh, ei, ez, em, esh, skv, ckv,
+        num_heads=H, head_dim=d, is_prefill=False, kv_scale="pertoken")
+    # self cache grew by one token; past int8 AND past per-token scales unchanged (append-only)
+    assert skv2[0].shape[2] == Tq + 1, f"pertoken decode self_kv Tk {skv2[0].shape[2]} != {Tq + 1}"
+    assert skv2[2].shape[2] == Tq + 1, "pertoken decode self_kv k_mul Tk"
+    assert torch.equal(skv2[0][:, :, :Tq, :], skv[0]), "pertoken prefill self K altered by append"
+    assert torch.equal(skv2[2][:, :, :Tq, :], skv[2]), "pertoken prefill self k_mul altered by append"
+    # cross K/V carried unchanged (computed once at prefill, identity on reuse)
+    assert ckv2 is ckv, "pertoken cross_kv must be the same object on reuse (compute-once)"
+    assert torch.equal(ckv2[0], ck_k0) and torch.equal(ckv2[1], ck_v0) and torch.equal(ckv2[2], ck_km0), \
+        "pertoken cross K/V/scale altered"
+    with torch.no_grad():
+        ec = EncoderDecoderCache(DynamicCache(), DynamicCache())
+        _ = L(h_fp, encoder_hidden_states=enc_fp, past_key_value=ec)
+        out_dec = L(h_dec, encoder_hidden_states=enc_fp, past_key_value=ec)
+        out_dec = out_dec[0] if isinstance(out_dec, tuple) else out_dec
+        out_dec = out_dec.to(torch.float32)
+    o2_dq = i8._dequant_boundary(oi2, oz2, om2, osh2).to(torch.float32)
+    assert _corr(o2_dq, out_dec) > 0.99, \
+        f"pertoken decoder-layer decode corr {_corr(o2_dq, out_dec)} <= 0.99"

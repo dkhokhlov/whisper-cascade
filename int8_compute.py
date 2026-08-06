@@ -1205,6 +1205,53 @@ def quantize_kv_static_per_head_intscale(k: torch.Tensor):
     return k_int, k_mul, k_shift, k_zp
 
 
+def _pertoken_row_scale(mul_a, sh_a, mul_b, sh_b, max_dim):
+    """Common per-row Q1.16 scale + per-element fixed-point ratio for the pertoken K/V path
+    (A8.6b) -- pure-int (no runtime fp).
+
+    scale_a = mul_a*2^-sh_a: the per-row scale (q_scale [B,1,Tq,1] or p_scale), constant along
+    the K/V-token dim. scale_b = mul_b*2^-sh_b: the per-K/V-token scale ([B,1,Tk,1]), varying
+    along max_dim. The real per-element value is acc*scale_a*scale_b, so the per-element scale
+    varies along max_dim -> a per-row requant to a COMMON scale is required before the softmax
+    (Q.K^T) or the output requant (P.V). The common per-row scale = scale_a*max(scale_b); each
+    element is then scaled by ratio = scale_b/max(scale_b) in (0,1].
+
+    Returns (common_mul, common_shift [broadcast of a and max_b] Q1.16 in [2^15,2^16),
+             ratio_mul, ratio_shift [shape of b] fixed-point in [2^30,2^31) s.t.
+             ratio_mul*2^-ratio_shift = scale_b/max(scale_b)).
+
+    The max is CEIL-normalized to Q1.16 so common_scale >= every per-element scale -> ratio <=
+    1 everywhere (no score clipping); the ceil costs <= 1 LSB of the scale mantissa (negligible,
+    and it only widens the common scale by a near-1 factor). The max itself is taken over
+    EXACT ints: align every scale_b to the LARGEST shift (smallest power-of-two) and left-shift
+    the mantissa -- no floor loss -- then amax. The ratio is (mul_b/maxb_mul)*2^(maxb_shift-sh_b)
+    as a round-half-up fixed-point, bitlen-normalized to [2^30,2^31).
+    """
+    sh_max = sh_b.amax(dim=max_dim, keepdim=True).to(torch.int64)             # [..,1]
+    aligned = mul_b.to(torch.int64) << (sh_max - sh_b.to(torch.int64))        # [..,Tk] exact int
+    max_aligned = aligned.amax(dim=max_dim, keepdim=True)                     # [..,1] exact int
+    bl = _int_bitlen(max_aligned)                                             # floor(log2)+1
+    e = (bl - 16).clamp(min=0)                                                # right-shift to ~2^16
+    denom = torch.ones_like(max_aligned) << e
+    maxb_mul = -((-max_aligned) // denom)                                     # ceil(max/denom) (>= true max)
+    maxb_shift = (sh_max + e).to(torch.int32)                                 # [..,1] Q1.16
+    # common per-row scale = scale_a * max(scale_b) (Q1.16, broadcast over the row)
+    common_mul, common_shift = _combine_scales_q116(
+        mul_a.to(torch.int64), sh_a.to(torch.int64), maxb_mul, maxb_shift)
+    common_mul = common_mul.to(torch.int32)
+    common_shift = common_shift.to(torch.int32)
+    # ratio = scale_b / max(scale_b) = (mul_b/maxb_mul) * 2^(maxb_shift - sh_b), fixed-point
+    d = maxb_shift.to(torch.int64) - sh_b.to(torch.int64)                     # [..,Tk] power-of-two exp
+    K30 = torch.tensor(30, dtype=torch.int64)
+    ratio_mul = _round_half_up(mul_b.to(torch.int64) << K30, maxb_mul)        # (mul_b/maxb_mul)*2^30
+    ratio_shift = (K30 - d).to(torch.int32)                                   # sh_r = 30 - d
+    blr = _int_bitlen(ratio_mul)                                              # normalize to [2^30,2^31)
+    sh_add = (31 - blr).clamp(min=0)
+    ratio_mul = (ratio_mul << sh_add).clamp(max=(1 << 31) - 1)
+    ratio_shift = (ratio_shift.to(torch.int64) + sh_add).to(torch.int32)
+    return common_mul, common_shift, ratio_mul.to(torch.int32), ratio_shift
+
+
 def int8_qk_matmul_intscale(q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_shift,
                             d_head=64, kv_scale="static", return_intermediates=False):
     """Int-canonical int8 Q.K^T + score path (A8.1) -- the zero-fp oracle the ONNX mirrors.
@@ -1214,10 +1261,10 @@ def int8_qk_matmul_intscale(q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_s
       kv_scale="static":  per [1,H,1,1] (one FIXED K scale per head -- the append-only cache
         form, from quantize_kv_static_per_head_intscale). The score scale is per [B,H,Tq,1] =
         q_scale*k_static -> feeds int8_softmax_intscale directly, per-row (no score requant).
-      kv_scale="pertoken": per [B,H,Tk,1] (each K token its own scale). The score scale is per
-        [B,H,Tq,Tk] -> a per-row requant of the int32 scores to a common [B,H,Tq,1] scale is
-        REQUIRED before the softmax (codex's caveat); NOT YET implemented (raises -- added
-        before the A8.6 gate).
+      kv_scale="pertoken": per [B,1,Tk,1] (each K token its own scale, zp=0 symmetric -- the
+        layer centers the k_proj output). The per-element score scale q_scale*k_scale[tk] varies
+        along Tk -> a per-row requant of the int32 scores to the common scale q_scale*max(k_scale)
+        is REQUIRED before the softmax (codex's caveat); done via _pertoken_row_scale.
 
     scores_int [B,H,Tq,Tk] = sum_d (q_int-q_zp)*(k_int-k_zp)  (int32, int64 accumulator). attn
     scale 1/sqrt(d_head): for d_head=64 an exact >>3 (round-half-up) on scores_int; the score
@@ -1226,9 +1273,6 @@ def int8_qk_matmul_intscale(q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_s
     int32 Q1.16, s_shift [B,H,Tq,1] int32). Pure-int throughout (no runtime fp).
     """
     import math
-    if kv_scale == "pertoken":
-        raise NotImplementedError("int8_qk_matmul_intscale: kv_scale='pertoken' (per-row score "
-                                 "requant) -- A8 static path first; pertoken added before A8.6.")
     # centered int operands (int64 so the d-fold sum stays exact before the attn-scale shift)
     uq = q_int.to(torch.int64) - q_zp.to(torch.int64)                # [B,H,Tq,d]
     uk = k_int.to(torch.int64) - k_zp.to(torch.int64)               # [B,H,Tk,d]
@@ -1240,7 +1284,29 @@ def int8_qk_matmul_intscale(q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_s
                                  f"perfect square (tiny uses 64); general case = fixed-point mul.")
     shift = int(math.log2(s))                                       # 3 for d_head=64
     scaled = _rshift_round(scores, shift).to(torch.int32)           # [B,H,Tq,Tk]
-    # score scale = q_scale*k_scale -> single Q1.16 per [B,H,Tq,1] (k scale broadcast over Tk)
+    if kv_scale == "pertoken":
+        # per-row score requant: common scale = q_scale*max(k_scale) per [B,H,Tq,1]; each score
+        # scaled by ratio = k_scale[tk]/max(k_scale) (in (0,1]). k_zp is 0 (symmetric, centered).
+        cm, csh, rm, rsh = _pertoken_row_scale(q_mul, q_shift, k_mul, k_shift, max_dim=2)
+        # ratio is [B,?,Tk,1] (Tk at dim 2 of k_mul); align Tk to the scores' dim 3 -> [B,?,1,Tk].
+        rm = rm.transpose(-1, -2).contiguous()
+        rsh = rsh.transpose(-1, -2).contiguous()
+        s_int = _rshift_round(
+            scaled.to(torch.int64) * rm.to(torch.int64), rsh.to(torch.int64)
+        ).to(torch.int32)                                           # [B,H,Tq,Tk] in the common row scale
+        # expand the common scale to the scores' full batch shape [B,H,Tq,1] (heads() supplies
+        # per-token scales broadcast over H -> cm is [B,1,Tq,1]; softmax flattens [B,H,Tq,Tk]).
+        bsh = scaled.shape[:-1]                                     # (B,H,Tq)
+        cm = cm.expand(*bsh, 1).contiguous()
+        csh = csh.expand(*bsh, 1).contiguous()
+        s_zp = torch.zeros(*bsh, 1, dtype=torch.int32)             # [B,H,Tq,1]
+        if return_intermediates:
+            inter = {"uq": uq, "uk": uk, "scores": scores, "scaled": scaled,
+                     "s_mul": cm, "s_shift": csh, "attn_shift": shift,
+                     "ratio_mul": rm, "ratio_shift": rsh}
+            return s_int, s_zp, cm, csh, inter
+        return s_int, s_zp, cm, csh
+    # static: score scale = q_scale*k_scale -> single Q1.16 per [B,H,Tq,1] (k broadcast over Tk)
     s_mul, s_shift = _combine_scales_q116(
         q_mul.to(torch.int64), q_shift.to(torch.int64),
         k_mul.to(torch.int64), k_shift.to(torch.int64),
@@ -1256,17 +1322,24 @@ def int8_qk_matmul_intscale(q_int, q_zp, q_mul, q_shift, k_int, k_zp, k_mul, k_s
 
 
 def int8_pv_matmul_intscale(p_int, p_zp, p_mul, p_shift, v_int, v_zp, v_mul, v_shift,
-                            return_intermediates=False):
+                            kv_scale="static", return_intermediates=False):
     """Int-canonical int8 P.V (A8.2) -- the zero-fp oracle the ONNX mirrors.
 
     P [B,H,Tq,Tk] int32 (int8-range, the int8_softmax_intscale output boundary form);
     p_zp/p_mul/p_shift per [B,H,Tq,1] (per-query-token Q1.16). V [B,H,Tk,d] int32 (int8-range,
-    static per-head symmetric, v_zp=0; v_mul/v_shift per [1,H,1,1], the same granularity as K).
-    attn_int [B,H,Tq,d] = sum_tk (p_int-p_zp)*(v_int-v_zp)  (int64 accumulator). The attn-output
-    scale = p_scale*v_scale combined to a single Q1.16 per [B,H,Tq,1] (v scale broadcast over Tk).
+    symmetric, v_zp=0):
+      kv_scale="static":  v_mul/v_shift per [1,H,1,1] (one FIXED V scale per head). The attn-output
+        scale = p_scale*v_scale combined to a single Q1.16 per [B,H,Tq,1] (v broadcast over Tk).
+        attn_int = sum_tk (p-p_zp)*(v-v_zp) directly (the per-term scale is constant over Tk).
+      kv_scale="pertoken": v_mul/v_shift per [B,1,Tk,1] (each V token its own scale). The per-term
+        scale p_scale*v_scale[tk] varies along Tk (the SUMMED dim) -> the requant must apply to
+        each TERM before the sum: term_c = rshift_round((p-p_zp)*(v-v_zp)*ratio, rsh) with
+        ratio = v_scale[tk]/max(v_scale) in (0,1]; attn = sum_tk term_c; common output scale =
+        p_scale*max(v_scale) per [B,H,Tq,1]. _pertoken_row_scale gives (common, ratio).
     Output boundary form via int8_output_requant_intscale (the shared Stage 1b), flattened
-    [B,H,Tq,d]->[B*H*Tq,d] (row b*H*Tq+tq); act_mul=combined scale, F=0, bias=None. The output
-    gets a fresh per-row scale for the next op (out_proj), which consumes it as its activation.
+    [B,H,Tq,d]->[B*H*Tq,d] (row b*H*Tq+tq); act_mul=combined/common scale, F=0, bias=None. The
+    output gets a fresh per-row scale for the next op (out_proj), which consumes it as its
+    activation.
 
     Returns (y_int8 [B,H,Tq,d] int32, y_mul [B,H,Tq,1] int32, y_shift [B,H,Tq,1] int32,
     y_zp [B,H,Tq,1] int32). Pure-int throughout (no runtime fp).
@@ -1275,12 +1348,27 @@ def int8_pv_matmul_intscale(p_int, p_zp, p_mul, p_shift, v_int, v_zp, v_mul, v_s
     d = v_int.shape[-1]
     up = p_int.to(torch.int64) - p_zp.to(torch.int64)               # [B,H,Tq,Tk]
     uv = v_int.to(torch.int64) - v_zp.to(torch.int64)               # [B,H,Tk,d]
-    attn = torch.einsum("bhtu,bhud->bhtd", up, uv)                  # [B,H,Tq,d] int64
-    # attn-output scale = p_scale*v_scale -> single Q1.16 per [B,H,Tq,1]
-    out_mul, out_shift = _combine_scales_q116(
-        p_mul.to(torch.int64), p_shift.to(torch.int64),
-        v_mul.to(torch.int64), v_shift.to(torch.int64),
-    )                                                               # [B,H,Tq,1] int32 each
+    if kv_scale == "pertoken":
+        # per-term requant: the per-term scale varies along Tk (the summed dim), so requant each
+        # (p-p_zp)*(v-v_zp) product by ratio = v_scale[tk]/max(v_scale) BEFORE the Tk sum.
+        cm, csh, rm, rsh = _pertoken_row_scale(p_mul, p_shift, v_mul, v_shift, max_dim=2)
+        term = up.unsqueeze(-1) * uv.unsqueeze(-3)                  # [B,H,Tq,Tk,d] int64
+        # ratio is [B,?,Tk,1] (Tk at dim 2 of v_mul); align Tk to the term's dim 3 -> [B,?,1,Tk,1].
+        rm5 = rm.transpose(-1, -2).unsqueeze(-1).contiguous()
+        rsh5 = rsh.transpose(-1, -2).unsqueeze(-1).contiguous()
+        term_c = _rshift_round(term * rm5, rsh5)                    # [B,H,Tq,Tk,d] int64 @ common
+        attn = term_c.sum(dim=3)                                    # [B,H,Tq,d] int64
+        # expand the common scale to [B,H,Tq,1] (p_mul from heads() is [B,1,Tq,1]; the flatten
+        # below produces B*H*Tq rows, one per (b,h,tq), all sharing the per-token scale).
+        bsh = attn.shape[:-1]                                       # (B,H,Tq)
+        out_mul = cm.expand(*bsh, 1).contiguous()
+        out_shift = csh.expand(*bsh, 1).contiguous()
+    else:
+        attn = torch.einsum("bhtu,bhud->bhtd", up, uv)              # [B,H,Tq,d] int64
+        out_mul, out_shift = _combine_scales_q116(
+            p_mul.to(torch.int64), p_shift.to(torch.int64),
+            v_mul.to(torch.int64), v_shift.to(torch.int64),
+        )                                                           # [B,H,Tq,1] int32 each
     # flatten -> shared per-row requant (F=0, no bias); reshape back to [B,H,Tq,*]
     attn_flat = attn.reshape(B * H * Tq, d)
     out_mul_flat = out_mul.to(torch.int32).reshape(B * H * Tq, 1)
@@ -1492,12 +1580,16 @@ def int8_decoder_layer_intscale(P, h_int, h_zp, h_mul, h_shift,
        scale,bias,g)).
     h_*: input hidden boundary [B,Tq,D], scales [B,Tq,1].
     enc_*: encoder hidden boundary [B,Src,D], scales [B,Src,1].
-    self_kv: None (first call) or (K_int [B,H,Tk,d], V_int, k_mul, k_shift, v_mul, v_shift) with
-       per-head static scales [1,H,1,1] (zp=0).
-    cross_kv: None (first call) or (K_int [B,H,Src,d], V_int, k_mul, k_shift, v_mul, v_shift).
+    self_kv: None (first call) or the cached K/V tuple (shape depends on kv_scale -- see below).
+    cross_kv: None (first call) or the cached cross K/V tuple (computed once, carried).
     is_prefill: True for the multi-token prompt step (triangular causal mask); False for decode
        (Tq=1, no mask -- the current query attends to all cached keys).
-    kv_scale: "static" only for now (the A8.6 pertoken path raises in int8_qk_matmul_intscale).
+    kv_scale: "static" (per-(layer,head) [1,H,1,1], zp=0; cache = (K,V,k_mul,k_shift,v_mul,
+       v_shift) with per-head scales, append-only under the fixed scale) or "pertoken" (per-K/V-
+       token [B,1,T,1], zp=0; the k_proj/v_proj output is CENTERED to symmetric; cache =
+       (K,V,k_mul,k_shift,v_mul,v_shift) with per-token scales, append-only -- each new token
+       brings its own scale, no past-token requant). fp is used only for the one-time static
+       calibration (static path); pertoken is pure-int at runtime (no fp calibration).
 
     Chain (WhisperDecoderLayer.forward order):
       self_attn(self_attn_layer_norm(h)) -> +h ; encoder_attn(encoder_attn_layer_norm(h),
@@ -1507,9 +1599,6 @@ def int8_decoder_layer_intscale(P, h_int, h_zp, h_mul, h_shift,
     Returns (h_out_int, h_out_zp, h_out_mul, h_out_shift [B,Tq,D]+[B,Tq,1],
               new_self_kv, new_cross_kv).
     """
-    if kv_scale != "static":
-        raise NotImplementedError("int8_decoder_layer_intscale: kv_scale='pertoken' -- A8.6 (the "
-                                 "per-row score requant); static path first.")
     B, Tq, D = h_int.shape
     H, d = num_heads, head_dim
     assert H * d == D, f"num_heads*head_dim ({H*d}) != embed_dim ({D})"
@@ -1581,6 +1670,46 @@ def int8_decoder_layer_intscale(P, h_int, h_zp, h_mul, h_shift,
         return (y.reshape(*lead, K), yzp.reshape(*lead, 1),
                 ym.reshape(*lead, 1), ysh.reshape(*lead, 1))
 
+    def kv_update(kv_cache, kh_, kzh_, kmh_, kshh_, vh_, vzh_, vmh_, vshh_):
+        """Append this step's K/V (boundary [B,H,Tq,d], scales [B,1,Tq,1]) to the cache and return
+        the current K/V in the form the matmuls consume: (K_cur, V_cur, k_zp, k_mul, k_shift,
+        v_mul, v_shift, new_cache). Both granularities are append-only (bit-exact across iters):
+          static:   on the first call derive the fixed per-head scale (fp calibration), requant
+                    every step's K/V to it; cache = (K,V,k_sm,k_ssh,v_sm,v_ssh), k_zp=0 [1,H,1,1].
+          pertoken: center K/V to symmetric (zp=0) and KEEP the per-token scale; cache =
+                    (K,V,k_mul[B,1,T,1],k_shift,v_mul,v_shift), k_zp=0 [B,1,1,1]. No requant of
+                    past tokens (each carries its own scale)."""
+        if kv_scale == "static":
+            if kv_cache is None:
+                k_sm, k_ssh = derive_static_scale_q116(_dequant_boundary(kh_, kzh_, kmh_, kshh_))
+                v_sm, v_ssh = derive_static_scale_q116(_dequant_boundary(vh_, vzh_, vmh_, vshh_))
+                K_old, V_old = None, None
+            else:
+                K_old, V_old, k_sm, k_ssh, v_sm, v_ssh = kv_cache
+            k_used = requant_to_static_intscale(kh_, kzh_, kmh_, kshh_, k_sm, k_ssh)
+            v_used = requant_to_static_intscale(vh_, vzh_, vmh_, vshh_, v_sm, v_ssh)
+            K_cur = kv_cache_concat(K_old, k_used)
+            V_cur = kv_cache_concat(V_old, v_used)
+            new_cache = (K_cur, V_cur, k_sm, k_ssh, v_sm, v_ssh)
+            k_zp = _zH()
+            return K_cur, V_cur, k_zp, k_sm, k_ssh, v_sm, v_ssh, new_cache
+        # pertoken: center to symmetric (zp=0), keep the per-token scale; concat scales along T
+        k_sym = (kh_ - kzh_).clamp(-127, 127)
+        v_sym = (vh_ - vzh_).clamp(-127, 127)
+        if kv_cache is None:
+            K_old, V_old, km_c, ks_c, vm_c, vs_c = None, None, None, None, None, None
+        else:
+            K_old, V_old, km_c, ks_c, vm_c, vs_c = kv_cache
+        K_cur = kv_cache_concat(K_old, k_sym)
+        V_cur = kv_cache_concat(V_old, v_sym)
+        km_cur = torch.cat([km_c, kmh_], dim=2) if km_c is not None else kmh_
+        ks_cur = torch.cat([ks_c, kshh_], dim=2) if ks_c is not None else kshh_
+        vm_cur = torch.cat([vm_c, vmh_], dim=2) if vm_c is not None else vmh_
+        vs_cur = torch.cat([vs_c, vshh_], dim=2) if vs_c is not None else vshh_
+        new_cache = (K_cur, V_cur, km_cur, ks_cur, vm_cur, vs_cur)
+        k_zp = torch.zeros(B, 1, 1, 1, dtype=torch.int32)
+        return K_cur, V_cur, k_zp, km_cur, ks_cur, vm_cur, vs_cur, new_cache
+
     # --- self-attention --------------------------------------------------------
     n_i, n_z, n_m, n_sh = ln(P["self_attn_ln"], h_int, h_zp, h_mul, h_shift)
     q_i, q_z, q_m, q_sh = lin(SA["q_proj"], n_i, n_z, n_m, n_sh)
@@ -1589,21 +1718,11 @@ def int8_decoder_layer_intscale(P, h_int, h_zp, h_mul, h_shift,
     qh, qzh, qmh, qshh = heads(q_i, q_z, q_m, q_sh, Tq)
     kh, kzh, kmh, kshh = heads(k_i, k_z, k_m, k_sh, Tq)
     vh, vzh, vmh, vshh = heads(v_i, v_z, v_m, v_sh, Tq)
-    # static per-head K/V scale: derive on the first call (calibration), reuse thereafter
-    if self_kv is None:
-        k_sm, k_ssh = derive_static_scale_q116(_dequant_boundary(kh, kzh, kmh, kshh))
-        v_sm, v_ssh = derive_static_scale_q116(_dequant_boundary(vh, vzh, vmh, vshh))
-        K_old, V_old = None, None
-    else:
-        K_old, V_old, k_sm, k_ssh, v_sm, v_ssh = self_kv
-    k_static = requant_to_static_intscale(kh, kzh, kmh, kshh, k_sm, k_ssh)     # [B,H,Tq,d] [-127,127]
-    v_static = requant_to_static_intscale(vh, vzh, vmh, vshh, v_sm, v_ssh)
-    K_cur = kv_cache_concat(K_old, k_static)                                   # [B,H,Tk,d]
-    V_cur = kv_cache_concat(V_old, v_static)
-    new_self_kv = (K_cur, V_cur, k_sm, k_ssh, v_sm, v_ssh)
-    # Q.K^T + score scale (static K -> per-row score scale, no score requant)
+    K_cur, V_cur, kv_zp, k_vm, k_vsh, v_vm, v_vsh, new_self_kv = kv_update(
+        self_kv, kh, kzh, kmh, kshh, vh, vzh, vmh, vshh)
+    # Q.K^T + score scale (static: per-row, no requant; pertoken: per-row requant to common scale)
     s_i, s_z, s_m, s_sh = int8_qk_matmul_intscale(
-        qh, qzh, qmh, qshh, K_cur, _zH(), k_sm, k_ssh, d_head=d)
+        qh, qzh, qmh, qshh, K_cur, kv_zp, k_vm, k_vsh, d_head=d, kv_scale=kv_scale)
     # causal mask (prefill only; decode Tq=1 attends to all cached keys)
     if is_prefill:
         Tk = K_cur.shape[2]
@@ -1611,7 +1730,7 @@ def int8_decoder_layer_intscale(P, h_int, h_zp, h_mul, h_shift,
         s_i = s_i.masked_fill(mask.view(1, 1, Tq, Tk), -(1 << 20))
     p_i, p_z, p_m, p_sh = softmax_scores(s_i, s_z, s_m, s_sh)
     a_i, a_z, a_m, a_sh = _b(int8_pv_matmul_intscale(                           # P.V (int8)
-        p_i, p_z, p_m, p_sh, V_cur, _zH(), v_sm, v_ssh))
+        p_i, p_z, p_m, p_sh, V_cur, kv_zp, v_vm, v_vsh, kv_scale=kv_scale))
     ao_i, ao_z, ao_m, ao_sh = merge_heads(a_i, a_z, a_m, a_sh)                 # [B,Tq,D]
     o_i, o_z, o_m, o_sh = lin(SA["out_proj"], ao_i, ao_z, ao_m, ao_sh)
     h1_i, h1_z, h1_m, h1_sh = _b(int8_residual_add_intscale(                    # + residual (self-attn)
@@ -1623,24 +1742,23 @@ def int8_decoder_layer_intscale(P, h_int, h_zp, h_mul, h_shift,
     cqh, cqzh, cqmh, cqshh = heads(cq_i, cq_z, cq_m, cq_sh, Tq)
     Src = enc_int.shape[1]
     if cross_kv is None:
+        # cross K/V computed ONCE from the encoder output, then carried (never recomputed).
         ck_i, ck_z, ck_m, ck_sh = lin(EA["k_proj"], enc_int, enc_zp, enc_mul, enc_shift)
         cv_i, cv_z, cv_m, cv_sh = lin(EA["v_proj"], enc_int, enc_zp, enc_mul, enc_shift)
         ckh, ckzh, ckmh, ckshh = heads(ck_i, ck_z, ck_m, ck_sh, Src)
         cvh, cvzh, cvmh, cvshh = heads(cv_i, cv_z, cv_m, cv_sh, Src)
-        ck_sm, ck_ssh = derive_static_scale_q116(_dequant_boundary(ckh, ckzh, ckmh, ckshh))
-        cv_sm, cv_ssh = derive_static_scale_q116(_dequant_boundary(cvh, cvzh, cvmh, cvshh))
-        ck_int = requant_to_static_intscale(ckh, ckzh, ckmh, ckshh, ck_sm, ck_ssh)
-        cv_int = requant_to_static_intscale(cvh, cvzh, cvmh, cvshh, cv_sm, cv_ssh)
-        new_cross_kv = (ck_int, cv_int, ck_sm, ck_ssh, cv_sm, cv_ssh)
+        ck_int, cv_int, ckv_zp, ck_vm, ck_vsh, cv_vm, cv_vsh, new_cross_kv = kv_update(
+            None, ckh, ckzh, ckmh, ckshh, cvh, cvzh, cvmh, cvshh)
     else:
         new_cross_kv = cross_kv
-        ck_int, cv_int, ck_sm, ck_ssh, cv_sm, cv_ssh = cross_kv
+        ck_int, cv_int, ck_vm, ck_vsh, cv_vm, cv_vsh = cross_kv
+        ckv_zp = _zH() if kv_scale == "static" else torch.zeros(B, 1, 1, 1, dtype=torch.int32)
     # cross Q.K^T (no causal mask; full src attendable)
     cs_i, cs_z, cs_m, cs_sh = int8_qk_matmul_intscale(
-        cqh, cqzh, cqmh, cqshh, ck_int, _zH(), ck_sm, ck_ssh, d_head=d)
+        cqh, cqzh, cqmh, cqshh, ck_int, ckv_zp, ck_vm, ck_vsh, d_head=d, kv_scale=kv_scale)
     cp_i, cp_z, cp_m, cp_sh = softmax_scores(cs_i, cs_z, cs_m, cs_sh)
     ca_i, ca_z, ca_m, ca_sh = _b(int8_pv_matmul_intscale(                       # cross P.V (int8)
-        cp_i, cp_z, cp_m, cp_sh, cv_int, _zH(), cv_sm, cv_ssh))
+        cp_i, cp_z, cp_m, cp_sh, cv_int, ckv_zp, cv_vm, cv_vsh, kv_scale=kv_scale))
     cao_i, cao_z, cao_m, cao_sh = merge_heads(ca_i, ca_z, ca_m, ca_sh)
     co_i, co_z, co_m, co_sh = lin(EA["out_proj"], cao_i, cao_z, cao_m, cao_sh)
     h2_i, h2_z, h2_m, h2_sh = _b(int8_residual_add_intscale(                    # + residual (cross-attn)
