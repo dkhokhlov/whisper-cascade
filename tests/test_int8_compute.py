@@ -110,3 +110,84 @@ def test_output_requant_differential(seed):
     rate = tot_y / tot_n
     assert rate < 1e-3, f"y_int8 mismatch rate {rate} exceeds 0.1% (ties)"
     assert worst <= 1, f"y_int8 worst |d| {worst} > 1 LSB"
+
+# --------------------------------------------------------------------------- #
+# A2 int-canonical LayerNorm (int8_layernorm_intscale): the zero-fp oracle the
+# ONNX LayerNorm mirrors bit-exactly. Pure-int (eps_K from int scale, CLZ rsqrt
+# seed, no fp fallback). Validates the reference BEFORE the ONNX emission.
+# --------------------------------------------------------------------------- #
+
+def _ln_inputs(D=384, B=8, sigma=4.0, seed=0):
+    torch.manual_seed(seed)
+    x = torch.randn(B, D) * sigma
+    xi, am, sh, xz = i8.quantize_act_per_token_intscale(x)
+    return xi, am, sh, xz
+
+
+def test_int_bitlen_powers_of_two():
+    """CLZ ladder must be exact at 2^k, 2^k-1, 2^k+1 (off-by-one shifts the seed 2x)."""
+    for k in range(1, 56):
+        for off, want in [(0, k + 1), (-1, k), (1, k + 1)]:
+            s = torch.tensor([max(1, (1 << k) + off)], dtype=torch.int64)
+            assert int(i8._int_bitlen(s).item()) == want, f"bitlen(2^{k}{'+' if off>=0 else ''}{off})"
+
+
+def test_layernorm_intscale_rsqrt_converges():
+    """4 Newton iters converge to rsqrt(s_K/2^K)*2^R within ~1e-6 across s_K in [2^8, 2^30]."""
+    K, R = i8._LN_K, i8._LN_R
+    s_K = torch.tensor([1 << 8, (1 << 10) + 3, 1 << 14, 1 << 20,
+                        (1 << 24) + 999, 1 << 28, (1 << 30) - 7], dtype=torch.int64).reshape(-1, 1)
+    s = i8._int_bitlen(s_K); bitpos = s - 1; e = K - bitpos
+    odd = e & 1; half = (e - odd) // 2; a = R + half
+    sqrt2_Q20 = 1482910
+    C = torch.where(odd == 1, torch.full_like(s_K, 8409 * sqrt2_Q20),
+                    torch.full_like(s_K, 8409 * (1 << 20)))
+    seed = i8._round_half_up(C << a.clamp(min=0), torch.full_like(s_K, 10000 * (1 << 20)))
+    r = seed; three = torch.full_like(s_K, 3 * (1 << R)); hr = torch.full_like(s_K, 1 << (R - 1))
+    for _ in range(4):
+        t = ((s_K * r) * r) >> (K + R)
+        r = (r * (three - t) + hr) >> (R + 1)
+    r_true = (1.0 / torch.sqrt(s_K.float() / 2 ** K)) * 2 ** R
+    rel = (r.float() - r_true).abs() / r_true
+    assert float(rel.max()) < 1e-5, f"rsqrt rel err {rel.max().item()} > 1e-5"
+
+
+def test_layernorm_intscale_self_consistent():
+    """Dequant of (y_int8, y_mul, y_shift, y_zp) matches y_int/2^(K+R+G) within one int8 step."""
+    m = hqq_asr.load_whisper_hqq(MODEL, device="cpu", compute_dtype=torch.float32)
+    ln = dict(m.named_modules())["model.encoder.layers.0.self_attn_layer_norm"]
+    gamma, beta, eps = ln.weight.detach(), ln.bias.detach(), ln.eps
+    for seed in (0, 1, 2):
+        xi, am, sh, xz = _ln_inputs(seed=seed)
+        y_int8, ym, ys, yzp, inter = i8.int8_layernorm_intscale(
+            xi, xz, am, sh, gamma, beta, eps, return_intermediates=True)
+        scale = ym.float().reshape(-1, 1) * (2.0 ** (-ys.float().reshape(-1, 1)))
+        y_recon = (y_int8.float() - yzp.float().reshape(-1, 1)) * scale
+        y_int_fp = inter["y_int"].float() * (2.0 ** -(16 + 20 + 15))
+        step = (inter["y_int"].amax(-1, keepdim=True).float()
+                - inter["y_int"].amin(-1, keepdim=True).float()) / 255.0
+        err = (y_recon - y_int_fp).abs()
+        assert bool((err < step).all()), f"self-consistency err {err.max().item()} >= step {step.max().item()}"
+        # overflow guards (codex+claude bounds)
+        assert int(inter["y_int"].abs().max()) < (1 << 62), "y_int overflow"
+        assert int((inter["s_K"] * inter["r"]).abs().max()) < (1 << 62), "s_K*r overflow"
+
+
+def test_layernorm_intscale_vs_fp_within_tolerance():
+    """Int-canonical LN output (dequant) vs fp LayerNorm: abs err < 0.1 (int8 + fixed-point
+    budget; the A2 staged WER gate already passed at +ln -0.0090). The int-canonical path adds
+    the int eps_K + int rsqrt seed approximations (both ~lossless)."""
+    m = hqq_asr.load_whisper_hqq(MODEL, device="cpu", compute_dtype=torch.float32)
+    ln = dict(m.named_modules())["model.encoder.layers.0.self_attn_layer_norm"]
+    gamma, beta, eps = ln.weight.detach(), ln.bias.detach(), ln.eps
+    worst = 0.0
+    for seed in (0, 1, 2, 3):
+        xi, am, sh, xz = _ln_inputs(seed=seed)
+        y_int8, ym, ys, yzp = i8.int8_layernorm_intscale(xi, xz, am, sh, gamma, beta, eps)
+        scale = ym.float().reshape(-1, 1) * (2.0 ** (-ys.float().reshape(-1, 1)))
+        y_recon = (y_int8.float() - yzp.float().reshape(-1, 1)) * scale
+        x_recon = (xi.float() - xz.float().reshape(-1, 1)) * am.float().reshape(-1, 1) \
+            * (2.0 ** (-sh.float().reshape(-1, 1)))
+        y_fp = i8.fp_layernorm_ref(x_recon, gamma, beta, eps)
+        worst = max(worst, float((y_recon - y_fp).abs().max()))
+    assert worst < 0.1, f"int-canonical LN abs err {worst} >= 0.1"

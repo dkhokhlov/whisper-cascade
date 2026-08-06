@@ -446,3 +446,16 @@ ORT_DISABLE_ALL. New module `export_onnx_int8.py`.
    `tests/test_int8_onnx.py` now has 16 tests. **Next: the Q6 sub-modules -- one LN, exact-Phi
    GELU LUT, one softmax row, one ConvInteger, one If, one Loop with int loop-carried cache;
    each audited raw + optimized; then a 1-layer decoder -> full encoder + merged-decoder.**
+
+   Q6 int-canonical LayerNorm reference -- DONE (`int8_compute.int8_layernorm_intscale`,
+   codex+claude consensus 2026-08-05). The Phase-A `int8_layernorm(stage=4)` uses runtime fp
+   (eps_K from fp x_scale, rsqrt seed via torch.log2, fp fallback) -- a different algorithm, not
+   a bit-exact oracle. The new reference is PURE-INT throughout: eps_K = round_half_up(
+   eps*2^(K+2*y_shift)/y_mul^2) (p/q form, keep y_mul^2; GUARD y_shift<=23, measured 20);
+   pure-int CLZ bitlen (`_int_bitlen`, mirrors the ONNX ladder -- bit-exact at 2^k/2^k+-1);
+   int rsqrt seed (C = 8409*2^20 or 8409*sqrt2_Q20, no fp fallback -- unreachable for |u|<=255);
+   4 Newton iters (s_K*r^2 = 2^56 invariant, peak 2^57, int64-safe); output REUSES
+   `int8_output_requant_intscale` with F = K+R+G = 51. Validated: CLZ boundaries PASS, rsqrt
+   rel err 7e-7, self-consistency within one int8 step, vs fp LN abs err < 0.1 (median 0.02).
+   `tests/test_int8_compute.py` has 9 tests. **Next: emit the ONNX LayerNorm mirroring this
+   reference (reuse the Stage 1b _clz_ladder + _rhu + output requant), bit-exact verify + audit.**

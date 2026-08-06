@@ -536,6 +536,122 @@ def int8_layernorm(
 
 
 # --------------------------------------------------------------------------- #
+# A2 (int-canonical): pure-int LayerNorm oracle for the zero-fp ONNX emission  #
+# (codex+claude consensus 2026-08-05). The Phase-A int8_layernorm(stage=4) uses  #
+# runtime fp (eps_K from fp x_scale; rsqrt seed via torch.log2; fp fallback),  #
+# so it is a DIFFERENT algorithm, not a bit-exact oracle. This reference is    #
+# pure-int throughout and is the spec the ONNX LayerNorm mirrors bit-exactly.  #
+# --------------------------------------------------------------------------- #
+
+def _int_bitlen(s: torch.Tensor) -> torch.Tensor:
+    """Pure-int bit-length = floor(log2(s)) + 1 via a 6-level CLZ ladder, all int64.
+    Mirrors the ONNX _clz_ladder so the torch reference and the ONNX emission use identical
+    CLZ logic (bit-exact at powers of two). s int64 > 0, clamped to [1, 2^62); returns int64.
+    The k=1 step's largest threshold is 2^62 (s < 2^62 by the cap, so the 2^63 step -- which
+    would overflow the int64 cast -- is never taken)."""
+    s = torch.clamp(s.to(torch.int64), min=1, max=(1 << 62) - 1)
+    b = torch.zeros_like(s)
+    ge = s >= (1 << 32)
+    b = torch.where(ge, b + 32, b)
+    one = torch.ones_like(s)
+    for k in (16, 8, 4, 2, 1):
+        shift = (b + k).clamp(max=62)                                       # never 1<<63
+        thr = torch.bitwise_left_shift(one, shift)                          # 2^(b+k), int64
+        b = torch.where(s >= thr, b + k, b)
+    return b + 1
+
+
+def int8_layernorm_intscale(
+    x_int: torch.Tensor, x_zp: torch.Tensor, y_mul_in: torch.Tensor,
+    y_shift_in: torch.Tensor, gamma: torch.Tensor, beta: torch.Tensor, eps: float,
+    K: int = _LN_K, R: int = _LN_R, G: int = _LN_G, return_intermediates: bool = False,
+):
+    """Int-canonical pure-int LayerNorm -- the zero-fp oracle the ONNX LayerNorm mirrors.
+
+    Input: the previous op's int8 output as (x_int [B,D], x_zp [B,1], y_mul_in [B,1] Q1.16,
+    y_shift_in [B,1]); x_scale = y_mul_in * 2^-y_shift_in. gamma/beta [D]. Pure-int throughout
+    (no runtime fp): eps_K from the int act scale, int rsqrt seed via a pure-int CLZ bitlen
+    (no torch.log2), no fp fallback (unreachable: |u| <= 255 -> var_K < 2^32, bitpos <= 31,
+    a = R+half >= 12). Output reuses int8_output_requant_intscale with F = K+R+G.
+
+    Algorithm (codex+claude consensus):
+      u = x_int - x_zp ; S1 = sum(u) ; S2 = sum(u*u)                  (int64; cast before u*u)
+      mean_K = floor_div(S1<<K, D) ; var_K = floor_div(S2<<K, D) - (mean_K^2 >> K)
+      eps_K = round_half_up(eps*2^(K+2*y_shift) / y_mul^2) ; max(eps_K, 1)
+            (p/q form, eps=1e-5 -> p=1, q=100000; GUARD K+2*y_shift <= 62)
+      s_K = var_K + eps_K (clamp [1, 2^62))
+      bitlen = clz_ladder(s_K) ; bitpos = bitlen-1 ; e = K-bitpos ;
+      odd = e & 1 ; half = (e - odd)//2 ; a = R+half
+      C = 8409*2^20 (even) or 8409*1482910 (sqrt2_Q20, odd) ;
+      seed = round_half_up(C<<a, 10000*2^20)
+      r = seed ; 4x: prod = (s_K*r)*r ; t = prod >>(K+R) ; r = (r*(3*2^R - t) + 2^(R-1)) >>(R+1)
+      y_int = ((u<<K) - mean_K)*r*gamma_int + (beta_int << (K+R))     (Q(K+R+G))
+      out = int8_output_requant_intscale(y_int, act_mul=1, act_shift=0, F=K+R+G, bias=None)
+    Overflow: Newton s_K*r^2 = 2^(K+2R) = 2^56 invariant, peak ~2^57 (< 2^63). Output z-score
+    bound ((u<<K)-mean_K)*r <= sqrt(D)*2^(K+R) ~ 2^40.3; *gamma_int(2^15) ~ 2^55.3 < 2^63;
+    +beta<<(K+R) ~ 2^51; requant acc ~2^55 within cap62. R <= 23 hard boundary (K+2R < 63).
+
+    Returns (y_int8 [B,D] int32, y_mul [B,1] int32, y_shift [B,1] int32, y_zp [B,1] int32);
+    with return_intermediates, also a dict of the int intermediates for bit-exact verification.
+    """
+    B, D = x_int.shape[0], x_int.shape[-1]
+    u = x_int.to(torch.int64) - x_zp.to(torch.int64).reshape(-1, 1)          # [B,D] centered
+    S1 = u.sum(dim=-1, keepdim=True)                                         # [B,1] int64
+    S2 = (u * u).sum(dim=-1, keepdim=True)                                   # [B,1] int64
+    D_i64 = torch.tensor(D, dtype=torch.int64)
+    mean_K = torch.div(S1 << K, D_i64, rounding_mode="floor")                # QK floor (S1 signed)
+    var_K = torch.div(S2 << K, D_i64, rounding_mode="floor") - (mean_K * mean_K >> K)
+    # eps_K = round_half_up(eps * 2^(K+2*y_shift) / y_mul^2); eps = p/q (eps=1e-5 -> q=100000)
+    p, q = 1, int(round(1.0 / eps))
+    ys = y_shift_in.to(torch.int64).reshape(-1, 1)
+    ym = y_mul_in.to(torch.int64).reshape(-1, 1)
+    h = K + 2 * ys
+    if int(h.max()) > 62:
+        raise ValueError(f"int8_layernorm_intscale: K+2*y_shift={int(h.max())} > 62 "
+                          f"(eps_K int64 overflow; require y_shift <= 23)")
+    num = (torch.ones_like(h) * p) << h                                      # p * 2^(K+2*ys), int64
+    den = (q * ym * ym).to(torch.int64)                                      # q * y_mul^2
+    eps_K = torch.clamp(_round_half_up(num, den), min=1)
+    s_K = torch.clamp(var_K + eps_K, min=1, max=(1 << 62) - 1)
+    # int rsqrt seed via pure-int CLZ bitlen
+    bitlen = _int_bitlen(s_K)
+    bitpos = bitlen - 1
+    e = K - bitpos
+    odd = e & 1                                                       # two's-complement parity, correct for e<0
+    half = (e - odd) // 2                                             # floor(e/2), sign-safe (numerator even)
+    a = R + half                                                      # always >= 12 for |u| <= 255
+    sqrt2_Q20 = 1482910                                                # round(sqrt(2) * 2^20)
+    C = torch.where(odd == 1, torch.full_like(s_K, 8409 * sqrt2_Q20),
+                    torch.full_like(s_K, 8409 * (1 << 20)))
+    den_seed = torch.full_like(s_K, 10000 * (1 << 20))
+    seed = _round_half_up(C << a.clamp(min=0), den_seed)               # a >= 12 always
+    r = seed
+    three = torch.full_like(s_K, 3 * (1 << R))
+    half_r = torch.full_like(s_K, 1 << (R - 1))
+    for _ in range(4):
+        prod = (s_K * r) * r                                          # int64, ~2^56 invariant
+        t = prod >> (K + R)                                            # positive -> arithmetic == logical
+        r = (r * (three - t) + half_r) >> (R + 1)
+    # y_int @ Q(K+R+G) = ((u<<K) - mean_K) * r * gamma_int + (beta_int << (K+R))
+    gamma_int = torch.floor(gamma.to(torch.float64) * (2.0 ** G) + 0.5).to(torch.int64)   # [D] QG (bake)
+    beta_int = torch.floor(beta.to(torch.float64) * (2.0 ** G) + 0.5).to(torch.int64)     # [D] QG (bake)
+    uK = (u << K) - mean_K                                             # [B,D] QK (u<<K == u*2^K, two's complement)
+    y_int = uK * r * gamma_int.reshape(1, -1) + (beta_int.reshape(1, -1) << (K + R))   # [B,D] Q(K+R+G)
+    # output requant: reuse Stage 1b with F = K+R+G, fresh per-token scale (act_mul=1, act_shift=0)
+    ones = torch.ones(B, 1, dtype=torch.int32)
+    zeros = torch.zeros(B, 1, dtype=torch.int32)
+    y_int8, y_mul, y_shift, y_zp = int8_output_requant_intscale(
+        y_int, ones, zeros, K + R + G, None)
+    if return_intermediates:
+        inter = {"u": u, "S1": S1, "S2": S2, "mean_K": mean_K, "var_K": var_K,
+                 "eps_K": eps_K, "s_K": s_K, "bitlen": bitlen, "bitpos": bitpos,
+                 "e": e, "odd": odd, "half": half, "a": a, "seed": seed, "r": r,
+                 "gamma_int": gamma_int, "beta_int": beta_int, "uK": uK, "y_int": y_int}
+        return y_int8, y_mul, y_shift, y_zp, inter
+    return y_int8, y_mul, y_shift, y_zp
+
+
+# --------------------------------------------------------------------------- #
 # A3: int8 GELU (exact normal-CDF LUT: GELU(x) = x * Phi(x))                   #
 # --------------------------------------------------------------------------- #
 
