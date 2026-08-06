@@ -780,3 +780,127 @@ def test_concat_boundary_intscale_vs_fp():
         denom = fp_concat.abs().amax() + 1e-6
         worst = max(worst, float((recon - fp_concat).abs().max() / denom))
     assert worst < 0.02, f"head-merge vs fp rel_err {worst} >= 2%"
+
+
+# --------------------------------------------------------------------------- #
+# A8.5b (int-canonical): int8_decoder_layer_intscale -- the chained              #
+# boundary-form single decoder layer (self-attn -> +residual -> cross-attn ->  #
+# +residual -> final_ln -> fc1 -> gelu -> fc2 -> +residual). Passes            #
+# (y_int8,y_mul,y_shift,y_zp) straight through every block -- NO fp dequant/   #
+# re-quant between blocks (the first such chain). fp is used ONLY for the      #
+# one-time static per-head K/V calibration at prefill. The zero-fp oracle the  #
+# ONNX decoder mirrors. Validated vs the real WhisperDecoderLayer.forward      #
+# (the fp reference uses the SAME HQQ 3-bit weights under eager attention).    #
+# --------------------------------------------------------------------------- #
+
+def _ln_params(l):
+    return (l.weight.detach().to(torch.float32), l.bias.detach().to(torch.float32), l.eps)
+
+
+def _decoder_layer_params(L):
+    """Build the P dict for int8_decoder_layer_intscale from a real WhisperDecoderLayer
+    (HQQ 3-bit weights, eager attention)."""
+    def lp(mod):                                  # (qr, zero, scale, bias, g)
+        return _linear_params(mod)[:5]
+    return {
+        "self_attn": {"q_proj": lp(L.self_attn.q_proj), "k_proj": lp(L.self_attn.k_proj),
+                      "v_proj": lp(L.self_attn.v_proj), "out_proj": lp(L.self_attn.out_proj)},
+        "enc_attn": {"q_proj": lp(L.encoder_attn.q_proj), "k_proj": lp(L.encoder_attn.k_proj),
+                     "v_proj": lp(L.encoder_attn.v_proj), "out_proj": lp(L.encoder_attn.out_proj)},
+        "self_attn_ln": _ln_params(L.self_attn_layer_norm),
+        "enc_attn_ln": _ln_params(L.encoder_attn_layer_norm),
+        "final_ln": _ln_params(L.final_layer_norm),
+        "fc1": lp(L.fc1), "fc2": lp(L.fc2),
+    }
+
+
+def _load_decoder_layer():
+    m = hqq_asr.load_whisper_hqq(MODEL, device="cpu", compute_dtype=torch.float32)
+    return m.model.decoder.layers[0], m
+
+
+def _corr(a, b):
+    return float(torch.corrcoef(torch.stack([a.flatten().to(torch.float64),
+                                             b.flatten().to(torch.float64)]))[0, 1])
+
+
+def test_decoder_layer_intscale_vs_fp():
+    """Prefill: the chained int8 layer output (dequant) vs the real WhisperDecoderLayer.forward
+    output on the SAME h/enc inputs. The int8 chain (per-token act + static per-head K/V + the
+    fixed-point decomps) stays close to fp: corr > 0.99, mean_abserr < 3% of |out|. The A8.6
+    staged WER gate measures the real cost; this is the per-layer regression guard."""
+    L, _m = _load_decoder_layer()
+    P = _decoder_layer_params(L)
+    H, d = 6, 64
+    B, Tq, D, Src = 2, 8, 384, 30
+    worst_corr, worst_mae = 1.0, 0.0
+    for seed in (0, 1, 2):
+        torch.manual_seed(seed)
+        h_fp = torch.randn(B, Tq, D) * 1.0
+        enc_fp = torch.randn(B, Src, D) * 1.0
+        # fp reference: the real layer, fresh (no cache), causal mask applied internally
+        with torch.no_grad():
+            out_fp = L(h_fp, encoder_hidden_states=enc_fp)
+            out_fp = out_fp[0] if isinstance(out_fp, tuple) else out_fp
+            out_fp = out_fp.to(torch.float32)
+        # int8 chained layer (prefill: causal mask on, caches empty -> derived + filled)
+        hi, hm, hsh, hz = i8.quantize_act_per_token_intscale(h_fp)
+        ei, em, esh, ez = i8.quantize_act_per_token_intscale(enc_fp)
+        oi, oz, om, osh, skv, ckv = i8.int8_decoder_layer_intscale(
+            P, hi, hz, hm, hsh, ei, ez, em, esh, None, None,
+            num_heads=H, head_dim=d, is_prefill=True, kv_scale="static")
+        o_dq = i8._dequant_boundary(oi, oz, om, osh).to(torch.float32)
+        worst_corr = min(worst_corr, _corr(o_dq, out_fp))
+        worst_mae = max(worst_mae, float((o_dq - out_fp).abs().mean()))
+        # cache shapes: self Tk == Tq (prefill fills it); cross Tk == Src (computed once)
+        assert skv[0].shape == (B, H, Tq, d), f"self_kv K shape {skv[0].shape}"
+        assert ckv[0].shape == (B, H, Src, d), f"cross_kv K shape {ckv[0].shape}"
+    assert worst_corr > 0.99, f"decoder-layer prefill corr {worst_corr} <= 0.99"
+    # mean_abserr is a secondary guard: ~1.2% of the ~4.3 |out|; 0.08 is the regression
+    # margin (the A8.6 staged WER gate is the real quality check).
+    assert worst_mae < 0.08, f"decoder-layer prefill mean_abserr {worst_mae} >= 0.08"
+
+
+def test_decoder_layer_intscale_kv_cache():
+    """Prefill then decode: the static per-head KV cache is append-only (self Tk grows Tq -> Tq+1),
+    the cross K/V is computed ONCE (prefill) and carried unchanged (identity + bit-identical int8),
+    and the decode-step output (dequant) matches the real layer's decode output (corr > 0.99)."""
+    from transformers.cache_utils import DynamicCache, EncoderDecoderCache
+    L, _m = _load_decoder_layer()
+    P = _decoder_layer_params(L)
+    H, d = 6, 64
+    B, Tq, D, Src = 2, 8, 384, 30
+    torch.manual_seed(0)
+    h_fp = torch.randn(B, Tq, D) * 1.0
+    enc_fp = torch.randn(B, Src, D) * 1.0
+    hi, hm, hsh, hz = i8.quantize_act_per_token_intscale(h_fp)
+    ei, em, esh, ez = i8.quantize_act_per_token_intscale(enc_fp)
+    # prefill (caches empty -> derived + filled)
+    oi, oz, om, osh, skv, ckv = i8.int8_decoder_layer_intscale(
+        P, hi, hz, hm, hsh, ei, ez, em, esh, None, None,
+        num_heads=H, head_dim=d, is_prefill=True, kv_scale="static")
+    assert skv[0].shape[2] == Tq, "prefill self_kv Tk"
+    ck_k0, ck_v0 = ckv[0].clone(), ckv[1].clone()
+    # decode step (Tq=1, no causal mask; reuse both caches)
+    torch.manual_seed(1)
+    h_dec = torch.randn(B, 1, D) * 1.0
+    dhi, dhm, dhsh, dhz = i8.quantize_act_per_token_intscale(h_dec)
+    oi2, oz2, om2, osh2, skv2, ckv2 = i8.int8_decoder_layer_intscale(
+        P, dhi, dhz, dhm, dhsh, ei, ez, em, esh, skv, ckv,
+        num_heads=H, head_dim=d, is_prefill=False, kv_scale="static")
+    # self cache grew by one token (append-only under the fixed per-head scale -> no requant)
+    assert skv2[0].shape[2] == Tq + 1, f"decode self_kv Tk {skv2[0].shape[2]} != {Tq + 1}"
+    assert torch.equal(skv2[0][:, :, :Tq, :], skv[0]), "prefill self K must be unchanged by append"
+    # cross K/V carried unchanged (computed once at prefill, identity on reuse)
+    assert ckv2 is ckv, "cross_kv must be the same object on reuse (compute-once)"
+    assert torch.equal(ckv2[0], ck_k0) and torch.equal(ckv2[1], ck_v0), "cross K/V int altered"
+    # decode output vs the real layer's decode (prefill its HF cache, then decode one token)
+    with torch.no_grad():
+        ec = EncoderDecoderCache(DynamicCache(), DynamicCache())
+        _ = L(h_fp, encoder_hidden_states=enc_fp, past_key_value=ec)
+        out_dec = L(h_dec, encoder_hidden_states=enc_fp, past_key_value=ec)
+        out_dec = out_dec[0] if isinstance(out_dec, tuple) else out_dec
+        out_dec = out_dec.to(torch.float32)
+    o2_dq = i8._dequant_boundary(oi2, oz2, om2, osh2).to(torch.float32)
+    assert _corr(o2_dq, out_dec) > 0.99, \
+        f"decoder-layer decode corr {_corr(o2_dq, out_dec)} <= 0.99"

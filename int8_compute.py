@@ -1430,6 +1430,224 @@ def int8_concat_boundary_intscale(int8_list, zp_list, mul_list, shift_list, dim=
     return y_int8, y_mul, y_shift, y_zp
 
 
+def _dequant_boundary(x_int, x_zp, x_mul, x_shift):
+    """Dequant a boundary-form tensor to fp64 (calibration/verification only -- NOT a chain op)."""
+    return (x_int.to(torch.float64) - x_zp.to(torch.float64)) * (
+        x_mul.to(torch.float64) * 2.0 ** (-x_shift.to(torch.float64)))
+
+
+def derive_static_scale_q116(x_real):
+    """Per-head static symmetric int8 scale (Q1.16) from fp amax -- the A8.3 calibration.
+    x_real [B,H,T,d] fp. Returns (mul [1,H,1,1] int32, shift [1,H,1,1] int32); scale = mul*2^-shift,
+    zp=0 symmetric. ONE scale per head from the per-head amax. Run ONCE at prefill (calibration;
+    fp is allowed here -- the deployed in-graph-Loop derivation is a Phase B int-amax concern)."""
+    H = x_real.shape[1]
+    amax = x_real.abs().amax(dim=(0, 2, 3)).clamp(min=1e-8)                  # [H]
+    scale = amax / 127.0
+    q, exp = torch.frexp(scale.to(torch.float64))
+    mul = torch.round(q * (2 ** 16)).clamp(0, 2 ** 16 - 1).to(torch.int32)
+    shift = (16 - exp).to(torch.int32)
+    return mul.view(1, H, 1, 1), shift.view(1, H, 1, 1)
+
+
+def requant_to_static_intscale(x_int, x_zp, x_mul, x_shift, static_mul, static_shift):
+    """Pure-int requant of a boundary-form int8 tensor to a FIXED static int8 scale (A8.3).
+    x_real = (x_int-x_zp)*x_mul*2^-x_shift; static_scale = static_mul*2^-static_shift.
+    out_int = round(x_real/static_scale) = round((x_int-x_zp)*x_mul*2^(static_shift-x_shift)/static_mul),
+    clamped to [-127,127]. x_int [...,D]; x_zp/x_mul/x_shift [...,1]; static_mul/static_shift [1,H,1,1]
+    (broadcast). Returns out_int [...] int32. The append-only KV-cache op under a fixed scale; the
+    only error vs the fp round (quantize_kv_under_fixed_intscale) is the int round-half-up, which
+    matches torch.round to within fp representation. Saturation outside the calibration range clamps."""
+    u = x_int.to(torch.int64) - x_zp.to(torch.int64)                          # [..., D]
+    num = u * x_mul.to(torch.int64)                                           # [..., D] ~ |u|*2^16
+    shift_diff = (static_shift.to(torch.int64) - x_shift.to(torch.int64))    # [..., 1] signed
+    pos = shift_diff.clamp(min=0)                                            # shift left amount
+    neg = (-shift_diff).clamp(min=0)                                         # extra denominator shift
+    num = num << pos                                                          # [..., D]
+    den = (static_mul.to(torch.int64) << neg)                                # [..., 1] (broadcast)
+    out = _round_half_up(num, den)                                            # [..., D]
+    return out.clamp(-127, 127).to(torch.int32)
+
+
+def int8_decoder_layer_intscale(P, h_int, h_zp, h_mul, h_shift,
+                               enc_int, enc_zp, enc_mul, enc_shift,
+                               self_kv, cross_kv, num_heads=6, head_dim=64,
+                               is_prefill=False, kv_scale="static"):
+    """Chained boundary-form single decoder layer (A8.5b) -- the zero-fp oracle the ONNX decoder
+    mirrors. Passes (y_int8,y_mul,y_shift,y_zp) straight through every block -- NO fp dequant/re-
+    quant between blocks (the first such chain). fp is used ONLY for the one-time static-scale
+    calibration at prefill (derive_static_scale_q116).
+
+    P: param dict -- self_attn{q,k,v,out}_proj, enc_attn{q,k,v,out}_proj (each (qr,zero,scale,
+       bias,g)); self_attn_ln, enc_attn_ln, final_ln (each (gamma,beta,eps)); fc1, fc2 ((qr,zero,
+       scale,bias,g)).
+    h_*: input hidden boundary [B,Tq,D], scales [B,Tq,1].
+    enc_*: encoder hidden boundary [B,Src,D], scales [B,Src,1].
+    self_kv: None (first call) or (K_int [B,H,Tk,d], V_int, k_mul, k_shift, v_mul, v_shift) with
+       per-head static scales [1,H,1,1] (zp=0).
+    cross_kv: None (first call) or (K_int [B,H,Src,d], V_int, k_mul, k_shift, v_mul, v_shift).
+    is_prefill: True for the multi-token prompt step (triangular causal mask); False for decode
+       (Tq=1, no mask -- the current query attends to all cached keys).
+    kv_scale: "static" only for now (the A8.6 pertoken path raises in int8_qk_matmul_intscale).
+
+    Chain (WhisperDecoderLayer.forward order):
+      self_attn(self_attn_layer_norm(h)) -> +h ; encoder_attn(encoder_attn_layer_norm(h),
+      encoder_hidden) -> +h ; final_layer_norm(h) -> fc1 -> gelu -> fc2 -> +h
+      (final_layer_norm is BEFORE fc1).
+
+    Returns (h_out_int, h_out_zp, h_out_mul, h_out_shift [B,Tq,D]+[B,Tq,1],
+              new_self_kv, new_cross_kv).
+    """
+    if kv_scale != "static":
+        raise NotImplementedError("int8_decoder_layer_intscale: kv_scale='pertoken' -- A8.6 (the "
+                                 "per-row score requant); static path first.")
+    B, Tq, D = h_int.shape
+    H, d = num_heads, head_dim
+    assert H * d == D, f"num_heads*head_dim ({H*d}) != embed_dim ({D})"
+    SA, EA = P["self_attn"], P["enc_attn"]
+    _zH = lambda: torch.zeros(1, H, 1, 1, dtype=torch.int32)                 # static zp=0
+
+    def _b(t):
+        """Reorder a block's (int8, mul, shift, zp) return to boundary (int8, zp, mul, shift).
+        int8_output_requant_intscale (and every block built on it: linear, ln, gelu, softmax, PV,
+        residual, concat) returns (int8, mul, shift, zp); the chain convention is (int8, zp, mul,
+        shift). int8_qk_matmul_intscale already returns boundary order, so it needs NO _b."""
+        i, m, s, z = t
+        return i, z, m, s
+
+    def lin(proj, x_int, x_zp, x_mul, x_shift):
+        """[...,D] boundary -> [...,O] boundary (flatten to per-token 2D, int8_linear_intscale)."""
+        qr, zero, scale, bias, g = proj
+        lead = x_int.shape[:-1]
+        Dd = x_int.shape[-1]
+        y, ym, ysh, yzp = int8_linear_intscale(
+            x_int.reshape(-1, Dd), x_zp.reshape(-1, 1), x_mul.reshape(-1, 1),
+            x_shift.reshape(-1, 1), qr, zero, scale, bias, g)
+        O = y.shape[-1]
+        return (y.reshape(*lead, O), yzp.reshape(*lead, 1), ym.reshape(*lead, 1),
+                ysh.reshape(*lead, 1))
+
+    def ln(lnp, x_int, x_zp, x_mul, x_shift):
+        gamma, beta, eps = lnp
+        lead = x_int.shape[:-1]
+        Dd = x_int.shape[-1]
+        y, ym, ysh, yzp = int8_layernorm_intscale(
+            x_int.reshape(-1, Dd), x_zp.reshape(-1, 1), x_mul.reshape(-1, 1),
+            x_shift.reshape(-1, 1), gamma, beta, eps)
+        return (y.reshape(*lead, Dd), yzp.reshape(*lead, 1), ym.reshape(*lead, 1),
+                ysh.reshape(*lead, 1))
+
+    def gelu(x_int, x_zp, x_mul, x_shift):
+        lead = x_int.shape[:-1]
+        Dd = x_int.shape[-1]
+        y, ym, ysh, yzp = int8_gelu_intscale(
+            x_int.reshape(-1, Dd), x_zp.reshape(-1, 1), x_mul.reshape(-1, 1),
+            x_shift.reshape(-1, 1))
+        return (y.reshape(*lead, Dd), yzp.reshape(*lead, 1), ym.reshape(*lead, 1),
+                ysh.reshape(*lead, 1))
+
+    def heads(x_int, x_zp, x_mul, x_shift, T):
+        """[...,T,D] boundary -> [B,H,T,d] + scales [B,1,T,1] (one per-token scale, broadcast over H)."""
+        xh = x_int.reshape(B, T, H, d).permute(0, 2, 1, 3).contiguous()        # [B,H,T,d]
+        return xh, x_zp.reshape(B, 1, T, 1), x_mul.reshape(B, 1, T, 1), x_shift.reshape(B, 1, T, 1)
+
+    def merge_heads(a_int, a_zp, a_mul, a_shift):
+        """[B,H,Tq,d] per-head boundary (scales [B,H,Tq,1]) -> [B,Tq,D] + [B,Tq,1] (A8.5 head merge).
+        int8_concat_boundary_intscale returns (int8,mul,shift,zp); reorder to boundary (int8,zp,mul,shift)."""
+        il = [a_int[:, h] for h in range(H)]
+        zl = [a_zp[:, h] for h in range(H)]
+        ml = [a_mul[:, h] for h in range(H)]
+        sl = [a_shift[:, h] for h in range(H)]
+        yi, ym, ysh, yzp = int8_concat_boundary_intscale(il, zl, ml, sl, dim=-1)
+        return yi, yzp, ym, ysh
+
+    def softmax_scores(s_i, s_z, s_m, s_sh):
+        """int8_softmax_intscale on 4D scores [B,H,Tq,Tk] -- flatten to [N,K] (the requant is
+        hardwired 2D), reshape back. int8_softmax_intscale returns (int8,mul,shift,zp); reorder to
+        boundary (int8,zp,mul,shift)."""
+        lead = s_i.shape[:-1]
+        K = s_i.shape[-1]
+        y, ym, ysh, yzp = int8_softmax_intscale(
+            s_i.reshape(-1, K), s_z.reshape(-1, 1), s_m.reshape(-1, 1), s_sh.reshape(-1, 1))
+        return (y.reshape(*lead, K), yzp.reshape(*lead, 1),
+                ym.reshape(*lead, 1), ysh.reshape(*lead, 1))
+
+    # --- self-attention --------------------------------------------------------
+    n_i, n_z, n_m, n_sh = ln(P["self_attn_ln"], h_int, h_zp, h_mul, h_shift)
+    q_i, q_z, q_m, q_sh = lin(SA["q_proj"], n_i, n_z, n_m, n_sh)
+    k_i, k_z, k_m, k_sh = lin(SA["k_proj"], n_i, n_z, n_m, n_sh)
+    v_i, v_z, v_m, v_sh = lin(SA["v_proj"], n_i, n_z, n_m, n_sh)
+    qh, qzh, qmh, qshh = heads(q_i, q_z, q_m, q_sh, Tq)
+    kh, kzh, kmh, kshh = heads(k_i, k_z, k_m, k_sh, Tq)
+    vh, vzh, vmh, vshh = heads(v_i, v_z, v_m, v_sh, Tq)
+    # static per-head K/V scale: derive on the first call (calibration), reuse thereafter
+    if self_kv is None:
+        k_sm, k_ssh = derive_static_scale_q116(_dequant_boundary(kh, kzh, kmh, kshh))
+        v_sm, v_ssh = derive_static_scale_q116(_dequant_boundary(vh, vzh, vmh, vshh))
+        K_old, V_old = None, None
+    else:
+        K_old, V_old, k_sm, k_ssh, v_sm, v_ssh = self_kv
+    k_static = requant_to_static_intscale(kh, kzh, kmh, kshh, k_sm, k_ssh)     # [B,H,Tq,d] [-127,127]
+    v_static = requant_to_static_intscale(vh, vzh, vmh, vshh, v_sm, v_ssh)
+    K_cur = kv_cache_concat(K_old, k_static)                                   # [B,H,Tk,d]
+    V_cur = kv_cache_concat(V_old, v_static)
+    new_self_kv = (K_cur, V_cur, k_sm, k_ssh, v_sm, v_ssh)
+    # Q.K^T + score scale (static K -> per-row score scale, no score requant)
+    s_i, s_z, s_m, s_sh = int8_qk_matmul_intscale(
+        qh, qzh, qmh, qshh, K_cur, _zH(), k_sm, k_ssh, d_head=d)
+    # causal mask (prefill only; decode Tq=1 attends to all cached keys)
+    if is_prefill:
+        Tk = K_cur.shape[2]
+        mask = torch.triu(torch.ones(Tq, Tk, dtype=torch.bool), diagonal=1)    # True = future (masked)
+        s_i = s_i.masked_fill(mask.view(1, 1, Tq, Tk), -(1 << 20))
+    p_i, p_z, p_m, p_sh = softmax_scores(s_i, s_z, s_m, s_sh)
+    a_i, a_z, a_m, a_sh = _b(int8_pv_matmul_intscale(                           # P.V (int8)
+        p_i, p_z, p_m, p_sh, V_cur, _zH(), v_sm, v_ssh))
+    ao_i, ao_z, ao_m, ao_sh = merge_heads(a_i, a_z, a_m, a_sh)                 # [B,Tq,D]
+    o_i, o_z, o_m, o_sh = lin(SA["out_proj"], ao_i, ao_z, ao_m, ao_sh)
+    h1_i, h1_z, h1_m, h1_sh = _b(int8_residual_add_intscale(                    # + residual (self-attn)
+        h_int, h_zp, h_mul, h_shift, o_i, o_z, o_m, o_sh))
+
+    # --- cross-attention -------------------------------------------------------
+    n2_i, n2_z, n2_m, n2_sh = ln(P["enc_attn_ln"], h1_i, h1_z, h1_m, h1_sh)
+    cq_i, cq_z, cq_m, cq_sh = lin(EA["q_proj"], n2_i, n2_z, n2_m, n2_sh)
+    cqh, cqzh, cqmh, cqshh = heads(cq_i, cq_z, cq_m, cq_sh, Tq)
+    Src = enc_int.shape[1]
+    if cross_kv is None:
+        ck_i, ck_z, ck_m, ck_sh = lin(EA["k_proj"], enc_int, enc_zp, enc_mul, enc_shift)
+        cv_i, cv_z, cv_m, cv_sh = lin(EA["v_proj"], enc_int, enc_zp, enc_mul, enc_shift)
+        ckh, ckzh, ckmh, ckshh = heads(ck_i, ck_z, ck_m, ck_sh, Src)
+        cvh, cvzh, cvmh, cvshh = heads(cv_i, cv_z, cv_m, cv_sh, Src)
+        ck_sm, ck_ssh = derive_static_scale_q116(_dequant_boundary(ckh, ckzh, ckmh, ckshh))
+        cv_sm, cv_ssh = derive_static_scale_q116(_dequant_boundary(cvh, cvzh, cvmh, cvshh))
+        ck_int = requant_to_static_intscale(ckh, ckzh, ckmh, ckshh, ck_sm, ck_ssh)
+        cv_int = requant_to_static_intscale(cvh, cvzh, cvmh, cvshh, cv_sm, cv_ssh)
+        new_cross_kv = (ck_int, cv_int, ck_sm, ck_ssh, cv_sm, cv_ssh)
+    else:
+        new_cross_kv = cross_kv
+        ck_int, cv_int, ck_sm, ck_ssh, cv_sm, cv_ssh = cross_kv
+    # cross Q.K^T (no causal mask; full src attendable)
+    cs_i, cs_z, cs_m, cs_sh = int8_qk_matmul_intscale(
+        cqh, cqzh, cqmh, cqshh, ck_int, _zH(), ck_sm, ck_ssh, d_head=d)
+    cp_i, cp_z, cp_m, cp_sh = softmax_scores(cs_i, cs_z, cs_m, cs_sh)
+    ca_i, ca_z, ca_m, ca_sh = _b(int8_pv_matmul_intscale(                       # cross P.V (int8)
+        cp_i, cp_z, cp_m, cp_sh, cv_int, _zH(), cv_sm, cv_ssh))
+    cao_i, cao_z, cao_m, cao_sh = merge_heads(ca_i, ca_z, ca_m, ca_sh)
+    co_i, co_z, co_m, co_sh = lin(EA["out_proj"], cao_i, cao_z, cao_m, cao_sh)
+    h2_i, h2_z, h2_m, h2_sh = _b(int8_residual_add_intscale(                    # + residual (cross-attn)
+        h1_i, h1_z, h1_m, h1_sh, co_i, co_z, co_m, co_sh))
+
+    # --- feed-forward (final_layer_norm is BEFORE fc1) -------------------------
+    n3_i, n3_z, n3_m, n3_sh = ln(P["final_ln"], h2_i, h2_z, h2_m, h2_sh)
+    f1_i, f1_z, f1_m, f1_sh = lin(P["fc1"], n3_i, n3_z, n3_m, n3_sh)            # [B,Tq,4D]
+    g_i, g_z, g_m, g_sh = gelu(f1_i, f1_z, f1_m, f1_sh)
+    f2_i, f2_z, f2_m, f2_sh = lin(P["fc2"], g_i, g_z, g_m, g_sh)                # [B,Tq,D]
+    h_out_i, h_out_z, h_out_m, h_out_sh = _b(int8_residual_add_intscale(        # + residual (FFN)
+        h2_i, h2_z, h2_m, h2_sh, f2_i, f2_z, f2_m, f2_sh))
+
+    return h_out_i, h_out_z, h_out_m, h_out_sh, new_self_kv, new_cross_kv
+
+
 # --------------------------------------------------------------------------- #
 # A1 validation harness                                                        #
 # --------------------------------------------------------------------------- #
