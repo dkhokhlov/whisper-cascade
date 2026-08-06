@@ -163,3 +163,26 @@ def test_8bit_output_requant_bitexact():
     mod = _load_first_linear(8)
     torch.manual_seed(3)
     _check_requant(mod, torch.randn(2, int(mod.meta["shape"][1])) * 2.0)
+
+
+# ---- recursive zero-fp audit (Q4) ----
+
+def test_zero_fp_audit_stage1b_passes():
+    """Stage 1b (int output requant) is structurally zero-fp: no fp tensors, no fp Casts,
+    no fp-computing ops -- raw graph AND the ORT-optimized artifact (ORT_ENABLE_ALL must not
+    inject fp into an int-only linear)."""
+    mod = _load_first_linear(3)
+    model = ex.build_int8_linear_onnx(mod, emit_intermediates=False, emit_output_requant=True)
+    ex.zero_fp_audit(model)                       # raw graph
+    ex.zero_fp_audit(model, check_optimized=True)  # ORT-optimized artifact
+
+
+def test_zero_fp_audit_stage1a_fails():
+    """Stage 1a (fp dequant output) is NOT zero-fp: the audit must catch the fp output and
+    the fp Cast/Div intermediate value_infos (negative test -- ensures the audit fails closed
+    on fp rather than passing vacuously)."""
+    mod = _load_first_linear(3)
+    model = ex.build_int8_linear_onnx(mod, emit_intermediates=False, emit_output_requant=False)
+    with pytest.raises(AssertionError) as exc:
+        ex.zero_fp_audit(model)
+    assert "FLOAT" in str(exc.value), "audit must flag the fp output"

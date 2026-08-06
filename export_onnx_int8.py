@@ -490,9 +490,172 @@ def build_int8_linear_onnx(hqq_linear, model_name="int8_linear", emit_intermedia
     return m
 
 
-def zero_fp_audit(model):
-    """Recursive zero-fp audit: assert no fp16/fp32/bfloat16/float8 anywhere in the graph
-    (inputs/outputs/value_info/initializers/Constant attrs/nested graph attrs). FAIL CLOSED on
-    unknown types. Stage 1b will also audit the ORT-optimized artifact. (Stub for the full
-    recursive impl; the linear Stage 1a intentionally has an fp dequant output.)"""
-    raise NotImplementedError("full recursive zero-fp audit is Stage 1b")
+# ---- recursive zero-fp audit (Q4) ----
+# Tensor elem types that are legal in a zero-fp graph: integers, bool, string. Any float
+# (fp32/fp16/bfloat16/float8*) is a violation. Unknown/UNDEFINED types fail closed.
+_ALLOWED_TYPES = {
+    T.INT8, T.INT16, T.INT32, T.INT64, T.UINT8, T.UINT16, T.UINT32, T.UINT64, T.BOOL, T.STRING,
+}
+_FP_TYPES = {
+    T.FLOAT, T.FLOAT16, T.BFLOAT16, T.FLOAT8E4M3FN, T.FLOAT8E5M2,
+    T.FLOAT8E4M3FNUZ, T.FLOAT8E5M2FNUZ,
+}
+# Ops that are int-typed on the boundary but compute in fp internally, or are fp-only. The
+# tensor-type walk catches most fp (fp initializers, fp Casts, fp-typed ops); this denylist is
+# belt-and-suspenders for ops whose fp is hidden (DynamicQuantizeLinear's fp scale, Round's
+# fp-only domain, the com.microsoft QLinear* ops) and the standard fp nonlinear ops the
+# consensus said to avoid (replaced by int LUT decompositions).
+_FP_DENYLIST = {
+    "DynamicQuantizeLinear", "QLinearMatMul", "QLinearConv", "QLinearSoftmax",
+    "QLinearAdd", "QLinearMul", "Round",
+    "Erf", "Sqrt", "Pow", "Exp", "Log", "Reciprocal",
+    "Softmax", "SoftmaxGrad", "LayerNormalization", "Gelu", "Gemm",
+}
+_TYPE_NAMES = {
+    getattr(T, n): n for n in
+    ("UNDEFINED", "FLOAT", "UINT8", "INT8", "UINT16", "INT16", "INT32", "INT64", "STRING",
+     "BOOL", "FLOAT16", "DOUBLE", "UINT32", "UINT64", "COMPLEX64", "COMPLEX128", "BFLOAT16",
+     "FLOAT8E4M3FN", "FLOAT8E5M2", "FLOAT8E4M3FNUZ", "FLOAT8E5M2FNUZ")
+}
+
+
+def _type_name(t):
+    return _TYPE_NAMES.get(t, f"UNKNOWN({t})")
+
+
+def _check_elem_type(t, where, violations):
+    if t in _FP_TYPES:
+        violations.append(f"{where}: float type {_type_name(t)}")
+    elif t not in _ALLOWED_TYPES:
+        violations.append(f"{where}: non-allowed type {_type_name(t)} (fail closed)")
+
+
+def _audit_tensor_proto(t, where, violations):
+    _check_elem_type(t.data_type, where, violations)
+
+
+def _audit_value_info(vi, where, violations):
+    tt = vi.type.tensor_type
+    if tt.elem_type == 0 and (tt.HasField("shape") or vi.type.HasField("sequence_type")
+                              or vi.type.HasField("map_type") or vi.type.HasField("optional_type")):
+        # non-tensor (sequence/map/optional) -- recurse into the leaf elem type if present.
+        violations.append(f"{where}: non-tensor value-info (sequence/map/optional) not supported "
+                          f"(fail closed)")
+        return
+    _check_elem_type(tt.elem_type, where, violations)
+
+
+def _audit_attrs(node, node_loc, violations):
+    """Recurse into a node's attributes: flag fp scalar attrs (FLOAT/FLOATS), fp tensor attrs
+    (value/sparse_value of a Constant), and nested graph-valued attrs (then_branch/else_branch/
+    body/sub_graph/...)."""
+    from onnx import AttributeProto as A
+    for attr in node.attribute:
+        an = attr.name
+        if attr.type == A.FLOAT:
+            violations.append(f"{node_loc}: attribute {an} is FLOAT (scalar)")
+        elif attr.type == A.FLOATS:
+            violations.append(f"{node_loc}: attribute {an} is FLOATS (list)")
+        elif attr.type == A.TENSOR:
+            _audit_tensor_proto(attr.t, f"{node_loc}: attribute {an} (Constant value)", violations)
+        elif attr.type == A.SPARSE_TENSOR:
+            _audit_tensor_proto(attr.sparse_tensor.values,
+                                f"{node_loc}: attribute {an} (sparse values)", violations)
+        elif attr.type == A.GRAPH:
+            _audit_graph(attr.g, f"{node_loc}:{an}", violations)
+        elif attr.type == A.GRAPHS:
+            for i, sg in enumerate(attr.graphs):
+                _audit_graph(sg, f"{node_loc}:{an}[{i}]", violations)
+
+
+def _audit_graph(graph, where, violations):
+    for vi in graph.input:
+        _audit_value_info(vi, f"{where}:input '{vi.name}'", violations)
+    for vi in graph.output:
+        _audit_value_info(vi, f"{where}:output '{vi.name}'", violations)
+    for vi in graph.value_info:
+        _audit_value_info(vi, f"{where}:value_info '{vi.name}'", violations)
+    for init in graph.initializer:
+        _audit_tensor_proto(init, f"{where}:initializer '{init.name}'", violations)
+    for node in graph.node:
+        nloc = f"{where}:node '{node.name or node.op_type}'({node.op_type})"
+        if node.op_type in _FP_DENYLIST:
+            violations.append(f"{nloc}: forbidden op '{node.op_type}' (fp-computing or fp-only)")
+        if node.op_type == "Cast":
+            to = None
+            for attr in node.attribute:
+                if attr.name == "to":
+                    to = attr.i
+            if to is not None and to in _FP_TYPES:
+                violations.append(f"{nloc}: Cast to {_type_name(to)} (fp)")
+            elif to is not None and to not in _ALLOWED_TYPES:
+                violations.append(f"{nloc}: Cast to {_type_name(to)} (non-allowed, fail closed)")
+        _audit_attrs(node, nloc, violations)
+
+
+def zero_fp_audit(model, check_optimized=False, optimized_path=None):
+    """Recursive zero-fp audit (Q4). Assert the graph (and every nested graph-valued attr:
+    then_branch/else_branch/body/sub_graph/...) has NO float (fp32/fp16/bfloat16/float8*) in any
+    input/output/value_info/initializer/Constant-attr, no fp Cast, and no fp-computing op from
+    the denylist. FAIL CLOSED on unknown/UNDEFINED types. With check_optimized=True, ALSO audit
+    the ORT-optimized artifact (ORT_ENABLE_ALL) -- ORT can inject fp Casts/fuse LN at session
+    load. Returns None on success; raises AssertionError listing every violation on failure.
+
+    The raw graph audit catches the export's own fp. The optimized audit catches ORT-injected
+    fp; ORT 1.19.2 CPU adds none for the int-only linear (verified), but the decoder's
+    LayerNormalization/GELU/Softmax may trigger fp fusion at load, so Phase C validates the
+    merged-decoder under ORT_DISABLE_ALL as well."""
+    if isinstance(model, (str, bytes)):
+        m = onnx.load(model)
+        path = model if isinstance(model, str) else None
+    else:
+        m = model
+        path = None
+    try:
+        m = onnx.shape_inference.infer_shapes(m)
+    except Exception:
+        pass  # shape inference is best-effort; the type walk does not depend on it
+    violations = []
+    _audit_graph(m.graph, "graph", violations)
+    if violations:
+        raise AssertionError("zero-fp audit FAILED:\n  " + "\n  ".join(violations))
+    if check_optimized:
+        _audit_optimized(m if path is None else path, optimized_path)
+    return None
+
+
+def _audit_optimized(model_or_path, optimized_path=None):
+    """Audit the ORT-optimized graph. ORT_ENABLE_ALL writes the optimized model to disk; audit
+    that artifact recursively. ORT may inject fp Casts or fuse LayerNormalization/GELU into fp
+    subgraphs at load, so the optimized artifact must be audited separately from the raw export."""
+    import os
+    import tempfile
+    if optimized_path is None:
+        fd, optimized_path = tempfile.mkstemp(suffix="_ort_optimized.onnx")
+        os.close(fd)
+    import onnxruntime as ort
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.optimized_model_filepath = optimized_path
+    path = model_or_path if isinstance(model_or_path, str) else _save_tmp(model_or_path)
+    ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
+    mopt = onnx.load(optimized_path)
+    try:
+        mopt = onnx.shape_inference.infer_shapes(mopt)
+    except Exception:
+        pass
+    violations = []
+    _audit_graph(mopt.graph, "optimized", violations)
+    if violations:
+        raise AssertionError("zero-fp audit FAILED on the ORT-optimized artifact:\n  "
+                             + "\n  ".join(violations))
+    return None
+
+
+def _save_tmp(model):
+    import os
+    import tempfile
+    fd, p = tempfile.mkstemp(suffix="_audit.onnx")
+    os.close(fd)
+    onnx.save(model, p)
+    return p

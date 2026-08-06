@@ -432,4 +432,17 @@ ORT_DISABLE_ALL. New module `export_onnx_int8.py`.
    `Not(Less(...))`; `BitShift` requires both inputs the SAME unsigned type (uint64); SSA form
    is enforced (no duplicate output/node names); `Clamp` is not in the int opset used here --
    clamp via `Max`/`Min`. `tests/test_int8_onnx.py` covers both tiers (Stage 1a + 1b, 14 tests).
-   **Next: the raw + optimized zero-fp audit (recursive), then LN/GELU/softmax/conv/Loop.**
+
+   Recursive zero-fp audit -- DONE (`export_onnx_int8.zero_fp_audit`). Recurses ALL
+   graph-valued attrs (then_branch/else_branch/body/sub_graph via AttributeProto.GRAPH/GRAPHS,
+   not just the named ones), audits every input/output/value_info/initializer/Constant-attr for
+   fp32/fp16/bfloat16/float8*, flags any fp Cast, and denies the fp-computing ops
+   (DynamicQuantizeLinear, QLinearMatMul/Conv/Softmax, Round, Erf/Sqrt/Pow/Exp/Log/Reciprocal,
+   Softmax, LayerNormalization, Gemm). FAIL CLOSED on unknown/UNDEFINED types. With
+   `check_optimized=True` it ALSO audits the ORT-optimized artifact (ORT_ENABLE_ALL writes the
+   optimized model to disk; ORT can inject fp Casts/fuse LN at load). The Stage 1b int linear
+   PASSES both the raw and the ORT-optimized audit (ORT 1.19.2 CPU injects no fp into an
+   int-only linear); the Stage 1a fp-dequant graph correctly FAILS (negative test).
+   `tests/test_int8_onnx.py` now has 16 tests. **Next: the Q6 sub-modules -- one LN, exact-Phi
+   GELU LUT, one softmax row, one ConvInteger, one If, one Loop with int loop-carried cache;
+   each audited raw + optimized; then a 1-layer decoder -> full encoder + merged-decoder.**
