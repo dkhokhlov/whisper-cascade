@@ -119,6 +119,47 @@ def dequant_act(x_int: torch.Tensor, scale: torch.Tensor, zp: torch.Tensor) -> t
     return (x_int.to(torch.float32) - zp) * scale
 
 
+def quantize_act_per_token_intscale(x: torch.Tensor):
+    """Per-token asymmetric int8 quant with an INTEGER fixed-point scale (A7, zero-fp).
+
+    Same int8 levels as quantize_act_per_token, but the scale is returned as a fixed-point
+    pair (mul, shift) instead of a float: x_fp ~= (x_int8 - x_zp) * mul * 2^(-shift). This is
+    the form the zero-fp ONNX graph applies as an int Mul + BitShift (no runtime fp). The
+    scale is still derived here from the fp amax; the deployed graph derives it from the int
+    amax (same order) -- A7 gates the fp-scale -> int-fixed-point-scale rounding, the one
+    unmeasured approximation.
+
+    Returns (x_int8 [-128,127] int32, mul [*,1] int32, shift [*,1] int32, zp [*,1] int32).
+
+    mul is a Q1.16 fixed-point (normalized to ~[2^15, 2^16)): coarser than the weight scale's
+    Q1.31 because the activation scale multiplies the FULL-I accumulator acc (int64, ~2^36 for
+    fc1), so mul * acc must fit int64. 16-bit scale precision is still far finer than the
+    int8 weight quant (2^-16 rel vs 2^-7), so the scale-value rounding is ~lossless; the
+    int64-overflow bound, not precision, sets the Q here.
+
+    A7 boundary round (codex+claude consensus, 2026-08-05): the int8 bin each value maps to
+    is decided by the INTEGER scale (mul*2^-shift), not the fp scale, so the reference's
+    lossy round matches the deployed graph's integer requant (else A7 is optimistic). The
+    arithmetic is fp but the scale VALUE is the Q1.16-quantized scale.
+    """
+    xmin = x.amin(dim=-1, keepdim=True)
+    xmax = x.amax(dim=-1, keepdim=True)
+    scale = ((xmax - xmin) / 255.0).clamp(min=1e-8)               # fp scale (intermediate)
+    q, exp = torch.frexp(scale.to(torch.float64))                  # scale = q * 2^exp, q in [0.5,1)
+    mul = torch.round(q * (2 ** 16)).clamp(0, 2 ** 16 - 1).to(torch.int32)    # Q1.16
+    shift = (16 - exp).to(torch.int32)                            # scale = mul * 2^(-shift)
+    # A7 boundary round: the int8 bin each value maps to is decided by the INTEGER scale
+    # (mul * 2^-shift), NOT the fp scale. The deployed zero-fp ONNX requants int8->int8 with
+    # this integer scale; rounding with the fp scale here would measure the next op's lossy
+    # round at higher precision than the deployed graph, making A7 optimistic. (codex+claude
+    # consensus, 2026-08-05.) The arithmetic is fp but the scale VALUE is the Q1.16-quantized
+    # scale, isolating the scale-value approximation A7 measures.
+    scale_int = (mul.to(torch.float64) * (2.0 ** (-shift.to(torch.float64)))).clamp(min=1e-12)
+    zp = torch.round(-xmin / scale_int - 128.0)
+    x_int = torch.round(x / scale_int + zp).clamp(-128, 127).to(torch.int32)
+    return x_int, mul, shift, zp
+
+
 # --------------------------------------------------------------------------- #
 # A1: per-group int8 matmul, staged                                            #
 # --------------------------------------------------------------------------- #
@@ -222,6 +263,7 @@ def int8_matmul_fixed_point(
     x_int: torch.Tensor, x_scale: torch.Tensor, x_zp: torch.Tensor,
     qr: torch.Tensor, zero: torch.Tensor, scale: torch.Tensor,
     bias: torch.Tensor | None, group_size: int,
+    act_mul: torch.Tensor | None = None, act_shift: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Stage 4: per-group fp scale AND fp zero as fixed-point, with fractional-bit retention.
 
@@ -263,7 +305,19 @@ def int8_matmul_fixed_point(
     p1 = _rshift_round(T1 * mul_s.unsqueeze(0).to(torch.int64), sh1)  # [B,O,G] int64 @ 2^-F
     p2 = _rshift_round(T2 * mul_z.unsqueeze(0).to(torch.int64), sh2)  # [B,1,G] int64 @ 2^-F
     acc = (p1 - p2).sum(dim=-1).to(torch.int64)                      # [B,O] int64 @ 2^-F
-    out = _rshift_round(acc, F_t).to(torch.float32) * x_scale        # final requant to int
+    if act_mul is not None:
+        # A7 integer activation scale: out_real = acc * act_mul * 2^-(F + act_shift).
+        # The act scale is applied as an int Mul (acc * am, both int) against the
+        # fixed-point 2^-(F + act_shift) power-of-two. The reference interface dequants
+        # to fp WITHOUT integer rounding loss, so this isolates the act-scale-VALUE
+        # approximation (Q1.16 vs the fp per-token scale) from a separate output
+        # quantization the NEXT op performs. The deployed ONNX graph keeps int8
+        # between ops via a proper requant (the rounding lives there, not here).
+        am = act_mul.to(torch.int64).reshape(-1, 1)                  # [B,1]
+        ash = (F + act_shift.to(torch.int64)).reshape(-1, 1)         # [B,1] = F + per-token shift
+        out = (acc * am).to(torch.float32) / (2.0 ** ash.to(torch.float32))
+    else:
+        out = _rshift_round(acc, F_t).to(torch.float32) * x_scale    # fp act scale (A6 path)
     if bias is not None:
         out = out + bias.to(torch.float32)
     return out

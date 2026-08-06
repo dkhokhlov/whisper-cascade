@@ -60,15 +60,26 @@ class Int8Linear(nn.Module):
         self.register_buffer("zero", meta["zero"].to(torch.float32).reshape(-1, 1))   # [N,1]
         self.register_buffer("scale", meta["scale"].to(torch.float32).reshape(-1, 1)) # [N,1]
         self.register_buffer("bias", hqq.bias.to(torch.float32) if hqq.bias is not None else None)
+        # A7: when True, the per-token activation scale is integer fixed-point (mul*2^-shift),
+        # applied as an int Mul + BitShift (zero runtime fp), the form the ONNX graph emits.
+        # Default False keeps the A6 fp act-scale path (regression-safe).
+        self.int_act_scale = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         lead = x.shape[:-1]
         I = x.shape[-1]
         x2 = x.reshape(-1, I).to(torch.float32)                          # [B, I]
-        x_int, x_scale, x_zp = i8.quantize_act_per_token(x2)            # per-token over I
-        out = i8.int8_matmul_fixed_point(
-            x_int, x_scale, x_zp, self.qr, self.zero, self.scale, self.bias, self.group_size
-        )                                                              # [B, O] fp32
+        if self.int_act_scale:
+            x_int, a_mul, a_shift, x_zp = i8.quantize_act_per_token_intscale(x2)
+            out = i8.int8_matmul_fixed_point(
+                x_int, None, x_zp, self.qr, self.zero, self.scale, self.bias, self.group_size,
+                act_mul=a_mul, act_shift=a_shift,
+            )
+        else:
+            x_int, x_scale, x_zp = i8.quantize_act_per_token(x2)        # per-token over I
+            out = i8.int8_matmul_fixed_point(
+                x_int, x_scale, x_zp, self.qr, self.zero, self.scale, self.bias, self.group_size
+            )                                                          # [B, O] fp32
         return out.reshape(*lead, self.out_features)
 
 
@@ -275,7 +286,7 @@ def _set_child(parent: nn.Module, dotted: str, child: nn.Module) -> None:
     setattr(parent, leaf, child)
 
 
-def swap_to_int8(model: nn.Module, blocks: set[str]) -> dict:
+def swap_to_int8(model: nn.Module, blocks: set[str], int_act_scale: bool = False) -> dict:
     """Swap selected op families in `model` to int8-compute modules. Returns a report dict.
 
     blocks: subset of {"matmul","ln","gelu","sm","conv"} (the staged-WER block names):
@@ -287,6 +298,10 @@ def swap_to_int8(model: nn.Module, blocks: set[str]) -> dict:
               attention scale 1/sqrt(d_head) (A5); the int scale only has effect with sm.
     The swap is in-place. The int8 attention wraps the existing q/k/v/out_proj modules
     (which are Int8Linear if matmul is in blocks, else the original HQQLinear).
+
+    int_act_scale (A7): set Int8Linear.int_act_scale=True on every swapped linear so the
+    per-token activation scale is integer fixed-point (zero runtime fp). The fp path stays
+    the default (False) for the A6 regression. Only affects the matmul block.
     """
     import transformers.models.whisper.modeling_whisper as w
 
@@ -295,7 +310,8 @@ def swap_to_int8(model: nn.Module, blocks: set[str]) -> dict:
     use_int_scale = "conv" in blocks
     for name, mod in list(model.named_modules()):
         if "matmul" in blocks and isinstance(mod, HQQLinear):
-            _set_child(model, name, Int8Linear(mod)); report["matmul"] += 1
+            lin = Int8Linear(mod); lin.int_act_scale = int_act_scale
+            _set_child(model, name, lin); report["matmul"] += 1
         elif "ln" in blocks and isinstance(mod, nn.LayerNorm):
             _set_child(model, name, Int8LayerNorm(mod)); report["ln"] += 1
         elif "gelu" in blocks and type(mod).__name__ == "GELUActivation":
@@ -377,13 +393,16 @@ def _run_pass(pipe, samples, n, lang):
 
 
 def run_wer(model_dir: str, blocks: set[str], n: int, dataset: str, config: str,
-            split: str, lang) -> None:
+            split: str, lang, int_act_scale: bool = False) -> None:
     """Build the HQQ pipeline once, run the fp baseline (no swap), then swap `blocks`
     to int8 and re-run on the SAME samples. Report both corpus WERs + the paired delta.
 
     The fp baseline (all-fp HQQ dequant compute) is the same-storage anchor: it isolates
     the int8-compute cost from the storage-bit effect. The 4-bit manifest is a separate
-    cross-model reference (not run here)."""
+    cross-model reference (not run here).
+
+    int_act_scale (A7): swap linears with integer fixed-point activation scales (zero
+    runtime fp) instead of the A6 fp act scale."""
     import json, sys
     from jiwer import wer as jiwer_wer
     import eval_wer as e
@@ -399,8 +418,8 @@ def run_wer(model_dir: str, blocks: set[str], n: int, dataset: str, config: str,
     fp_wer = jiwer_wer(refs, fp_hyps, e.WER_NORM, e.WER_NORM)
     print(f"  fp baseline WER = {fp_wer:.4f} over {len(refs)} samples", file=sys.stderr)
 
-    report = swap_to_int8(pipe.model, blocks)
-    print(f"swapped: {report}", file=sys.stderr)
+    report = swap_to_int8(pipe.model, blocks, int_act_scale=int_act_scale)
+    print(f"swapped: {report} int_act_scale={int_act_scale}", file=sys.stderr)
     print(f"int8 ({sorted(blocks)}) pass over the same {len(refs)} samples ...", file=sys.stderr)
     _, i8_hyps = _run_pass(pipe, samples, n, lang)
     n_cmp = min(len(i8_hyps), len(fp_hyps))
@@ -410,6 +429,7 @@ def run_wer(model_dir: str, blocks: set[str], n: int, dataset: str, config: str,
     result = {
         "model": model_dir,
         "blocks": sorted(blocks),
+        "int_act_scale": int_act_scale,
         "n_samples": n_cmp,
         "fp_wer": round(fp_wer, 4),
         "int8_wer": round(i8_wer, 4),
@@ -423,7 +443,7 @@ def run_wer(model_dir: str, blocks: set[str], n: int, dataset: str, config: str,
 def main():
     import argparse, sys
 
-    p = argparse.ArgumentParser(description="int8-compute forward harness (A6)")
+    p = argparse.ArgumentParser(description="int8-compute forward harness (A6/A7)")
     p.add_argument("--model", default="build/whisper-tiny-hqq-2bit")
     p.add_argument("--validate", action="store_true", help="per-layer Int8Linear vs HQQ fp")
     p.add_argument("--n-layers", type=int, default=8)
@@ -435,6 +455,8 @@ def main():
     p.add_argument("--config", default="en_us")
     p.add_argument("--split", default="test")
     p.add_argument("--lang", default="", help="forced language (e.g. spanish); empty=auto")
+    p.add_argument("--int-act-scale", action="store_true",
+                    help="A7: integer fixed-point activation scale (zero runtime fp) on linears")
     args = p.parse_args()
     if args.validate:
         validate_int8_linear(args.model, args.n_layers, args.seed)
@@ -442,7 +464,7 @@ def main():
     if args.wer:
         blocks = {b.strip() for b in args.blocks.split(",") if b.strip()}
         run_wer(args.model, blocks, args.n, args.dataset, args.config, args.split,
-                args.lang or None)
+                args.lang or None, int_act_scale=args.int_act_scale)
         return
     p.print_help()
 
