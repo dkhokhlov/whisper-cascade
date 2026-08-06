@@ -551,3 +551,42 @@ def test_pv_intscale_vs_fp_attention():
         attn_fp = torch.einsum("bhtu,bhud->bhtd", up, uv) * p_scale * v_scale
         worst = max(worst, i8._rel_err(recon, attn_fp))
     assert worst < 0.05, f"int-canonical P.V rel err {worst} >= 5%"
+
+
+# --------------------------------------------------------------------------- #
+# A8.3 (int-canonical): int8 KV cache (append-only Concat under a fixed         #
+# per-head scale + cross-attn compute-once carry). The defining static-KV      #
+# property: a new token quantizes under the SAME fixed scale as the cached      #
+# entries -> pure int8 Concat, no requant -> bit-exact across iterations.       #
+# --------------------------------------------------------------------------- #
+
+def test_kv_cache_append_bitexact_across_iterations():
+    """The defining static-KV property: appending a new token's K (quantized under the fixed
+    per-head scale) is bit-identical to quantizing the full [cached+new] sequence under that
+    scale -- a new token never changes a past token's int8 (no requant drift across iterations)."""
+    torch.manual_seed(0)
+    B, H, T_old, T_new, d = 2, 6, 10, 3, 64
+    k_full = torch.randn(B, H, T_old + T_new, d) * 2.0
+    # fixed per-head scale set once (from the full-sequence per-head amax -- oracle calibration)
+    k_int_full, k_mul, k_shift, _ = i8.quantize_kv_static_per_head_intscale(k_full)
+    # split: quantize old + new SEPARATELY under the SAME fixed scale, then concat
+    k_old_int = i8.quantize_kv_under_fixed_intscale(k_full[:, :, :T_old, :], k_mul, k_shift)
+    k_new_int = i8.quantize_kv_under_fixed_intscale(k_full[:, :, T_old:, :], k_mul, k_shift)
+    cached = i8.kv_cache_concat(None, k_old_int)          # step 1: old (cross-attn compute-once)
+    cached = i8.kv_cache_concat(cached, k_new_int)         # step 2: + new (append-only)
+    assert cached.shape == (B, H, T_old + T_new, d)
+    assert torch.equal(cached, k_int_full), \
+        "append-only concat must equal full-sequence quant (no requant drift)"
+
+
+def test_kv_cache_concat_preserves_int8():
+    """cached_int=None returns new_int (cross-attn compute-once on step 1); repeated appends
+    grow T along dim 2 with the exact int8 values preserved (pure Concat, no copy/alter)."""
+    torch.manual_seed(1)
+    B, H, d = 2, 6, 64
+    chunks = [torch.randint(-127, 128, (B, H, 1, d), dtype=torch.int32) for _ in range(4)]
+    cached = None
+    for c in chunks:
+        cached = i8.kv_cache_concat(cached, c)
+    assert cached.shape == (B, H, 4, d)
+    assert torch.equal(cached, torch.cat(chunks, dim=2)), "concat must preserve int8 values"

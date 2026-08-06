@@ -1280,6 +1280,38 @@ def int8_pv_matmul_intscale(p_int, p_zp, p_mul, p_shift, v_int, v_zp, v_mul, v_s
     return y_int8, y_mul, y_shift, y_zp
 
 
+def quantize_kv_under_fixed_intscale(k: torch.Tensor, k_mul: torch.Tensor, k_shift: torch.Tensor):
+    """Quantize k under a GIVEN fixed per-head Q1.16 scale (the append-only KV cache op, A8.3).
+
+    k [B,H,T,d] fp; k_mul/k_shift [1,H,1,1] (the FIXED per-head scale, set once by calibration --
+    NOT derived from k here). Returns k_int [B,H,T,d] int32 in [-127,127] (symmetric, zp=0). The
+    scale is the SAME as the cached entries' scale, so the new token appends via a pure int8
+    Concat (kv_cache_concat) with no requant -> bit-exact across iterations (a new token never
+    changes a past token's int8). Saturation: a token outside the calibration range clamps (the
+    static-K cost A8.6 measures). The A7 boundary round (integer scale decides the int8 bin)
+    applies as in quantize_kv_static_per_head_intscale.
+    """
+    H = k.shape[1]
+    scale_int = (k_mul.to(torch.float64) * 2.0 ** (-k_shift.to(torch.float64))).clamp(min=1e-12)
+    k_int = torch.round(k / scale_int.view(1, H, 1, 1)).clamp(-127, 127).to(torch.int32)
+    return k_int
+
+
+def kv_cache_concat(cached_int: torch.Tensor | None, new_int: torch.Tensor) -> torch.Tensor:
+    """Append-only int8 KV cache concat along T (A8.3, static granularity).
+
+    cached_int [B,H,T_old,d] int32 (or None on the first step); new_int [B,H,T_new,d] int32
+    (quantized under the SAME fixed scale as cached, via quantize_kv_under_fixed_intscale).
+    Returns [B,H,T_old+T_new,d] -- a pure int8 Concat, no requant (the new entries share the
+    cached per-head scale, so bit-exact across iterations). Cross-attn K/V: pass cached_int=None
+    on step 1 (computed once from the encoder output) and the cached result on every later step
+    -- the cross k/v projection is NOT recomputed (matches int8_forward.py:202-211).
+    """
+    if cached_int is None:
+        return new_int
+    return torch.cat([cached_int, new_int], dim=2)
+
+
 # --------------------------------------------------------------------------- #
 # A1 validation harness                                                        #
 # --------------------------------------------------------------------------- #
