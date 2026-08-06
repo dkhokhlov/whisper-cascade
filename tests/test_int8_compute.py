@@ -250,3 +250,61 @@ def test_gelu_intscale_vs_fp_erf_pre_requant():
         gelu_fp = i8.fp_gelu_ref(x_real)
         worst = max(worst, float((gelu_prereq - gelu_fp).abs().max()))
     assert worst < 1e-2, f"pre-requant LUT/index abs err {worst} >= 0.01"
+
+
+# --------------------------------------------------------------------------- #
+# A4 (int-canonical): pure-int softmax oracle (int8_softmax_intscale) + the      #
+# pure-int reciprocal (_int_recip_intscale) -- the spec the ONNX softmax        #
+# mirrors bit-exactly. subtract-max cancels zp; exp via int LUT; int reciprocal #
+# (CLZ seed + Newton); per-row requant.                                         #
+# --------------------------------------------------------------------------- #
+
+def test_int_recip_intscale_converges():
+    """_int_recip_intscale converges to (1/x)*2^P within ~5e-6 across x in [2^8, 2^30] (the
+    softmax sum_exp range). Pure-int CLZ seed + 5 Newton iters; no torch.log2, no fp fallback."""
+    K = 16
+    xs = torch.tensor([1 << 8, (1 << 10) + 3, 1 << 16, (1 << 20) + 999,
+                       1 << 24, 123456789, 1 << 30], dtype=torch.int64).reshape(-1, 1)
+    r = i8._int_recip_intscale(xs, K=K, P=24)
+    r_true = (1.0 / (xs.float() / 2 ** K)) * 2 ** 24
+    rel = (r.float() - r_true).abs() / r_true
+    assert float(rel.max()) < 1e-4, f"int recip rel err {rel.max().item()} > 1e-4"
+
+
+def _sm_inputs(B=2, K=1500, sig=2.0, seed=0):
+    torch.manual_seed(seed)
+    scores = torch.randn(B, K) * sig
+    return i8.quantize_act_per_token_intscale(scores)
+
+
+def test_softmax_intscale_idx_in_range():
+    """The exp-LUT index is clamped to [0, T-1]; exp_int in [0, 2^S]; the subtract-max cancels
+    zp (shifted <= 0); no int64 overflow in num/p_fixed/sum*inv."""
+    T, S = i8._SM_T, i8._SM_S
+    for seed in (0, 1, 2):
+        for sig in (0.5, 2.0, 5.0, 50.0):
+            xi, am, sh, xz = _sm_inputs(seed=seed, sig=sig)
+            _, _, _, _, inter = i8.int8_softmax_intscale(xi, xz, am, sh, return_intermediates=True)
+            assert int(inter["idx"].min()) >= 0 and int(inter["idx"].max()) <= T - 1
+            assert int(inter["exp_int"].min()) >= 0 and int(inter["exp_int"].max()) <= (1 << S)
+            assert int(inter["shifted"].max()) <= 0, "shifted must be <= 0 (max subtracted)"
+            assert int(inter["num"].abs().max()) < (1 << 62), "num overflow"
+            assert int(inter["p_fixed"].abs().max()) < (1 << 62), "p_fixed overflow"
+            assert int((inter["sum_exp"] * inter["inv_int"]).abs().max()) < (1 << 62), "sum*inv overflow"
+
+
+def test_softmax_intscale_vs_fp_within_tolerance():
+    """PRE-requant LUT+reciprocal softmax vs fp softmax: abs err < 2e-3 (the exp LUT
+    nearest-neighbor grid spacing L/T = 0.003 -> ~0.5 grid; the int reciprocal is ~5e-6). The
+    output int8 requant step is gated separately (shared with the linear/LN/GELU, WER-neutral;
+    the A4 staged WER gate already passed at +softmax)."""
+    worst = 0.0
+    for seed in (0, 1, 2, 3):
+        xi, am, sh, xz = _sm_inputs(seed=seed)
+        _, _, _, _, inter = i8.int8_softmax_intscale(xi, xz, am, sh, return_intermediates=True)
+        x_real = (xi.float() - xz.float().reshape(-1, 1)) * am.float().reshape(-1, 1) \
+            * (2.0 ** (-sh.float().reshape(-1, 1)))
+        p_fp = i8.fp_softmax_ref(x_real)
+        p_prereq = inter["p_fixed"].float() * (2.0 ** -(i8._SM_S + i8._SM_P))
+        worst = max(worst, float((p_prereq - p_fp).abs().max()))
+    assert worst < 2e-3, f"pre-requant LUT+recip abs err {worst} >= 2e-3"

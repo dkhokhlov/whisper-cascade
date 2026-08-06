@@ -488,7 +488,26 @@ ORT_DISABLE_ALL. New module `export_onnx_int8.py`.
    passes raw + ORT-optimized (Gather is an int index lookup, no fp). Pre-requant LUT+index error
    vs fp erf GELU is 0.0008 (the Phi LUT is near-exact); the post-requant abs err is one int8
    output step (shared with the linear/LN, WER-neutral, A3 staged gate already passed at +gelu).
-   `tests/test_int8_onnx.py` now has 36 tests; `tests/test_int8_compute.py` has 12. **Next: the
-   remaining Q6 sub-modules -- one softmax row, one ConvInteger, one If, one Loop with int
-   loop-carried cache (each bit-exact vs a pure-int reference + raw/optimized audit); then
-   1-layer decoder -> full encoder + merged-decoder.**
+   `tests/test_int8_onnx.py` now has 36 tests; `tests/test_int8_compute.py` has 12.
+
+   **Q6 int-canonical softmax ONNX emission -- VERIFIED BIT-EXACT (2026-08-05).**
+   `build_int8_softmax_onnx` (`export_onnx_int8.py`) mirrors `int8_softmax_intscale`
+   bit-exactly: softmax is translation-invariant, so the subtract-max CANCELS x_zp
+   (shifted_int = x_int - max_int, <= 0). Pure-int: idx = clamp(round_half_up(shifted*y_mul*
+   IDX_MUL, 2^(IDX_Q+y_shift)) + T-1, 0, T-1) (IDX_MUL = 22369621, same /3-fold as GELU; the
+   offset is T-1, the exp LUT grid [-L,0] not [-Lx,Lx]); exp_int = Gather(exp_lut, idx) (Q_S);
+   sum_exp = ReduceSum; inv_int via a PURE-INT reciprocal `_emit_int_recip` (CLZ seed via
+   _clz_ladder tag "sm_recip_clz" + 5 Newton iters -- no torch.log2, no fp fallback; the 0.707
+   seed underestimates so r approaches 1/x from below and t < 2*2^P throughout, uint64 right
+   shifts == arithmetic); p_fixed = exp_int*inv_int (Q(S+P)); output reuses _emit_output_requant
+   (F=S+P=39, act_mul=1, act_shift=0). Softmax is parameter-free; K is the sequence length.
+   Verified bit-exact vs the torch reference across 4 seeds x 6 cases (K=1500/256, batch 1..5,
+   magnitudes 0.5..50) -- EVERY int intermediate (max, shifted, num, den, idx, exp_int, sum_exp,
+   inv_int, p_fixed) AND the four int8 outputs match. Zero-fp audit passes raw + ORT-optimized
+   (Gather/ReduceMax/ReduceSum/the int reciprocal are all int). Pre-requant LUT+reciprocal error
+   vs fp softmax is 1.0e-3 (the exp LUT nearest-neighbor grid spacing L/T = 0.003 -> ~0.5 grid;
+   the int reciprocal is 5e-6); post-requant is the int8 output step (WER-neutral, A4 staged gate
+   already passed at +softmax). `tests/test_int8_onnx.py` now has 46 tests;
+   `tests/test_int8_compute.py` has 15. **Next: the remaining Q6 sub-modules -- one ConvInteger,
+   one If, one Loop with int loop-carried cache (each bit-exact vs a pure-int reference +
+   raw/optimized audit); then 1-layer decoder -> full encoder + merged-decoder.**

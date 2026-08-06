@@ -780,6 +780,145 @@ def build_int8_gelu_onnx(model_name="int8_gelu", emit_intermediates=False, D=153
     return m
 
 
+# ---- Softmax (Q6): int-canonical, pure-int, mirrors int8_softmax_intscale ----
+# softmax over the last dim: subtract-max (cancels zp), exp via int LUT, int reciprocal (CLZ
+# seed + Newton), per-row requant. Constants match int8_compute (_SM_*).
+_SM_T, _SM_L, _SM_S, _SM_P = 4096, 12, 15, 24
+_SM_IDX_Q = 16
+_SM_IDX_MUL = 22369621              # round((T/L)*2^IDX_Q) = round((1024/3)*2^16), same as GELU
+
+
+def _emit_int_recip(b, x_int, K, P, tag="sm_recip"):
+    """Append the pure-int reciprocal 1/x (mirrors int8_compute._int_recip_intscale) to builder
+    `b`. x_int [..., 1] int64 = x_real*2^K (x_real > 0); returns r [..., 1] = (1/x_real)*2^P.
+    CLZ seed via _clz_ladder (tag f'{tag}_clz') + 5 Newton iters. All positive (the 0.707 seed
+    underestimates -> r approaches 1/x from below -> t < 2*2^P throughout), so uint64 right
+    shifts == arithmetic. Node names are f'{tag}_'-prefixed."""
+    p = f"{tag}_"
+    b.init("zero_i64", np.array([0], dtype=np.int64), INT64)
+    b.init("one_i64", np.array([1], dtype=np.int64), INT64)
+    b.init("one_u64", np.array([1], dtype=np.uint64), UINT64)
+    b.init(f"{p}K", np.array([K], dtype=np.int64), INT64)
+    b.init(f"{p}P", np.array([P], dtype=np.int64), INT64)
+    b.init(f"{p}Ku", np.array([K], dtype=np.uint64), UINT64)
+    b.init(f"{p}Pu", np.array([P], dtype=np.uint64), UINT64)
+    b.init(f"{p}c7071", np.array([7071], dtype=np.int64), INT64)
+    b.init(f"{p}c10000", np.array([10000], dtype=np.int64), INT64)
+    b.init(f"{p}two", np.array([2 * (1 << P)], dtype=np.int64), INT64)
+    b.init(f"{p}half", np.array([1 << (P - 1)], dtype=np.int64), INT64)
+    # seed: bitpos = clz_ladder(x)-1 ; e = P+K-bitpos ; base = 2^max(e,0) ; seed = rhu(base*7071, 10000)
+    bitlen = _clz_ladder(b, x_int, tag=f"{p}clz")
+    bitpos = b.node("Sub", [bitlen, "one_i64"], [f"{p}bitpos"], f"{p}bitpos")
+    pk = b.node("Add", [f"{p}P", f"{p}K"], [f"{p}pk"], f"{p}pk")
+    e = b.node("Sub", [pk, bitpos], [f"{p}e"], f"{p}e")                          # [...,1]
+    e_c = b.node("Max", [e, "zero_i64"], [f"{p}e_c"], f"{p}e_c")
+    e_cu = b.node("Cast", [e_c], [f"{p}e_cu"], f"{p}e_cu", to=UINT64)
+    base_u = b.node("BitShift", ["one_u64", e_cu], [f"{p}base_u"], f"{p}base", direction="LEFT")
+    base = b.node("Cast", [base_u], [f"{p}base"], f"{p}base_i", to=INT64)
+    num_s = b.node("Mul", [base, f"{p}c7071"], [f"{p}seed_num"], f"{p}seed_num")
+    seed = _rhu(b, num_s, f"{p}c10000", f"{p}seed")                              # [...,1]
+    r = seed
+    for i in range(5):
+        xr = b.node("Mul", [x_int, r], [f"{p}xr{i}"], f"{p}xr{i}")
+        xru = b.node("Cast", [xr], [f"{p}xru{i}"], f"{p}xru{i}", to=UINT64)
+        tu = b.node("BitShift", [xru, f"{p}Ku"], [f"{p}tu{i}"], f"{p}tu{i}", direction="RIGHT")
+        t = b.node("Cast", [tu], [f"{p}t{i}"], f"{p}t{i}", to=INT64)
+        tmt = b.node("Sub", [f"{p}two", t], [f"{p}2mt{i}"], f"{p}2mt{i}")
+        rt = b.node("Mul", [r, tmt], [f"{p}rt{i}"], f"{p}rt{i}")
+        rth = b.node("Add", [rt, f"{p}half"], [f"{p}rth{i}"], f"{p}rth{i}")
+        rthu = b.node("Cast", [rth], [f"{p}rthu{i}"], f"{p}rthu{i}", to=UINT64)
+        rsh = b.node("BitShift", [rthu, f"{p}Pu"], [f"{p}rsh{i}"], f"{p}rsh{i}", direction="RIGHT")
+        r = b.node("Cast", [rsh], [f"{p}r{i}"], f"{p}r{i}", to=INT64)
+    return r
+
+
+def _emit_softmax_int8(b, x_int, x_zp, y_mul_in, y_shift_in, exp_lut, K,
+                       T=_SM_T, S=_SM_S, P=_SM_P, idx_q=_SM_IDX_Q, idx_mul=_SM_IDX_MUL):
+    """Append the int-canonical softmax over the last dim (mirrors int8_softmax_intscale) to
+    builder `b`. Consumes the previous op's int8 output (x_int [B,K], x_zp [B,1], y_mul_in [B,1],
+    y_shift_in [B,1]); emits (y_int8 [B,K], y_mul [B,1], y_shift [B,1], y_zp [B,1]). The
+    subtract-max cancels x_zp. Returns the 4 output names. See int8_softmax_intscale for the
+    bit-exact spec."""
+    P_ = "sm_"
+    b.init("zero_i64", np.array([0], dtype=np.int64), INT64)
+    b.init("axes_neg1", np.array([-1], dtype=np.int64), INT64)
+    b.init(f"{P_}iq", np.array([idx_q], dtype=np.int64), INT64)
+    b.init(f"{P_}imul", np.array([idx_mul], dtype=np.int64), INT64)
+    b.init(f"{P_}T_m1", np.array([T - 1], dtype=np.int64), INT64)
+    b.init("one_u64", np.array([1], dtype=np.uint64), UINT64)
+    x64 = b.node("Cast", [x_int], [f"{P_}x64"], f"{P_}x_cast", to=INT64)         # [B,K]
+    # max_int = ReduceMax(x64, -1) ; shifted = x64 - max_int (zp cancels)
+    max_int = b.node("ReduceMax", [x64, "axes_neg1"], [f"{P_}max"], f"{P_}max", keepdims=1)  # [B,1]
+    shifted = b.node("Sub", [x64, max_int], [f"{P_}shifted"], f"{P_}shifted")    # [B,K] (<=0)
+    ym = b.node("Cast", [y_mul_in], [f"{P_}ym"], f"{P_}ym_cast", to=INT64)       # [B,1]
+    ys = b.node("Cast", [y_shift_in], [f"{P_}ys"], f"{P_}ys_cast", to=INT64)     # [B,1]
+    # idx = clamp(rhu(shifted*ym*IDX_MUL, 2^(IDX_Q+ys)) + T-1, 0, T-1)
+    sym = b.node("Mul", [shifted, ym], [f"{P_}sym"], f"{P_}sym")                 # [B,K]*[B,1]
+    num = b.node("Mul", [sym, f"{P_}imul"], [f"{P_}num"], f"{P_}num")            # [B,K]*[1]
+    s_idx = b.node("Add", [ys, f"{P_}iq"], [f"{P_}s_idx"], f"{P_}s_idx")         # [B,1]
+    s_idx_u = b.node("Cast", [s_idx], [f"{P_}s_idx_u"], f"{P_}s_idx_cast", to=UINT64)
+    den_u = b.node("BitShift", ["one_u64", s_idx_u], [f"{P_}den_u"], f"{P_}den_shift", direction="LEFT")
+    den = b.node("Cast", [den_u], [f"{P_}den"], f"{P_}den_cast", to=INT64)       # [B,1]
+    idx_pre = _rhu(b, num, den, f"{P_}idx")                                      # [B,K]
+    idx_plus = b.node("Add", [idx_pre, f"{P_}T_m1"], [f"{P_}idx_plus"], f"{P_}idx_plus")
+    idx_lo = b.node("Max", [idx_plus, "zero_i64"], [f"{P_}idx_lo"], f"{P_}idx_lo")
+    idx = b.node("Min", [idx_lo, f"{P_}T_m1"], [f"{P_}idx"], f"{P_}idx_hi")      # [B,K]
+    # exp_int = Gather(exp_lut, idx) ; sum_exp = ReduceSum
+    b.init(f"{P_}lut", exp_lut.astype(np.int64), INT64)                          # [T] exp*2^S
+    exp_int = b.node("Gather", [f"{P_}lut", idx], [f"{P_}exp"], f"{P_}gather", axis=0)   # [B,K]
+    sum_exp = b.node("ReduceSum", [exp_int, "axes_neg1"], [f"{P_}sum"], f"{P_}sum", keepdims=1)  # [B,1]
+    # inv_int = int reciprocal ; p_fixed = exp_int * inv_int
+    inv_int = _emit_int_recip(b, sum_exp, K=S, P=P, tag=f"{P_}recip")            # [B,1]
+    p_fixed = b.node("Mul", [exp_int, inv_int], [f"{P_}p"], f"{P_}p")            # [B,K]*[B,1]
+    # output requant: F = S+P, fresh per-row scale (act_mul=1, act_shift=0)
+    b.init(f"{P_}am_one", np.array([1], dtype=np.int32), INT32)
+    b.init(f"{P_}ash_zero", np.array([0], dtype=np.int32), INT32)
+    y_out, y_mul, y_shift, y_zp = _emit_output_requant(
+        b, p_fixed, f"{P_}am_one", f"{P_}ash_zero", S + P, None, K)
+    return y_out, y_mul, y_shift, y_zp
+
+
+def build_int8_softmax_onnx(model_name="int8_softmax", emit_intermediates=False, K=1500):
+    """Build the int-canonical softmax ONNX (mirrors int8_compute.int8_softmax_intscale).
+
+    Softmax over the last dim is parameter-free; `K` is the sequence length (default 1500 =
+    whisper-tiny encoder attention; tests override). The exp LUT is baked as an int64 [T]
+    initializer (bit-identical to int8_compute._exp_lut, loaded lazily).
+
+    Inputs (the previous op's int8 output, zero runtime fp):
+      x_int [B, K] int8, x_zp [B, 1] int32, x_mul [B, 1] int32 (Q1.16 input scale),
+      x_shift [B, 1] int32.
+    Outputs: y_int8 [B, K] int8, y_mul [B, 1] int32, y_shift [B, 1] int32, y_zp [B, 1] int32.
+    With emit_intermediates the graph also outputs max, shifted, num, den, idx, exp, sum, inv, p
+    for bit-exact verification vs the torch reference.
+    """
+    import int8_compute as i8
+    exp_lut = i8._exp_lut().numpy().astype(np.int64)                             # [T] exp*2^S
+    b = _Builder()
+    out_names = _emit_softmax_int8(b, "x_int", "x_zp", "x_mul", "x_shift", exp_lut, K)
+    y_out, y_mul, y_shift, y_zp = out_names
+    inputs = [
+        helper.make_tensor_value_info("x_int", INT8, ["B", K]),
+        helper.make_tensor_value_info("x_zp", INT32, ["B", 1]),
+        helper.make_tensor_value_info("x_mul", INT32, ["B", 1]),
+        helper.make_tensor_value_info("x_shift", INT32, ["B", 1]),
+    ]
+    vi = helper.make_tensor_value_info
+    outputs = [vi("y_int8", INT8, ["B", K]), vi("y_mul", INT32, ["B", 1]),
+               vi("y_shift", INT32, ["B", 1]), vi("y_zp", INT32, ["B", 1])]
+    if emit_intermediates:
+        outputs += [vi("sm_max", INT64, ["B", 1]), vi("sm_shifted", INT64, ["B", K]),
+                    vi("sm_num", INT64, ["B", K]), vi("sm_den", INT64, ["B", 1]),
+                    vi("sm_idx", INT64, ["B", K]), vi("sm_exp", INT64, ["B", K]),
+                    vi("sm_sum", INT64, ["B", 1]), vi("sm_recip_r4", INT64, ["B", 1]),
+                    vi("sm_p", INT64, ["B", K])]
+    g_ = helper.make_graph(b.nodes, model_name, inputs, outputs, initializer=b.inits)
+    m = helper.make_model(g_, opset_imports=[helper.make_opsetid("", 18)])
+    m.ir_version = 9
+    onnx.checker.check_model(m)
+    return m
+
+
 # ---- recursive zero-fp audit (Q4) ----
 # Tensor elem types that are legal in a zero-fp graph: integers, bool, string. Any float
 # (fp32/fp16/bfloat16/float8*) is a violation. Unknown/UNDEFINED types fail closed.

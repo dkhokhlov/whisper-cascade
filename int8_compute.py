@@ -851,6 +851,90 @@ def int8_softmax(scores_int: torch.Tensor, score_scale: torch.Tensor, stage: int
 
 
 # --------------------------------------------------------------------------- #
+# A4 (int-canonical): pure-int softmax oracle for the zero-fp ONNX emission      #
+# (codex+claude consensus 2026-08-05). The Phase-A int8_softmax uses runtime fp  #
+# (fp score_scale, fp index round, torch.log2 reciprocal seed + fp fallback), so #
+# it is a DIFFERENT algorithm, not a bit-exact oracle. This reference is pure-int #
+# throughout and is the spec the ONNX softmax mirrors bit-exactly.               #
+# --------------------------------------------------------------------------- #
+
+# Fixed-point for the exp-LUT index: shifted_real * T/L = shifted_int*y_mul*2^-y_shift * (1024/3)
+# (T=4096, L=12). Same IDX_MUL as GELU (the /3 folded into Q_IDX); the offset differs (T-1, the
+# exp LUT grid is [-L, 0], not [-Lx, Lx]).
+_SM_IDX_Q = 16
+_SM_IDX_MUL = int(round((1024.0 / 3.0) * (2 ** _SM_IDX_Q)))   # 22369621
+
+
+def _int_recip_intscale(x_int, K, P=_SM_P, iters=5):
+    """Pure-int reciprocal 1/x via a CLZ seed + Newton, all int64 (mirrors the ONNX emission).
+    x_int [..., 1] int64 = x_real*2^K (x_real > 0). Returns r_int [..., 1] = (1/x_real)*2^P.
+    Seed: bitpos = _int_bitlen(x_int) - 1 (pure-int CLZ, no torch.log2); e = P + K - bitpos;
+    seed = round_half_up(2^e * 7071, 10000) (0.7071 = geom mean of 1/mantissa in (0.5,1]).
+    e >= 0 always for softmax (sum_exp <= K*2^S << 2^(P+K)); clamp(min=0) guards the shift.
+    Newton: t = (x_int*r) >> K ; r = (r*(2*2^P - t) + 2^(P-1)) >> P (round-half-up, all positive:
+    the 0.707 seed underestimates, so r approaches 1/x from below and t < 2*2^P throughout)."""
+    x_int = x_int.to(torch.int64)
+    bitpos = _int_bitlen(x_int) - 1
+    e = (P + K) - bitpos
+    base = torch.bitwise_left_shift(torch.ones_like(x_int), e.clamp(min=0))   # 2^e (e >= 0)
+    seed = _round_half_up(base * 7071, torch.full_like(x_int, 10000))         # *0.7071
+    r = seed
+    two = torch.full_like(x_int, 2 * (1 << P))
+    half = torch.full_like(x_int, 1 << (P - 1))
+    for _ in range(iters):
+        t = torch.bitwise_right_shift(x_int * r, K)                            # x*r in Q_P
+        r = torch.bitwise_right_shift(r * (two - t) + half, P)                 # round-half-up
+    return r
+
+
+def int8_softmax_intscale(x_int, x_zp, y_mul_in, y_shift_in, return_intermediates=False):
+    """Int-canonical pure-int softmax over the last dim -- the zero-fp oracle the ONNX mirrors.
+
+    Input: the previous op's int8 output (x_int [..., K], x_zp [..., 1], y_mul_in [..., 1] Q1.16,
+    y_shift_in [..., 1]); score_real = (x_int - x_zp)*y_mul*2^-y_shift. softmax is translation-
+    invariant, so the subtract-max CANCELS x_zp: shifted_real = (x_int - max_int)*y_mul*2^-y_shift.
+    Pure-int throughout (no runtime fp):
+      max_int = amax(x_int, -1) ; shifted_int = x_int - max_int (<= 0)
+      idx = clamp(round_half_up(shifted_int*y_mul*IDX_MUL, 2^(IDX_Q+y_shift)) + T-1, 0, T-1)
+      exp_int = exp_lut[idx] (Q_S) ; sum_exp = sum(exp_int) (int64)
+      inv_int = _int_recip_intscale(sum_exp, K=S, P=P)   (pure-int CLZ seed + Newton)
+      p_fixed = exp_int * inv_int (Q(S+P))
+      out = int8_output_requant_intscale(p_fixed, 1, 0, F=S+P, bias=None)
+    The exp LUT covers shifted_real in [-L, 0]; values below -L clamp to idx 0 (exp ~= 0). The
+    input scale (set by the previous op) maps the attention-score range into this window.
+
+    Returns (y_int8 [..., K] int32, y_mul [..., 1] int32, y_shift [..., 1] int32, y_zp [..., 1]);
+    with return_intermediates, also a dict of the int intermediates for bit-exact verification.
+    """
+    T, S, P = _SM_T, _SM_S, _SM_P
+    shp = x_int.shape
+    x64 = x_int.to(torch.int64)
+    ym = y_mul_in.to(torch.int64).reshape(*shp[:-1], 1)
+    ys = y_shift_in.to(torch.int64).reshape(*shp[:-1], 1)
+    # subtract-max (zp cancels); shifted_int <= 0
+    max_int = x64.amax(dim=-1, keepdim=True)                                  # [..., 1]
+    shifted = x64 - max_int                                                    # [..., K] (<= 0)
+    # idx = clamp(round_half_up(shifted*ym*IDX_MUL, 2^(IDX_Q+ys)) + T-1, 0, T-1)
+    num = shifted * ym * _SM_IDX_MUL                                           # [..., K]
+    den = torch.ones_like(ys) << (ys + _SM_IDX_Q)                             # [..., 1] = 2^(IDX_Q+ys)
+    idx = torch.clamp(_round_half_up(num, den) + T - 1, 0, T - 1)             # [..., K]
+    lut = _exp_lut().to(torch.int64)                                           # [T] exp*2^S
+    exp_int = lut[idx]                                                         # [..., K] Q_S
+    sum_exp = exp_int.sum(dim=-1, keepdim=True)                               # [..., 1] int64
+    inv_int = _int_recip_intscale(sum_exp, K=S, P=P)                           # [..., 1] Q_P
+    p_fixed = exp_int * inv_int                                                # [..., K] Q(S+P)
+    ones = torch.ones(*shp[:-1], 1, dtype=torch.int32)
+    zeros = torch.zeros(*shp[:-1], 1, dtype=torch.int32)
+    y_int8, y_mul, y_shift, y_zp = int8_output_requant_intscale(p_fixed, ones, zeros, S + P, None)
+    if return_intermediates:
+        inter = {"max_int": max_int, "shifted": shifted, "num": num, "den": den,
+                 "idx": idx, "exp_int": exp_int, "sum_exp": sum_exp,
+                 "inv_int": inv_int, "p_fixed": p_fixed}
+        return y_int8, y_mul, y_shift, y_zp, inter
+    return y_int8, y_mul, y_shift, y_zp
+
+
+# --------------------------------------------------------------------------- #
 # A5: int8 conv (per-channel int8 weight, standard QLinearConv math) + attn scale
 # --------------------------------------------------------------------------- #
 
