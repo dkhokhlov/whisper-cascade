@@ -308,3 +308,91 @@ def test_softmax_intscale_vs_fp_within_tolerance():
         p_prereq = inter["p_fixed"].float() * (2.0 ** -(i8._SM_S + i8._SM_P))
         worst = max(worst, float((p_prereq - p_fp).abs().max()))
     assert worst < 2e-3, f"pre-requant LUT+recip abs err {worst} >= 2e-3"
+
+
+# --------------------------------------------------------------------------- #
+# A5 (int-canonical): pure-int Conv1d oracle (int8_conv1d_intscale) -- the spec  #
+# the ONNX Conv1d mirrors bit-exactly. per-batch Q1.16 act scale (factorable     #
+# across the kernel window), per-channel Q0.15 weight scale (keeps the full      #
+# int32 acc * mul_w * x_mul in int64), pre-folded int bias, shared per-(b,o)     #
+# output requant.                                                               #
+# --------------------------------------------------------------------------- #
+
+def _conv_inputs(B=2, in_ch=80, T=300, sigma=2.0, seed=0):
+    torch.manual_seed(seed)
+    x = torch.randn(B, in_ch, T) * sigma
+    return i8.quantize_act_per_batch_intscale(x)            # xi [B,in,T] int32, mul/shift/zp [B,1,1]
+
+
+def _real_conv(name):
+    m = hqq_asr.load_whisper_hqq(MODEL, device="cpu", compute_dtype=torch.float32)
+    conv = dict(m.named_modules())[name]
+    return conv.weight.detach().to(torch.float32), conv.bias.detach().to(torch.float32), \
+        int(conv.stride[0]), int(conv.padding[0])
+
+
+def test_conv1d_intscale_in_range():
+    """x_int in [-128,127]; F_w >= 1 (bias precision); acc_w/acc_wb in int64 headroom
+    (Q0.15 * int32 acc * Q1.16 x_mul <= 2^62; Q0.31 would hit 2^78). Real whisper-tiny weights."""
+    for name in ("model.encoder.conv1", "model.encoder.conv2"):
+        w, bias, stride, _pad = _real_conv(name)
+        out_ch, in_ch, k = w.shape
+        for seed in (0, 1, 2):
+            for sig in (0.3, 2.0, 8.0):
+                xi, am, sh, xz = _conv_inputs(B=2, in_ch=in_ch, T=300, sigma=sig, seed=seed)
+                w_int, w_scale = i8._quant_weight_per_channel(w)
+                _, _, _, _, inter = i8.int8_conv1d_intscale(
+                    xi, xz, am, sh, w_int, w_scale, bias, stride=stride, kernel=k,
+                    padding=1, return_intermediates=True)
+                assert int(xi.min()) >= -128 and int(xi.max()) <= 127, "x_int out of int8"
+                assert inter["F_w"] >= 1, f"F_w={inter['F_w']} < 1 (bias precision)"
+                assert int(inter["acc_w"].abs().max()) < (1 << 62), "acc_w overflow"
+                assert int(inter["acc_wb"].abs().max()) < (1 << 62), "acc_wb overflow"
+
+
+def test_conv1d_intscale_self_consistent():
+    """Re-dequant of (y_int8, y_mul, y_shift, y_zp) matches the pre-requant real conv output
+    (acc_real_w * x_scale + bias, where acc_real_w = acc_w*2^-F_w and x_scale = x_mul*2^-x_shift)
+    within one int8 step (per-(b,o) row step)."""
+    import torch.nn.functional as F
+    for name, T in [("model.encoder.conv1", 300), ("model.encoder.conv2", 300)]:
+        w, bias, stride, _pad = _real_conv(name)
+        out_ch, in_ch, k = w.shape
+        for seed in (0, 1, 2):
+            xi, am, sh, xz = _conv_inputs(B=2, in_ch=in_ch, T=T, sigma=2.0, seed=seed)
+            w_int, w_scale = i8._quant_weight_per_channel(w)
+            y_int8, ym, ys, yzp, inter = i8.int8_conv1d_intscale(
+                xi, xz, am, sh, w_int, w_scale, bias, stride=stride, kernel=k,
+                padding=1, return_intermediates=True)
+            scale = ym.float() * (2.0 ** (-ys.float()))                       # [B,out,1]
+            y_recon = (y_int8.float() - yzp.float()) * scale                   # [B,out,T_out]
+            acc_real_w = inter["acc_w"].float() * (2.0 ** -inter["F_w"])       # [B,out,T_out]
+            x_scale = am.float() * (2.0 ** (-sh.float()))                     # [B,1,1]
+            y_pre = acc_real_w * x_scale + bias.reshape(1, out_ch, 1)          # [B,out,T_out]
+            step = (y_pre.amax(-1, keepdim=True) - y_pre.amin(-1, keepdim=True)) / 255.0
+            err = (y_recon - y_pre).abs()
+            assert bool((err < step + 1e-6).all()), \
+                f"{name}: self-consistency err {err.max().item()} >= step {step.max().item()}"
+
+
+def test_conv1d_intscale_vs_fp_within_tolerance():
+    """Int-canonical Conv1d output (dequant) vs fp Conv1d: the per-BATCH int8 act quant (256 levels
+    over the whole [in,T] tensor -- the conv-window-factorable choice) plus the per-channel int8
+    weight quant gives a global rel_err ~1.2% (conv1) / ~3.2% (conv2). The A5 staged WER gate
+    already passed at +conv (this rel err is WER-neutral); the threshold is a regression guard."""
+    import torch.nn.functional as F
+    worst = 0.0
+    for name, T in [("model.encoder.conv1", 300), ("model.encoder.conv2", 300)]:
+        w, bias, stride, _pad = _real_conv(name)
+        out_ch, in_ch, k = w.shape
+        for seed in (0, 1, 2):
+            xi, am, sh, xz = _conv_inputs(B=2, in_ch=in_ch, T=T, sigma=2.0, seed=seed)
+            w_int, w_scale = i8._quant_weight_per_channel(w)
+            y_int8, ym, ys, yzp = i8.int8_conv1d_intscale(
+                xi, xz, am, sh, w_int, w_scale, bias, stride=stride, kernel=k, padding=1)
+            scale = ym.float() * (2.0 ** (-ys.float()))                       # [B,out,1]
+            y_recon = (y_int8.float() - yzp.float()) * scale                   # [B,out,T_out]
+            x_real = (xi.float() - xz.float()) * am.float() * (2.0 ** (-sh.float()))
+            y_fp = F.conv1d(x_real, w, bias, stride=stride, padding=1)
+            worst = max(worst, i8._rel_err(y_recon, y_fp))
+    assert worst < 0.05, f"int-canonical conv rel err {worst} >= 5%"

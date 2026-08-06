@@ -241,20 +241,28 @@ def _rshift_round(v: torch.Tensor, sh) -> torch.Tensor:
     return torch.bitwise_right_shift(v + half, sh)
 
 
-def fixed_point_per_group(scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-group fixed-point (gemmlowp/TFLite scheme): scale ≈ mul * 2^left_shift.
+def fixed_point_per_group(scale: torch.Tensor, Q: int = 31) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-element fixed-point (gemmlowp/TFLite scheme): scale ≈ mul * 2^left_shift.
 
     Returns (mul [same shape] int32, right_shift [same shape] int32). mul is normalized
-    to ~[2^30, 2^31) (a Q0.31 fixed-point), so each group keeps ~30 bits of precision
-    regardless of magnitude. The shift is PER-GROUP -- a shared shift cannot cover the
+    to ~[2^(Q-1), 2^Q) (a Q0.Q fixed-point), so each element keeps ~(Q-1) bits of precision
+    regardless of magnitude. The shift is PER-ELEMENT -- a shared shift cannot cover the
     per-group scale dynamic range (~10-100x within a layer, see A1 diagnostics) without
     zeroing small-scale groups. ONNX BitShift accepts a per-element shift tensor, so this
     is emittable. HQQ scales are all < 1, so left_shift <= 0 and a right-shift suffices.
+
+    Q=31 (default) for the linear per-GROUP scale: the per-group partial (group_size terms,
+    ~2^12) is shifted to 2^-F BEFORE the cross-group sum, so mul (~2^31) * partial (~2^12) =
+    2^43 fits int64 with room. Q=15 for the conv per-CHANNEL scale: the conv accumulates the
+    FULL int32 acc (all in*kernel terms, up to 2^31) BEFORE the scale, so mul (~2^15) * acc
+    (2^31) = 2^46 fits int64 (a Q0.31 mul would overflow: 2^31 * 2^31 = 2^62, then * the Q1.16
+    act scale 2^16 -> 2^78). Q0.15 is still 2^8 finer than the int8 weight quant (2^-7), so
+    WER-neutral (the conv weight is int8, not HQQ 2/3-bit).
     """
     s = scale.to(torch.float64)
     q, exp = torch.frexp(s)                       # s = q * 2^exp, q in [0.5, 1) for s>0
-    mul = torch.round(q * (2 ** 31)).clamp(0, 2**31 - 1).to(torch.int32)
-    left_shift = exp - 31                          # <= 0 for s < 1
+    mul = torch.round(q * (2 ** Q)).clamp(0, 2 ** Q - 1).to(torch.int32)
+    left_shift = exp - Q                           # <= 0 for s < 1
     right_shift = (-left_shift).clamp(min=0).to(torch.int32)
     return mul, right_shift
 
@@ -1005,6 +1013,106 @@ def int8_conv1d(x_int: torch.Tensor, x_scale: torch.Tensor, x_zp: torch.Tensor,
     out = out.transpose(1, 2)                                              # [B, out, T_out] (conv convention)
     o_int, o_scale, o_zp = quantize_act_per_token(out)                     # per-token output to next op
     return dequant_act(o_int, o_scale, o_zp)
+
+
+def quantize_act_per_batch_intscale(x: torch.Tensor):
+    """Per-batch asymmetric int8 quant with an INTEGER fixed-point scale (A7, zero-fp).
+
+    Same int8 levels as quantize_act_per_batch, but the scale is a fixed-point pair
+    (mul, shift) instead of a float: x_fp ~= (x_int8 - x_zp) * mul * 2^(-shift). This is
+    the form the zero-fp ONNX conv applies as an int Mul + BitShift (no runtime fp). The
+    per-batch (one scale per batch element over in,T) is the conv-window requirement: a
+    per-token (per-spatial-position) scale is NOT factorable across the kernel window, but
+    a per-batch scale is constant across the window -> factors out cleanly (see A5).
+
+    Returns (x_int8 [B,in,T] int32 in [-128,127], mul [B,1,1] int32 Q1.16, shift [B,1,1]
+    int32, zp [B,1,1] int32). Q1.16 (not Q1.31) because the conv acc is int32 (smaller than
+    the linear's int64 acc); the act scale multiplies acc_w (int64, ~2^22-2^30 here), so a
+    16-bit scale keeps the product in int64 with ample headroom. 16-bit precision is still
+    far finer than the int8 weight quant (2^-16 rel vs 2^-7), so the scale-value rounding is
+    ~lossless. The A7 boundary round (integer scale decides the int8 bin) applies as in
+    quantize_act_per_token_intscale.
+    """
+    xmin = x.amin(dim=(1, 2), keepdim=True)
+    xmax = x.amax(dim=(1, 2), keepdim=True)
+    scale = ((xmax - xmin) / 255.0).clamp(min=1e-8)                        # fp scale (intermediate)
+    q, exp = torch.frexp(scale.to(torch.float64))                         # scale = q * 2^exp, q in [0.5,1)
+    mul = torch.round(q * (2 ** 16)).clamp(0, 2 ** 16 - 1).to(torch.int32)  # Q1.16
+    shift = (16 - exp).to(torch.int32)                                     # scale = mul * 2^(-shift)
+    scale_int = (mul.to(torch.float64) * (2.0 ** (-shift.to(torch.float64)))).clamp(min=1e-12)
+    zp = torch.round(-xmin / scale_int - 128.0)
+    x_int = torch.round(x / scale_int + zp).clamp(-128, 127).to(torch.int32)
+    return x_int, mul, shift, zp
+
+
+def int8_conv1d_intscale(x_int: torch.Tensor, x_zp: torch.Tensor, x_mul: torch.Tensor,
+                         x_shift: torch.Tensor, w_int: torch.Tensor, w_scale: torch.Tensor,
+                         bias: torch.Tensor, stride: int = 1, kernel: int = 3, padding: int = 1,
+                         return_intermediates: bool = False):
+    """Int-canonical Conv1d oracle (pure-int, zero runtime fp) -- the spec the ONNX conv
+    mirrors bit-exactly.
+
+    x_int [B,in,T] int32 (int8-range [-128,127]); x_zp/x_mul/x_shift [B,1,1] int32 (per-batch
+    Q1.16 scale, from quantize_act_per_batch_intscale); w_int [out,in,kernel] int32 (symmetric
+    [-127,127], from _quant_weight_per_channel); w_scale [out] fp (baked to Q0.15 fixed-point
+    at ONNX export; here applied as int fixed-point -> pure-int throughout); bias [out].
+
+    Math (matches the A5 staged int8_conv1d, with INTEGER scales):
+      acc[b,o,t] = sum_{i,k} (x_int[b,i,t+k] - x_zp[b]) * w_int[o,i,k]   (int32 window matmul)
+      out_real   = acc[b,o,t] * w_scale[o] * x_scale[b] + bias[o].
+      w_scale baked Q0.15 (mul_w, shift_w, per-channel); F_w = min(shift_w) (scalar);
+      acc_w = rshift_round(acc * mul_w, shift_w - F_w)  @ 2^-F_w  (per-channel shift, broadcast).
+      Flatten [B,out,T_out] -> [B*out, T_out] (row b*out+o); expand x_mul/x_shift [B,1,1] ->
+      [B*out,1] (repeat_interleave out); bias_fixed = round(bias*2^F_w) [out] -> [B*out,1]
+      (repeat B). Pre-fold the bias: acc_wb = acc_w*x_mul + (bias_fixed << x_shift), then
+      reuse int8_output_requant_intscale with act_mul=1, act_shift=x_shift, F=F_w, bias=None.
+      act_shift=x_shift carries the per-batch x_shift into y_shift; the pre-folded bias keeps
+      the requant's per-feature bias path (which assumes [1,O]) out of the conv's per-row bias.
+
+    Q0.15 (not the linear's Q0.31) because the conv accumulates the FULL int32 acc (all
+    in*kernel terms) BEFORE the scale: mul_w*acc must fit int64 alongside the Q1.16 act scale.
+    Q0.15 mul (~2^15) * acc (int32 <= 2^31) * x_mul (~2^16) <= 2^62 < 2^63 (Q0.31 would hit
+    2^78). Q0.15 is 2^8 finer than the int8 weight quant (2^-7), so WER-neutral.
+    """
+    B, in_ch, T = x_int.shape
+    out_ch = w_int.shape[0]
+    T_out = (T + 2 * padding - kernel) // stride + 1
+    # per-channel weight scale -> Q0.15 fixed-point (mul_w, shift_w); F_w = min shift (scalar)
+    mul_w, shift_w = fixed_point_per_group(w_scale.to(torch.float64), Q=15)  # [out] int32 each
+    F_w = int(shift_w.min().item())
+    assert F_w >= 1, f"conv weight scale too large (shift_w={shift_w.tolist()}); F_w must be >=1 for bias precision"
+    sw = (shift_w - F_w).to(torch.int64)                                    # [out] per-channel residual shift
+    # window matmul (mirror the A5 einsum): center by per-batch zp, pad, unfold, matmul
+    x32 = (x_int.to(torch.int32) - x_zp.to(torch.int32))                   # [B,in,T] centered
+    xp = torch.nn.functional.pad(x32, (padding, padding))                  # [B,in,T+2p]
+    win = xp.unfold(-1, kernel, stride).movedim(1, 2)                      # [B,T_out,in,kernel]
+    win = win.reshape(B, T_out, in_ch * kernel).to(torch.int32)           # [B,T_out,in*k]
+    wr = w_int.reshape(out_ch, in_ch * kernel).to(torch.int32)             # [out,in*k]
+    acc = torch.einsum("bti,oi->bto", win, wr).transpose(1, 2)             # [B,out,T_out] int32
+    # per-channel w_scale fixed-point (broadcast mul_w/sw over B, T_out); acc_w @ 2^-F_w
+    acc_w = _rshift_round(acc.to(torch.int64) * mul_w.to(torch.int64).reshape(1, out_ch, 1),
+                          sw.reshape(1, out_ch, 1))                        # [B,out,T_out] int64
+    # flatten [B,out,T_out] -> [B*out, T_out] (row-major: B outer, out middle)
+    acc_w_flat = acc_w.reshape(B * out_ch, T_out)
+    x_mul_flat = x_mul.to(torch.int64).reshape(B, 1).repeat_interleave(out_ch, 0)   # [B*out,1]
+    x_shift_flat = x_shift.to(torch.int64).reshape(B, 1).repeat_interleave(out_ch, 0)
+    bias_fixed = torch.floor(bias.to(torch.float64) * (2.0 ** F_w) + 0.5).to(torch.int64)  # [out]
+    bias_fixed_flat = bias_fixed.reshape(1, out_ch).repeat(B, 1).reshape(B * out_ch, 1)    # [B*out,1]
+    accam = acc_w_flat * x_mul_flat                                        # [B*out,T_out] int64
+    bias_term = bias_fixed_flat << x_shift_flat                           # [B*out,1] int64
+    acc_wb = accam + bias_term                                             # [B*out,T_out] int64
+    ones = torch.ones(B * out_ch, 1, dtype=torch.int32)
+    y_int8_flat, y_mul_flat, y_shift_flat, y_zp_flat = int8_output_requant_intscale(
+        acc_wb, ones, x_shift_flat.to(torch.int32), F_w, None)
+    y_int8 = y_int8_flat.reshape(B, out_ch, T_out)
+    y_mul = y_mul_flat.reshape(B, out_ch, 1).to(torch.int32)
+    y_shift = y_shift_flat.reshape(B, out_ch, 1).to(torch.int32)
+    y_zp = y_zp_flat.reshape(B, out_ch, 1).to(torch.int32)
+    if return_intermediates:
+        inter = {"acc": acc, "acc_w": acc_w, "mul_w": mul_w, "shift_w": shift_w, "F_w": F_w,
+                 "acc_wb": acc_wb, "bias_fixed": bias_fixed}
+        return y_int8, y_mul, y_shift, y_zp, inter
+    return y_int8, y_mul, y_shift, y_zp
 
 
 def int_attn_scale(scores_int: torch.Tensor, score_scale: torch.Tensor, d_head: int) -> tuple[torch.Tensor, torch.Tensor]:

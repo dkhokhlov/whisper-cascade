@@ -454,3 +454,98 @@ def test_int8_softmax_zero_fp_audit():
     model = ex.build_int8_softmax_onnx(emit_intermediates=False, K=1500)
     ex.zero_fp_audit(model)                       # raw graph
     ex.zero_fp_audit(model, check_optimized=True)  # ORT-optimized artifact
+
+
+# ---- Q6: int8 Conv1d ONNX (int-canonical, mirrors int8_conv1d_intscale) ----
+
+_CONV_CASES = [("model.encoder.conv1", 3000, 1), ("model.encoder.conv2", 3000, 2)]
+
+
+def _check_conv1d(x, conv_name, T, stride):
+    """Build the int-canonical Conv1d ONNX (with intermediates) and assert every int intermediate
+    AND the four int8 outputs are BIT-EXACT vs int8_compute.int8_conv1d_intscale."""
+    import numpy as np
+    m = hqq_asr.load_whisper_hqq(MODEL, device="cpu", compute_dtype=torch.float32)
+    conv = dict(m.named_modules())[conv_name]
+    w = conv.weight.detach().to(torch.float32)
+    out_ch, in_ch, k = w.shape
+    xi, am, sh, xz = i8.quantize_act_per_batch_intscale(x)            # per-batch scale (conv-window)
+    w_int, w_scale = i8._quant_weight_per_channel(w)
+    y_int8, ym, ys, yzp, inter = i8.int8_conv1d_intscale(
+        xi, xz, am, sh, w_int, w_scale, conv.bias.detach().to(torch.float32),
+        stride=stride, kernel=k, padding=int(conv.padding[0]), return_intermediates=True)
+    model = ex.build_int8_conv1d_onnx(conv, model_name="cw_t", emit_intermediates=True, T=T)
+    path = "/tmp/_int8_conv_test.onnx"
+    onnx.save(model, path)
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    B = xi.shape[0]
+    feeds = {"x_int": xi.to(torch.int8).numpy(),
+             "x_zp": xz.to(torch.int32).numpy(),
+             "x_mul": am.to(torch.int32).numpy(),
+             "x_shift": sh.to(torch.int32).numpy()}
+    o = {out.name: v for out, v in zip(sess.get_outputs(), sess.run(None, feeds))}
+    # acc0 is the raw ConvInteger (sum x_int*w_int over the padded window); the reference does not
+    # expose it separately -- reconstruct as acc + x_zp*w_sum (undo the per-batch zp correction).
+    w_sum_np = w_int.sum(dim=(1, 2)).to(torch.int32).numpy().reshape(1, out_ch, 1)
+    acc0_ref = (inter["acc"].to(torch.int64).numpy()
+                + xz.to(torch.int64).numpy() * w_sum_np.astype(np.int64)).astype(np.int32)
+    # 3D intermediates: cw_acc0, cw_acc, cw_out (=acc_w), cw_acc_wb (pre-flatten, [B,out,T_out])
+    pairs3d = [("cw_acc0", acc0_ref), ("cw_acc", inter["acc"].to(torch.int32).numpy()),
+                ("cw_out", inter["acc_w"].to(torch.int64).numpy()),
+                ("cw_acc_wb", inter["acc_wb"].reshape(B, out_ch, -1).to(torch.int64).numpy())]
+    for ok, b in pairs3d:
+        a = o[ok].astype(np.int64)
+        assert a.shape == b.shape, f"{ok}: shape {a.shape} vs {b.shape}"
+        assert np.array_equal(a, b.astype(np.int64)), \
+            f"{ok}: {int((a != b.astype(np.int64)).sum())}/{a.size} differ (max|d|={int(np.abs(a - b.astype(np.int64)).max())})"
+    # four int8 outputs (flat [B*out, T_out] / [B*out, 1] vs the ref 3D reshaped row-major)
+    for k, ref in [("y_int8", y_int8), ("y_mul", ym), ("y_shift", ys), ("y_zp", yzp)]:
+        a = o[k].astype(np.int64)
+        b = ref.reshape(B * out_ch, -1).to(torch.int64).numpy()
+        assert a.shape == b.shape, f"OUT {k}: shape {a.shape} vs {b.shape}"
+        assert np.array_equal(a, b), \
+            f"OUT {k}: {int((a != b).sum())}/{a.size} differ (max|d|={int(np.abs(a - b).max())})"
+
+
+@pytest.mark.parametrize("conv_name,T,stride", _CONV_CASES)
+def test_int8_conv1d_bitexact(conv_name, T, stride):
+    """The int-canonical Conv1d ONNX is bit-exact vs int8_conv1d_intscale on real whisper-tiny
+    weights: acc0 (raw ConvInteger, reconstructed), acc (zp-corrected), acc_w (the Q0.15
+    per-channel weight-scale rshift_round), acc_wb (pre-folded bias) and the four int8 outputs.
+    conv1 stride 1 (T_out=T), conv2 stride 2 (T_out=T/2)."""
+    torch.manual_seed(7)
+    m = hqq_asr.load_whisper_hqq(MODEL, device="cpu", compute_dtype=torch.float32)
+    in_ch = dict(m.named_modules())[conv_name].weight.shape[1]
+    _check_conv1d(torch.randn(2, in_ch, T) * 2.0, conv_name, T, stride)
+
+
+@pytest.mark.parametrize("x_fn", [
+    lambda in_ch, T: torch.randn(1, in_ch, T) * 2.0,    # batch 1
+    lambda in_ch, T: torch.randn(3, in_ch, T) * 2.0,    # batch 3
+    lambda in_ch, T: torch.randn(2, in_ch, T) * 8.0,    # large magnitude (acc_wb headroom)
+    lambda in_ch, T: torch.randn(2, in_ch, T) * 0.3,    # small magnitude (zp near mid-range)
+    lambda in_ch, T: -(torch.rand(2, in_ch, T) * 4.0),  # all-negative (zp near 127)
+])
+def test_int8_conv1d_robustness(x_fn):
+    """Conv1d bit-exactness holds across batch sizes and input magnitudes (large drives acc_wb
+    toward the int64 headroom; small keeps the per-batch zp mid-range; all-negative pushes zp
+    near 127). Uses conv1 (stride 1) on the real whisper-tiny weights."""
+    torch.manual_seed(2)
+    conv_name, T, stride = _CONV_CASES[0]
+    m = hqq_asr.load_whisper_hqq(MODEL, device="cpu", compute_dtype=torch.float32)
+    in_ch = dict(m.named_modules())[conv_name].weight.shape[1]
+    _check_conv1d(x_fn(in_ch, T), conv_name, T, stride)
+
+
+def test_int8_conv1d_zero_fp_audit():
+    """The int-canonical Conv1d ONNX is structurally zero-fp: the uint8 ConvInteger pivot (ORT
+    1.19.2 has no int8 ConvInteger kernel), the int32 per-batch zp pad broadcast, the per-channel
+    Q0.15 weight scale (int Mul + BitShift), the pre-folded int bias, and the shared per-(b,o)
+    requant are all int -- raw graph AND the ORT-optimized artifact. Both conv1 (stride 1) and
+    conv2 (stride 2)."""
+    m = hqq_asr.load_whisper_hqq(MODEL, device="cpu", compute_dtype=torch.float32)
+    mods = dict(m.named_modules())
+    for conv_name, T, _stride in _CONV_CASES:
+        model = ex.build_int8_conv1d_onnx(mods[conv_name], emit_intermediates=False, T=T)
+        ex.zero_fp_audit(model)                       # raw graph
+        ex.zero_fp_audit(model, check_optimized=True)  # ORT-optimized artifact

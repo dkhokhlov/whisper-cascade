@@ -919,7 +919,163 @@ def build_int8_softmax_onnx(model_name="int8_softmax", emit_intermediates=False,
     return m
 
 
-# ---- recursive zero-fp audit (Q4) ----
+# ---- int-canonical Conv1d (Q6) ----
+_CONV_WQ = 15   # per-channel weight scale Q (mul_w ~ 2^15); see fixed_point_per_group(Q=15)
+
+
+def _emit_conv1d_int8(b, x_int, x_zp, x_mul, x_shift, w_u8, mul_w, half_w, p_w, w_sum,
+                     bias_fixed, F_w, in_ch, out, T_out, stride):
+    """Emit the int-canonical Conv1d subgraph (mirrors int8_compute.int8_conv1d_intscale).
+
+    Conv1d via ConvInteger uint8 (ORT 1.19.2 has no int8 ConvInteger kernel; uint8 works).
+    x_int int8 -> uint8 (x_u8 = x_int + 128); w_int int8 -> uint8 (w_u8 = w_int + 128). With
+    x_zp_u8 = w_zp_u8 = 128, ConvInteger computes sum (x_u8-128)*(w_u8-128) = sum x_int*w_int
+    = acc0 (the raw int8 conv). ConvInteger pads with 0 (-> x_int=-128 at pad), which does NOT
+    match the reference's "pad the centered x32 with 0" (-> x_int=x_zp at pad, contributing 0),
+    so the pad is applied manually: Concat x_u8 with a per-batch (x_zp+128) column on each side,
+    then ConvInteger runs VALID (pads=[0,0]). The per-batch zp correction
+    acc = acc0 - x_zp*w_sum (bit-identical to the reference's pre-matmul centering; int32 sum is
+    exact/associative) cancels the zp at the pad column (x_zp*w_int - x_zp*w_sum_window = 0).
+    Then per-channel Q0.15 weight scale, pre-folded bias, flatten, shared _emit_output_requant.
+
+    x_int [B,in,T] int8, x_zp/x_mul/x_shift [B,1,1] int32 (per-batch). w_u8 [out,in,k] uint8
+    (baked). mul_w/half_w/p_w [1,out,1] (per-channel Q0.15 scale + rshift_round helpers).
+    w_sum [1,out,1] int32, bias_fixed [1,out,1] int64, F_w scalar int, in_ch/out baked. T_out =
+    baked output length. Returns the 4 output tensor names (y_int8 [B*out,T_out] int8,
+    y_mul/y_shift/y_zp [B*out,1] int32) and leaves cw_acc0/cw_acc/cw_acc_wb for the caller to
+    surface as graph outputs when emit_intermediates is set.
+    """
+    P = "cw_"
+    # 1. x_int int8 -> uint8 (x_u8 = x_int + 128) ; ORT ConvInteger needs uint8
+    b.init("cw_c128_i32", np.array([128], dtype=np.int32), INT32)
+    x_i32 = b.node("Cast", [x_int], [f"{P}x_i32"], "cw_x_cast", to=INT32)            # [B,in,T]
+    x_u8_raw = b.node("Add", [x_i32, "cw_c128_i32"], [f"{P}x_u8_raw"], "cw_x_add128")  # [B,in,T] int32
+    x_u8 = b.node("Cast", [x_u8_raw], [f"{P}x_u8"], "cw_x_u8cast", to=UINT8)          # [B,in,T] uint8
+    # 2. manual per-batch pad: Concat x_u8 with (x_zp+128) columns -> x_padded [B,in,T+2] uint8.
+    #    (x_zp+128 at pad -> x_int=x_zp there -> centered (x_int-x_zp)=0, matching the reference's
+    #    pad-centered-with-0; ConvInteger's own pad (0 -> x_int=-128) would not match.)
+    xzp128 = b.node("Add", [x_zp, "cw_c128_i32"], [f"{P}xzp128"], "cw_xzp_add128")    # [B,1,1] int32
+    b.init("cw_ones_i32", np.ones((1, in_ch, 1), dtype=np.int32), INT32)
+    xzp_pad_i32 = b.node("Mul", [xzp128, "cw_ones_i32"], [f"{P}xzp_pad_i32"], "cw_xzp_pad")  # [B,in,1] int32
+    xzp_pad_col = b.node("Cast", [xzp_pad_i32], [f"{P}xzp_pad_col"], "cw_xzp_u8cast", to=UINT8)  # [B,in,1]
+    x_padded = b.node("Concat", [xzp_pad_col, x_u8, xzp_pad_col], [f"{P}x_padded"], "cw_padconcat",
+                      axis=2)                                                       # [B,in,T+2] uint8
+    # 3. ConvInteger uint8, VALID (pads=[0,0]); x_zp_u8=w_zp_u8=128 -> sum x_int*w_int = acc0
+    b.init("cw_xzp128_u8", np.array([128], dtype=np.uint8), UINT8)
+    b.init("cw_wzp128_u8", np.array([128], dtype=np.uint8), UINT8)
+    acc0 = b.node("ConvInteger", [x_padded, w_u8, "cw_xzp128_u8", "cw_wzp128_u8"],
+                  [f"{P}acc0"], "cw_convint", strides=[stride], pads=[0, 0])         # [B,out,T_out] int32
+    # 4. per-batch zp correction: acc = acc0 - x_zp[b] * w_sum[o]   (broadcast over T_out)
+    zp_term = b.node("Mul", [x_zp, w_sum], [f"{P}zp_term"], "cw_zpterm")            # [B,out,1] int32
+    acc = b.node("Sub", [acc0, zp_term], [f"{P}acc"], "cw_acc")                     # [B,out,T_out] int32
+    # 3. per-channel Q0.15 weight scale: acc_w = rshift_round(acc * mul_w, shift_w - F_w) @ 2^-F_w
+    acc_i64 = b.node("Cast", [acc], [f"{P}acc_i64"], "cw_acc_cast", to=INT64)     # [B,out,T_out]
+    acc_w = _rshift_round(b, acc_i64, mul_w, half_w, p_w, "cw")                   # [B,out,T_out] int64
+    # 4. apply per-batch act scale: accam = acc_w * x_mul   (x_mul [B,1,1] broadcasts)
+    xmul_i64 = b.node("Cast", [x_mul], [f"{P}xmul_i64"], "cw_xmul_cast", to=INT64)  # [B,1,1]
+    accam = b.node("Mul", [acc_w, xmul_i64], [f"{P}accam"], "cw_accam")           # [B,out,T_out]
+    # 5. pre-fold bias: bias_term = bias_fixed << x_shift  (per-(b,o), broadcast over T_out)
+    xsh_i64 = b.node("Cast", [x_shift], [f"{P}xsh_i64"], "cw_xsh_cast", to=INT64)  # [B,1,1]
+    xsh_u = b.node("Cast", [xsh_i64], [f"{P}xsh_u"], "cw_xsh_u", to=UINT64)        # [B,1,1]
+    bf_u = b.node("Cast", [bias_fixed], [f"{P}bf_u"], "cw_bf_u", to=UINT64)        # [1,out,1]
+    bias_term_u = b.node("BitShift", [bf_u, xsh_u], [f"{P}bias_term_u"], "cw_bfshift",
+                         direction="LEFT")                                        # [B,out,1] uint64
+    bias_term = b.node("Cast", [bias_term_u], [f"{P}bias_term"], "cw_bf_cast", to=INT64)
+    acc_wb = b.node("Add", [accam, bias_term], [f"{P}acc_wb"], "cw_accwb")        # [B,out,T_out] int64
+    # 6. flatten [B,out,T_out] -> [B*out, T_out] (row b*out+o) for the shared per-row requant
+    b.init(f"{P}shape_flat", np.array([-1, T_out], dtype=np.int64), INT64)
+    acc_wb_flat = b.node("Reshape", [acc_wb, f"{P}shape_flat"], [f"{P}acc_wb_flat"], "cw_flat")
+    # 7. expand x_shift [B,1,1] -> [B*out,1] (row b*out+o = x_shift[b]) via Tile, for act_shift
+    b.init(f"{P}xsh_3d_shape", np.array([-1, 1, 1], dtype=np.int64), INT64)
+    xsh_3d = b.node("Reshape", [x_shift, f"{P}xsh_3d_shape"], [f"{P}xsh_3d"], "cw_xsh_3d")  # [B,1,1]
+    b.init(f"{P}tile_reps", np.array([1, out, 1], dtype=np.int64), INT64)
+    xsh_tiled = b.node("Tile", [xsh_3d, f"{P}tile_reps"], [f"{P}xsh_tiled"], "cw_xsh_tile")  # [B,out,1]
+    b.init(f"{P}xsh_flat_shape", np.array([-1, 1], dtype=np.int64), INT64)
+    x_shift_flat = b.node("Reshape", [xsh_tiled, f"{P}xsh_flat_shape"], [f"{P}xsh_flat"],
+                          "cw_xsh_flat")                                          # [B*out,1] int32
+    # 8. shared per-row requant: act_mul=1 (scalar, broadcasts), act_shift=x_shift (per-row),
+    #    F=F_w, bias=None (pre-folded into acc_wb). x_shift carries into y_shift. The requant
+    #    outputs the FLAT [B*out,T_out] / [B*out,1] form -- the natural 2D [N,D] input to the
+    #    next op (the conv->encoder transpose to [B,T_out,out] is an assembly step, not here).
+    b.init(f"{P}one", np.array([1], dtype=np.int32), INT32)
+    y_int8, y_mul, y_shift, y_zp = _emit_output_requant(
+        b, acc_wb_flat, f"{P}one", x_shift_flat, F_w, None, T_out)
+    return y_int8, y_mul, y_shift, y_zp
+
+
+def build_int8_conv1d_onnx(conv_module, model_name="int8_conv1d", emit_intermediates=False, T=300):
+    """Build the int-canonical Conv1d ONNX (mirrors int8_compute.int8_conv1d_intscale).
+
+    Takes a torch.nn.Conv1d (weight [out,in,k], bias [out], stride/padding from the module)
+    and emits the zero-fp int8 conv: ConvInteger + per-batch zp correction + per-channel Q0.15
+    weight scale + pre-folded int bias + the shared per-(b,o) output requant.
+
+    Inputs (the previous op's int8 output, zero runtime fp):
+      x_int [B, in, T] int8, x_zp [B,1,1] int32, x_mul [B,1,1] int32 (Q1.16 per-batch scale),
+      x_shift [B,1,1] int32.
+    Outputs (flat 2D -- the natural input to the next op; the conv->encoder transpose to
+    [B,T_out,out] is an assembly step): y_int8 [B*out, T_out] int8, y_mul/y_shift/y_zp
+    [B*out, 1] int32 (one per-(b,o) row).
+    With emit_intermediates the graph also outputs acc0, acc, acc_w, acc_wb (3D
+    [B,out,T_out]) for bit-exact verification vs the torch reference. T is baked (the conv
+    output length T_out follows from T, stride, pad, kernel); B stays symbolic. Whisper-tiny
+    fixes T=3000 (conv1 T_out=3000, conv2 T_out=1500); the sub-module test overrides T. A
+    variable-T graph would compute T_out from Shape(x_int) at runtime -- out of scope for the
+    sub-module gate.
+    """
+    import torch
+    import int8_compute as i8
+    w = conv_module.weight.detach().to(torch.float32)                            # [out,in,k]
+    bias = conv_module.bias.detach().to(torch.float32)                            # [out]
+    out_ch, in_ch, k = w.shape
+    stride = int(conv_module.stride[0])
+    padding = int(conv_module.padding[0])
+    assert k == 3 and padding == 1, f"build_int8_conv1d_onnx: kernel={k} padding={padding} (3/1 only)"
+    T_out = (T + 2 * padding - k) // stride + 1
+    # quantize weight per-channel (symmetric int8) + bake the Q0.15 fixed-point scale
+    w_int, w_scale = i8._quant_weight_per_channel(w)                              # w_int [out,in,k] int32
+    mul_w_t, shift_w_t = i8.fixed_point_per_group(w_scale.to(torch.float64), Q=_CONV_WQ)  # [out] torch
+    F_w = int(shift_w_t.min().item())
+    assert F_w >= 1, f"conv weight scale too large (shift_w={shift_w_t.tolist()}); F_w>=1 for bias"
+    mul_w_np = mul_w_t.numpy().astype(np.int32)                                  # [out]
+    sw_np = (shift_w_t.numpy().astype(np.int64) - F_w)                            # [out] per-channel residual
+    half_w_np = (2 ** np.clip(sw_np - 1, 0, None)).astype(np.int64)              # [out]
+    p_w_np = (2 ** sw_np).astype(np.int64)                                        # [out]
+    bias_fixed_np = np.floor(bias.numpy().astype(np.float64) * (2.0 ** F_w) + 0.5).astype(np.int64)
+    w_sum_np = w_int.sum(dim=(1, 2)).to(torch.int32).numpy()                      # [out]
+    b = _Builder()
+    # baked initializers (reshaped to [1,out,1] for broadcast over B, T_out)
+    b.init("w_u8", (w_int.to(torch.int32) + 128).clamp(0, 255).to(torch.uint8).numpy(), UINT8)  # [out,in,k]
+    b.init("cw_mul_w", mul_w_np.reshape(1, out_ch, 1).astype(np.int32), INT32)
+    b.init("cw_half_w", half_w_np.reshape(1, out_ch, 1), INT64)
+    b.init("cw_p_w", p_w_np.reshape(1, out_ch, 1), INT64)
+    b.init("cw_bias_fixed", bias_fixed_np.reshape(1, out_ch, 1), INT64)
+    b.init("cw_w_sum", w_sum_np.reshape(1, out_ch, 1).astype(np.int32), INT32)
+    _emit_conv1d_int8(b, "x_int", "x_zp", "x_mul", "x_shift", "w_u8", "cw_mul_w", "cw_half_w",
+                     "cw_p_w", "cw_w_sum", "cw_bias_fixed", F_w, in_ch, out_ch, T_out, stride)
+    vi = helper.make_tensor_value_info
+    inputs = [
+        vi("x_int", INT8, ["B", in_ch, T]),
+        vi("x_zp", INT32, ["B", 1, 1]),
+        vi("x_mul", INT32, ["B", 1, 1]),
+        vi("x_shift", INT32, ["B", 1, 1]),
+    ]
+    outputs = [vi("y_int8", INT8, ["NB", T_out]),
+               vi("y_mul", INT32, ["NB", 1]),
+               vi("y_shift", INT32, ["NB", 1]),
+               vi("y_zp", INT32, ["NB", 1])]
+    if emit_intermediates:
+        outputs += [vi("cw_acc0", INT32, ["B", out_ch, T_out]),
+                    vi("cw_acc", INT32, ["B", out_ch, T_out]),
+                    vi("cw_out", INT64, ["B", out_ch, T_out]),
+                    vi("cw_acc_wb", INT64, ["B", out_ch, T_out])]
+    g_ = helper.make_graph(b.nodes, model_name, inputs, outputs, initializer=b.inits)
+    m = helper.make_model(g_, opset_imports=[helper.make_opsetid("", 18)])
+    m.ir_version = 9
+    onnx.checker.check_model(m)
+    return m
+
+
 # Tensor elem types that are legal in a zero-fp graph: integers, bool, string. Any float
 # (fp32/fp16/bfloat16/float8*) is a violation. Unknown/UNDEFINED types fail closed.
 _ALLOWED_TYPES = {
