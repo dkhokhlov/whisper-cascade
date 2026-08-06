@@ -274,6 +274,97 @@ class Int8Attention(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
+# Int8BoundaryDecoderLayer (A8.6a): drop-in WhisperDecoderLayer that runs the   #
+# whole layer on the boundary-form int8 chain (int8_decoder_layer_intscale).   #
+# --------------------------------------------------------------------------- #
+
+
+def _hqq_chain_params(h: HQQLinear):
+    """Extract (qr, zero, scale, bias, g) from an HQQLinear for int8_decoder_layer_intscale."""
+    meta = h.meta
+    O, I = (int(s) for s in meta["shape"])
+    g = int(meta["group_size"])
+    qr = i8.unpack_levels(h.W_q, int(meta["nbits"]), meta["packing"], (O, I), g, 1).to(torch.int32)
+    zero = meta["zero"].to(torch.float32).reshape(-1, 1)
+    scale = meta["scale"].to(torch.float32).reshape(-1, 1)
+    bias = h.bias.to(torch.float32) if h.bias is not None else None
+    return (qr, zero, scale, bias, g)
+
+
+def _chain_params(layer) -> dict:
+    """Build the P dict for int8_decoder_layer_intscale from a WhisperDecoderLayer."""
+    def lp(mod):
+        return _hqq_chain_params(mod)
+
+    def ln(l):
+        return (l.weight.detach().to(torch.float32), l.bias.detach().to(torch.float32), l.eps)
+
+    return {
+        "self_attn": {"q_proj": lp(layer.self_attn.q_proj), "k_proj": lp(layer.self_attn.k_proj),
+                      "v_proj": lp(layer.self_attn.v_proj), "out_proj": lp(layer.self_attn.out_proj)},
+        "enc_attn": {"q_proj": lp(layer.encoder_attn.q_proj), "k_proj": lp(layer.encoder_attn.k_proj),
+                     "v_proj": lp(layer.encoder_attn.v_proj), "out_proj": lp(layer.encoder_attn.out_proj)},
+        "self_attn_ln": ln(layer.self_attn_layer_norm),
+        "enc_attn_ln": ln(layer.encoder_attn_layer_norm),
+        "final_ln": ln(layer.final_layer_norm),
+        "fc1": lp(layer.fc1), "fc2": lp(layer.fc2),
+    }
+
+
+class Int8BoundaryDecoderLayer(nn.Module):
+    """A8.6a: drop-in replacement for a WhisperDecoderLayer that runs the whole layer on the
+    boundary-form int8 chain (`int8_decoder_layer_intscale`) -- self-attn + cross-attn + FFN,
+    all int8, zero fp between blocks. Owns its int8 self/cross KV cache as module attributes
+    (the HF `EncoderDecoderCache` is returned untouched); builds its own causal mask internally
+    (the passed `attention_mask` is ignored for self-attn); resets the caches when
+    `cache_position[0] == 0` (a fresh utterance / prefill); computes cross K/V once (prefill) and
+    reuses. Greedy batch-1 (no beam reordering of the module-held caches).
+
+    fp boundaries at layer entry/exit: the input hidden_states (fp from embeddings + positions)
+    is quantized to boundary form; the output boundary is dequanted to fp for the next layer and
+    the decoder's final layer_norm. A8.6b removes the between-layer fp boundary (passes boundary
+    form between layers). The A8.6 WER gate measures whether this within-layer chain is WER-neutral
+    vs the A7 integer-state baseline."""
+
+    def __init__(self, layer, num_heads: int, head_dim: int, kv_scale: str = "static"):
+        super().__init__()
+        self.embed_dim = layer.embed_dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.kv_scale = kv_scale
+        self.P = _chain_params(layer)           # param dict (not modules -- held as a plain attr)
+        self.self_kv = None                     # (K_int, V_int, k_mul, k_shift, v_mul, v_shift)
+        self.cross_kv = None                    # same shape, computed once at prefill
+
+    def forward(self, hidden_states, attention_mask=None, encoder_hidden_states=None,
+                encoder_attention_mask=None, layer_head_mask=None,
+                cross_attn_layer_head_mask=None, past_key_value=None,
+                output_attentions=False, use_cache=True, cache_position=None):
+        # fresh-utterance / prefill reset (cache_position[0]==0); decode steps reuse the caches.
+        # cache_position is always present under generate(); the None fallback is for direct calls.
+        is_prefill = (cache_position is None) or (int(cache_position[0]) == 0)
+        if is_prefill:
+            self.self_kv = None
+            self.cross_kv = None
+        # entry: fp hidden -> boundary (per-token int8); quantize returns (int8, mul, shift, zp)
+        h_i, h_m, h_sh, h_z = i8.quantize_act_per_token_intscale(hidden_states.to(torch.float32))
+        enc_i = enc_z = enc_m = enc_sh = None
+        if encoder_hidden_states is not None:
+            enc_i, enc_m, enc_sh, enc_z = i8.quantize_act_per_token_intscale(
+                encoder_hidden_states.to(torch.float32))
+        # boundary convention: (int8, zp, mul, shift)
+        oi, oz, om, osh, self.self_kv, self.cross_kv = i8.int8_decoder_layer_intscale(
+            self.P, h_i, h_z, h_m, h_sh, enc_i, enc_z, enc_m, enc_sh,
+            self.self_kv, self.cross_kv, num_heads=self.num_heads, head_dim=self.head_dim,
+            is_prefill=is_prefill, kv_scale=self.kv_scale)
+        out = i8._dequant_boundary(oi, oz, om, osh).to(torch.float32)
+        outputs = (out,)
+        if use_cache:
+            outputs += (past_key_value,)        # HF cache returned untouched (caches are module-held)
+        return outputs
+
+
+# --------------------------------------------------------------------------- #
 # Staged swap: replace selected op families with int8-compute modules         #
 # --------------------------------------------------------------------------- #
 
@@ -286,16 +377,22 @@ def _set_child(parent: nn.Module, dotted: str, child: nn.Module) -> None:
     setattr(parent, leaf, child)
 
 
-def swap_to_int8(model: nn.Module, blocks: set[str], int_act_scale: bool = False) -> dict:
+def swap_to_int8(model: nn.Module, blocks: set[str], int_act_scale: bool = False,
+                 kv_scale: str = "static") -> dict:
     """Swap selected op families in `model` to int8-compute modules. Returns a report dict.
 
-    blocks: subset of {"matmul","ln","gelu","sm","conv"} (the staged-WER block names):
+    blocks: subset of {"matmul","ln","gelu","sm","conv","chain"} (the staged-WER block names):
       matmul: every HQQLinear -> Int8Linear (A1, per-group int8 matmul).
       ln:     every nn.LayerNorm -> Int8LayerNorm (A2, fixed-point + int rsqrt).
       gelu:   every GELUActivation -> Int8GELU (A3, int sigmoid LUT).
       sm:     every WhisperAttention -> int8 softmax (A4); combined with conv for int scale.
       conv:   every nn.Conv1d -> Int8Conv1d (A5) AND every WhisperAttention uses the integer
               attention scale 1/sqrt(d_head) (A5); the int scale only has effect with sm.
+      chain:  every WhisperDecoderLayer -> Int8BoundaryDecoderLayer (A8.6a, the whole decoder
+              on the boundary-form int8 chain; exclusive of the per-op decoder swaps -- the
+              decoder layers are replaced, so their sub-modules no longer exist for matmul/ln/
+              sm/conv to find; those blocks then apply only to the encoder). kv_scale selects
+              the K/V granularity for the chain (A8.6: static | pertoken).
     The swap is in-place. The int8 attention wraps the existing q/k/v/out_proj modules
     (which are Int8Linear if matmul is in blocks, else the original HQQLinear).
 
@@ -305,9 +402,18 @@ def swap_to_int8(model: nn.Module, blocks: set[str], int_act_scale: bool = False
     """
     import transformers.models.whisper.modeling_whisper as w
 
-    report = {"matmul": 0, "ln": 0, "gelu": 0, "conv1d": 0, "attn": 0}
+    report = {"matmul": 0, "ln": 0, "gelu": 0, "conv1d": 0, "attn": 0, "chain": 0}
     use_int_sm = "sm" in blocks
     use_int_scale = "conv" in blocks
+    # chain: swap decoder layers FIRST -- replacing a container makes its children stale in the
+    # named_modules snapshot, so do it before the per-op pass (which then sees only the encoder).
+    if "chain" in blocks:
+        for name, mod in list(model.named_modules()):
+            if isinstance(mod, w.WhisperDecoderLayer):
+                layer = Int8BoundaryDecoderLayer(
+                    mod, mod.self_attn.num_heads, mod.self_attn.head_dim, kv_scale=kv_scale)
+                _set_child(model, name, layer)
+                report["chain"] += 1
     for name, mod in list(model.named_modules()):
         if "matmul" in blocks and isinstance(mod, HQQLinear):
             lin = Int8Linear(mod); lin.int_act_scale = int_act_scale
@@ -393,7 +499,7 @@ def _run_pass(pipe, samples, n, lang):
 
 
 def run_wer(model_dir: str, blocks: set[str], n: int, dataset: str, config: str,
-            split: str, lang, int_act_scale: bool = False) -> None:
+            split: str, lang, int_act_scale: bool = False, kv_scale: str = "static") -> None:
     """Build the HQQ pipeline once, run the fp baseline (no swap), then swap `blocks`
     to int8 and re-run on the SAME samples. Report both corpus WERs + the paired delta.
 
@@ -402,7 +508,10 @@ def run_wer(model_dir: str, blocks: set[str], n: int, dataset: str, config: str,
     cross-model reference (not run here).
 
     int_act_scale (A7): swap linears with integer fixed-point activation scales (zero
-    runtime fp) instead of the A6 fp act scale."""
+    runtime fp) instead of the A6 fp act scale.
+
+    kv_scale (A8.6): the K/V scale granularity for the `chain` block -- "static" (per-
+    (layer,head), append-only) or "pertoken" (per-K-token; A8.6b, the per-row score requant)."""
     import json, sys
     from jiwer import wer as jiwer_wer
     import eval_wer as e
@@ -418,8 +527,8 @@ def run_wer(model_dir: str, blocks: set[str], n: int, dataset: str, config: str,
     fp_wer = jiwer_wer(refs, fp_hyps, e.WER_NORM, e.WER_NORM)
     print(f"  fp baseline WER = {fp_wer:.4f} over {len(refs)} samples", file=sys.stderr)
 
-    report = swap_to_int8(pipe.model, blocks, int_act_scale=int_act_scale)
-    print(f"swapped: {report} int_act_scale={int_act_scale}", file=sys.stderr)
+    report = swap_to_int8(pipe.model, blocks, int_act_scale=int_act_scale, kv_scale=kv_scale)
+    print(f"swapped: {report} int_act_scale={int_act_scale} kv_scale={kv_scale}", file=sys.stderr)
     print(f"int8 ({sorted(blocks)}) pass over the same {len(refs)} samples ...", file=sys.stderr)
     _, i8_hyps = _run_pass(pipe, samples, n, lang)
     n_cmp = min(len(i8_hyps), len(fp_hyps))
@@ -430,6 +539,7 @@ def run_wer(model_dir: str, blocks: set[str], n: int, dataset: str, config: str,
         "model": model_dir,
         "blocks": sorted(blocks),
         "int_act_scale": int_act_scale,
+        "kv_scale": kv_scale,
         "n_samples": n_cmp,
         "fp_wer": round(fp_wer, 4),
         "int8_wer": round(i8_wer, 4),
@@ -449,7 +559,8 @@ def main():
     p.add_argument("--n-layers", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--wer", action="store_true", help="staged WER: fp baseline vs int8 stage")
-    p.add_argument("--blocks", default="matmul", help="comma list: matmul,ln,gelu,sm,conv")
+    p.add_argument("--blocks", default="matmul",
+                   help="comma list: matmul,ln,gelu,sm,conv,chain")
     p.add_argument("--n", type=int, default=20, help="number of fleurs samples")
     p.add_argument("--dataset", default="google/fleurs")
     p.add_argument("--config", default="en_us")
@@ -457,6 +568,8 @@ def main():
     p.add_argument("--lang", default="", help="forced language (e.g. spanish); empty=auto")
     p.add_argument("--int-act-scale", action="store_true",
                     help="A7: integer fixed-point activation scale (zero runtime fp) on linears")
+    p.add_argument("--kv-scale", choices=["static", "pertoken"], default="static",
+                   help="A8.6: K/V scale granularity for the chain block (static | pertoken)")
     args = p.parse_args()
     if args.validate:
         validate_int8_linear(args.model, args.n_layers, args.seed)
@@ -464,7 +577,7 @@ def main():
     if args.wer:
         blocks = {b.strip() for b in args.blocks.split(",") if b.strip()}
         run_wer(args.model, blocks, args.n, args.dataset, args.config, args.split,
-                args.lang or None, int_act_scale=args.int_act_scale)
+                args.lang or None, int_act_scale=args.int_act_scale, kv_scale=args.kv_scale)
         return
     p.print_help()
 
