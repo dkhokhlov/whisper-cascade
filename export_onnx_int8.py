@@ -559,26 +559,31 @@ def _emit_layernorm_int8(b, x_int, x_zp, y_mul_in, y_shift_in, gamma_int, beta_i
     mK2r = b.node("BitShift", [mK2u, f"{P}sh{K}_u64"], [f"{P}mK2r"], f"{P}mK2r", direction="RIGHT")
     mK2r_i = b.node("Cast", [mK2r], [f"{P}mK2r_i"], f"{P}mK2r_i", to=INT64)
     var_K = b.node("Sub", [var_hi, mK2r_i], [f"{P}var_K"], f"{P}var_sub")        # [B,1]
-    # eps_K = round_half_up(p*2^(K+2*y_shift) / (q*y_mul^2)); max(eps_K, 1)
-    # NOTE: this forms p*2^(K+2*y_shift) directly, which overflows int64 for large y_shift
-    # (small-magnitude activations, e.g. the decoder entry embeddings at y_shift~27). The torch
-    # oracle (int8_compute.int8_layernorm_intscale) was fixed to shift BOTH num and den down by
-    # sh=max(0,K+2*y_shift-62) (bit-identical for sh=0). This ONNX emission still uses the
-    # unshifted form -- bit-exact for the sh=0 (magnitude-~1) case the Q6 tests cover, but it
-    # WILL diverge from the oracle for sh>0. When the int8 DECODER ONNX is built (#65/#66, the
-    # decoder entry feeds small-magnitude embeddings here), mirror the shift-both fix: sh =
-    # Max(0, h-62); num = BitShift(one, h-sh); den = BitShift(q*ym^2, -sh) (RightShift by sh).
+    # eps_K = round_half_up(p*2^(h-sh) / floor(q*y_mul^2 / 2^sh)); h = K + 2*y_shift;
+    # sh = Max(0, h-62) shifts BOTH num and den down by the per-token excess over the int64 cap.
+    # The unshifted p*2^h overflows int64 (and uint64 for h>64) for large y_shift -- small-magnitude
+    # activations, e.g. the decoder entry embeddings at y_shift~27 -> h~70. sh=0 (h<=62) ->
+    # num = 2^h, den = q*y_mul^2: bit-identical to the unshifted form (mirrors torch d8fc2a8).
     ys = b.node("Cast", [y_shift_in], [f"{P}ys"], f"{P}ys_cast", to=INT64)
     ym = b.node("Cast", [y_mul_in], [f"{P}ym"], f"{P}ym_cast", to=INT64)
     two_ys = b.node("Mul", [ys, "c2_i64"], [f"{P}two_ys"], f"{P}two_ys")           # 2*y_shift
     h = b.node("Add", [two_ys, f"{P}K_i64"], [f"{P}h"], f"{P}h_add")             # K + 2*y_shift [B,1]
-    h_u = b.node("Cast", [h], [f"{P}h_u"], f"{P}h_cast", to=UINT64)
-    num = b.node("BitShift", ["one_u64", h_u], [f"{P}eps_num"], f"{P}eps_num", direction="LEFT")
+    b.init(f"{P}cap62_i64", np.array([62], dtype=np.int64), INT64)              # int64 cap exponent
+    h_m_62 = b.node("Sub", [h, f"{P}cap62_i64"], [f"{P}h_m_62"], f"{P}h_m_62")  # h - 62 [B,1]
+    sh = b.node("Max", [h_m_62, "zero_i64"], [f"{P}sh"], f"{P}sh_max0")         # Max(0, h-62) [B,1]
+    hs = b.node("Sub", [h, sh], [f"{P}hs"], f"{P}hs_sub")                        # h - sh = min(h,62) <= 62
+    hs_u = b.node("Cast", [hs], [f"{P}hs_u"], f"{P}hs_cast", to=UINT64)
+    num = b.node("BitShift", ["one_u64", hs_u], [f"{P}eps_num"], f"{P}eps_num", direction="LEFT")
     num_i = b.node("Cast", [num], [f"{P}eps_num_i"], f"{P}eps_num_i", to=INT64)
     ym2 = b.node("Mul", [ym, ym], [f"{P}ym2"], f"{P}ym2_mul")
     b.init(f"{P}q_i64", np.array([eps_q], dtype=np.int64), INT64)
-    den = b.node("Mul", [ym2, f"{P}q_i64"], [f"{P}eps_den"], f"{P}eps_den")     # q * y_mul^2
-    eps_K = _rhu(b, num_i, den, f"{P}eps")                                       # round_half_up
+    qym2 = b.node("Mul", [ym2, f"{P}q_i64"], [f"{P}qym2"], f"{P}qym2")          # q * y_mul^2 [B,1]
+    qym2_u = b.node("Cast", [qym2], [f"{P}qym2_u"], f"{P}qym2_cast", to=UINT64)
+    sh_u = b.node("Cast", [sh], [f"{P}sh_u"], f"{P}sh_cast", to=UINT64)
+    den_sh = b.node("BitShift", [qym2_u, sh_u], [f"{P}eps_den_sh"], f"{P}eps_den_rsh", direction="RIGHT")
+    den_i = b.node("Cast", [den_sh], [f"{P}eps_den"], f"{P}eps_den_cast", to=INT64)  # floor(qym2 / 2^sh)
+    den_i = b.node("Max", [den_i, "one_i64"], [f"{P}eps_den_c"], f"{P}eps_den_clamp")  # >= 1 (mirrors torch)
+    eps_K = _rhu(b, num_i, den_i, f"{P}eps")                                    # round_half_up
     eps_K = b.node("Max", [eps_K, "one_i64"], [f"{P}eps_K"], f"{P}eps_max")     # >= 1
     # s_K = var_K + eps_K (clamp [1, 2^62))
     s_K = b.node("Add", [var_K, eps_K], [f"{P}s_K_raw"], f"{P}sK_add")

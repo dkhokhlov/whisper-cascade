@@ -280,6 +280,23 @@ def test_int8_layernorm_zero_fp_audit():
     ex.zero_fp_audit(model, check_optimized=True)  # ORT-optimized artifact
 
 
+def test_int8_layernorm_large_shift_bitexact():
+    """The eps_K shift-both fix (mirrors torch d8fc2a8): for small-magnitude activations (the
+    decoder entry embeddings, amax ~0.05 -> y_shift ~26 -> h = K+2*y_shift ~68 > 62), the
+    unshifted p*2^h overflows int64/uint64. The ONNX emission must shift BOTH num and den down
+    by sh=Max(0,h-62) and stay BIT-EXACT vs the torch oracle (eps_K, s_K, every intermediate,
+    all four int8 outputs). sh=0 cases are covered by the other LN tests; this guards sh>0."""
+    ln = _load_ln("model.encoder.layers.0.self_attn_layer_norm")
+    D = int(ln.normalized_shape[0])
+    torch.manual_seed(11)
+    x = torch.randn(3, D) * 0.05                       # embedding-scale -> y_shift > 23 -> sh > 0
+    xi, am, sh, xz = i8.quantize_act_per_token_intscale(x)
+    h = i8._LN_K + 2 * sh.to(torch.int64)
+    sh_excess = (h - 62).clamp(min=0)
+    assert int(sh_excess.max()) > 0, "test must drive the sh>0 eps_K path (h > 62)"
+    _check_ln(ln, x)                                  # bit-exact incl. eps_K, s_K, outputs
+
+
 # ---- Q6: int8 GELU ONNX (int-canonical, mirrors int8_gelu_intscale) ----
 
 def _check_gelu(x, D):
