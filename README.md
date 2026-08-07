@@ -352,7 +352,7 @@ config. `whisper-base` beats `whisper-tiny` on every config except Hindi
 (both are not usable); `whisper-small` beats `whisper-base` on every config.
 
 Per-eval runtime, the relative Delta % columns, and the full quantization
-reports are in [`hqq_report.md`](hqq_report.md) (the `whisper-tiny` card),
+reports are in [`hqq_report_tiny.md`](hqq_report_tiny.md) (the `whisper-tiny` card),
 [`hqq_report_base.md`](hqq_report_base.md) (the `whisper-base` card), and
 [`hqq_report_small.md`](hqq_report_small.md) (the `whisper-small` card).
 Evidence JSONs are committed under `eval_multilingual/` and `eval_telephone/`

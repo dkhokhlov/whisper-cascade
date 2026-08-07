@@ -20,12 +20,10 @@ tags:
 # HQQ 4-bit Whisper-Tiny
 
 **Includes fp16 + fp32 ONNX exports — the same HQQ model runs on CPU ONNX
-Runtime with no HQQ runtime.** The fp16 export is a fp32-free graph for
-host-side validation; the fp32 export matches the published benchmark compute.
-The deployment hardware has no fp16 and no fp32 unit, so an int8-compute export
-(zero fp16/fp32) is the deploy target — under development. HQQ ships no ONNX
-exporter; this repo adds one (see
-[ONNX export](#onnx-export-cpu-onnx-runtime)).
+Runtime with no HQQ runtime.** The fp16 export is a fp16-only graph (lower
+RAM, slower on CPU-ORT); the fp32 export is the recommended CPU compute and
+matches the published benchmark. [HQQ](https://github.com/dropbox/hqq) ships no ONNX exporter; this repo adds
+one (see [ONNX export](#onnx-export-cpu-onnx-runtime)).
 
 Model card source for `dkhokhlov/whisper-tiny-hqq-4bit`.
 
@@ -40,8 +38,8 @@ Model card source for `dkhokhlov/whisper-tiny-hqq-4bit`.
 
 [`openai/whisper-tiny`](https://huggingface.co/openai/whisper-tiny) quantized
 with [HQQ](https://huggingface.co/docs/transformers/en/quantization/hqq) 4-bit
-grouped quantization for CPU inference. Resident weight RAM (fp16 compute, the
-deployment mode) is 57.53 MB, 23.8% smaller than the unquantized fp16 model
+grouped quantization for CPU inference. Resident weight RAM (fp16 compute) is
+57.53 MB, 23.8% smaller than the unquantized fp16 model
 (75.52 MB). fp16 compute is WER-neutral; the published WER benchmark uses
 fp32 compute for cross-model comparability. The key setting is mixed
 precision: the whole encoder stack and `fc1` are kept at 8-bit, the remaining
@@ -92,15 +90,14 @@ This repo ships **two ONNX exports** of the same HQQ model, differing only in
 compute dtype:
 
 - **fp16 (default): `encoder_model.onnx` + `decoder_model_merged.onnx`** —
-  host-side validation, not the deploy target. The graph is fp16-only (zero
-  fp32 ops) and uses eager attention so the attention scale stays a fp16 `Mul`
-  (SDPA would decompose it to `Sqrt`→`Div` in fp32). On CPU ONNX Runtime it runs
-  ~4.4× slower than the fp32 export (ORT-CPU upcasts fp16→fp32) but loads ~29%
-  less RAM. The deployment hardware has no fp16 unit, so this graph cannot run
-  on it; the deploy target is an int8-compute export (under development).
+  a fp16-only graph (zero fp32 ops). It uses eager attention so the attention
+  scale stays a fp16 `Mul` (SDPA would decompose it to `Sqrt`→`Div` in fp32).
+  On CPU ONNX Runtime it runs ~4.4× slower than the fp32 export (ORT-CPU
+  upcasts fp16→fp32 internally — fp16 is not a primary CPU compute format, so
+  the slowdown is expected) but loads ~29% less RAM.
 - **fp32: `encoder_model-fp32.onnx` + `decoder_model_merged-fp32.onnx`** — the
-  benchmark compute. Faster on CPU ORT; use it for host-side validation that
-  matches the published fp32 WER benchmark.
+  recommended CPU compute and the benchmark compute. Faster on CPU ORT; matches
+  the published fp32 WER benchmark.
 
 Both keep the packed uint8 `W_q` and the per-group `scale`/`zero` as ONNX
 initializers and emit the unpack + dequant as standard ONNX ops (opset 18), so

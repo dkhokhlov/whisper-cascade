@@ -13,7 +13,7 @@ Needs HF_TOKEN_WRITE (the Makefile push-onnx target sources ~/.api_keys).
 
 Usage:
     ONNX_OUT=build/whisper-tiny-hqq-onnx HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit \
-        MODEL_CARD=hqq_report.md python push_onnx.py
+        MODEL_CARD=hqq_report_tiny.md python push_onnx.py
 """
 
 import json

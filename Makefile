@@ -93,7 +93,7 @@ help: ## Show available targets
 	@printf '  %-52s %s\n' 'make eval-hqq EVAL_CONFIG=es_419' 'WER of HQQ MODEL_ASR on a fleurs config'
 	@printf '  %-52s %s\n' 'make onnx HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit' 'export HQQ -> ONNX to build/'
 	@printf '  %-52s %s\n' 'make eval-onnx ONNX_OUT=build/whisper-tiny-hqq-onnx' 'ONNX WER + exact-text gate vs manifest'
-	@printf '  %-52s %s\n' 'make push-onnx HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit MODEL_CARD=hqq_report.md' 'upload ONNX + card into the HQQ repo'
+	@printf '  %-52s %s\n' 'make push-onnx HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit MODEL_CARD=hqq_report_tiny.md' 'upload ONNX + card into the HQQ repo'
 	@printf '  %-52s %s\n' 'make eval-baseline EVAL_DATASET=diabolocom/talkbank_4_stt EVAL_CONFIG=es EVAL_SPLIT=segment' 'talkbank telephone Spanish'
 	@printf '  %-52s %s\n' 'make test' 'fast unit tests'
 	@echo ""
@@ -213,7 +213,7 @@ eval-onnx: $(VENV_ONNX)/.stamp ## Measure ONNX WER + exact-text gate vs the mani
 # alongside qmodel.pt. Only .onnx/.onnx_data are uploaded; the repo's config /
 # processor / qmodel.pt stay. Needs HF_TOKEN_WRITE from ~/.api_keys.
 # Per-flavor: ONNX_OUT=build/whisper-<flavor>-hqq-onnx HQQ_REPO=dkhokhlov/whisper-<flavor>-hqq-4bit
-# MODEL_CARD=hqq_report[_base|_small].md
+# MODEL_CARD=hqq_report[_tiny|_base|_small].md
 push-onnx: $(VENV_ONNX)/.stamp ## Upload ONNX_OUT/*.onnx (+ MODEL_CARD) into HQQ_REPO (needs HF_TOKEN_WRITE)
 	@set -a; . ~/.api_keys 2>/dev/null; set +a; \
 	 ONNX_OUT=$(ONNX_OUT) HQQ_REPO=$(HQQ_REPO) MODEL_CARD=$(MODEL_CARD) $(PYONNX) push_onnx.py

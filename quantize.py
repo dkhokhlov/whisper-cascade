@@ -43,10 +43,10 @@ HQQ_8BIT_PATTERNS = tuple(
 PUSH = os.environ.get("PUSH", "").strip() not in ("", "0", "false")
 HQQ_REPO = os.environ.get("HQQ_REPO", "dkhokhlov/whisper-tiny-hqq-4bit")
 # Quantization report copied as the model card when it exists (it holds the
-# measured WER results). One report per model size: hqq_report.md (tiny),
+# measured WER results). One report per model size: hqq_report_tiny.md (tiny),
 # hqq_report_base.md (base), hqq_report_small.md (small). The push step sets
 # this so each upload gets its own card instead of tiny's.
-HQQ_REPORT = os.environ.get("HQQ_REPORT", "hqq_report.md")
+HQQ_REPORT = os.environ.get("HQQ_REPORT", "hqq_report_tiny.md")
 # Multilingual generation config (default on): clear the English
 # forced_decoder_ids baked into the source config and write a modern
 # generation_config.json so the model auto-detects the language and
