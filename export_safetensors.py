@@ -43,9 +43,23 @@ def export_safetensors(hqq_out: str) -> dict:
 
     out = os.path.join(hqq_out, "model.safetensors")
     print(f"exporting {hqq_out}/qmodel.pt -> {out}", file=sys.stderr)
-    # Load on CPU: the export only reads the packed weights, so no GPU is
-    # needed and the output is device-independent.
-    model = hqq_asr.load_whisper_hqq(hqq_out, device="cpu")
+    # The export source is qmodel.pt. HQQ_FORMAT=safetensors is a consumer knob
+    # (for loading a published repo); if it is set here, load_weights would
+    # re-read this script's own previous (possibly stale) model.safetensors and
+    # re-export it, shipping a safetensors that disagrees with the fresh
+    # qmodel.pt. Force the load to read qmodel.pt by clearing HQQ_FORMAT for the
+    # load only (restored in finally). Do NOT delete the existing safetensors
+    # first: keep it until save_file overwrites it after a successful load, so a
+    # load failure (missing/corrupt qmodel.pt, bad config) does not destroy the
+    # last good export.
+    saved_fmt = os.environ.pop("HQQ_FORMAT", None)
+    try:
+        # Load on CPU: the export only reads the packed weights, so no GPU is
+        # needed and the output is device-independent.
+        model = hqq_asr.load_whisper_hqq(hqq_out, device="cpu")
+    finally:
+        if saved_fmt is not None:
+            os.environ["HQQ_FORMAT"] = saved_fmt
     model.eval()
     # Encode the per-linear HQQ config (scalars/strings/bools) as tensors so the
     # whole state_dict is safetensors-compatible (tensors only). load_state_dict
@@ -72,7 +86,16 @@ def export_safetensors(hqq_out: str) -> dict:
     # embed_tokens, and load_whisper_hqq re-ties them after from_quantized.
     # WER-neutral: the tie is value-identical.
     flat.pop("proj_out.weight", None)
-    save_file(flat, out)
+    # Record the tie in the safetensors header metadata so a host loader
+    # (C/C++/Rust, no torch) can reconstruct proj_out.weight from
+    # model.decoder.embed_tokens.weight without undocumented knowledge of the
+    # tie. safetensors.torch.load_file returns tensors only and ignores header
+    # metadata, so this is invisible to hqq_asr.load_weights.
+    metadata = {
+        "proj_out.weight.tied_to": "model.decoder.embed_tokens.weight",
+        "format": "hqq-whisper-safetensors-v1",
+    }
+    save_file(flat, out, metadata=metadata)
 
     dtypes = {}
     for t in flat.values():
@@ -85,6 +108,7 @@ def export_safetensors(hqq_out: str) -> dict:
         "n_tensors": len(flat),
         "n_hqq_linears": n_linear,
         "dtypes": dtypes,
+        "metadata": metadata,
     }
 
 
