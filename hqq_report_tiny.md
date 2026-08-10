@@ -140,7 +140,7 @@ make eval-onnx ONNX_OUT=build/whisper-tiny-hqq-onnx-fp16 \
      HQQ_REFERENCE_MANIFEST=build/hqq_reference_tiny_fp16.json EVAL_OUT=build/eval_onnx_tiny_fp16.json
 ```
 
-The export spec and the two validation gates are in `docs/onnx.md` in the repo.
+The export spec and the two validation gates are in `docs/ONNX.md` in the repo.
 
 ## Reproduce
 

@@ -4,7 +4,7 @@
 It keeps the packed uint8 W_q plus per-group scale/zero as ONNX initializers and emits
 the unpack + dequant as ONNX ops, so the exported graph carries the exact HQQ weights (and
 the measured WER), not a re-dequantized dense copy. This is a work in progress on the `onnx`
-branch; see docs/onnx.md for the spec and the two validation gates.
+branch; see docs/ONNX.md for the spec and the two validation gates.
 
 The export reads HQQ_OUT (a saved HQQ model dir, never written to) and writes the three
 ONNX subgraphs plus config/processor/generation files into ONNX_OUT (a separate dir).
