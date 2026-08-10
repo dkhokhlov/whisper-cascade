@@ -71,7 +71,7 @@ EVAL_CONFIG ?= en_us
 HQQ_COMPUTE_DTYPE ?= fp16
 export HQQ_COMPUTE_DTYPE
 
-.PHONY: help info venv gpu-venv onnx-venv samples asr en tts quantize push eval-baseline eval-hqq eval-onnx onnx hqq-reference push-onnx test test-integration clean clean-all
+.PHONY: help info venv gpu-venv onnx-venv samples asr en tts quantize push eval-baseline eval-hqq eval-onnx onnx hqq-reference bench-matrix push-onnx test test-integration clean clean-all
 
 help: ## Show available targets
 	@echo "whisper-cascade v$(VERSION)"
@@ -95,6 +95,7 @@ help: ## Show available targets
 	@printf '  %-52s # %s\n' 'make eval-onnx ONNX_OUT=build/whisper-tiny-hqq-onnx' 'ONNX WER + exact-text gate vs manifest'
 	@printf '  %-52s # %s\n' 'make push-onnx HQQ_REPO=dkhokhlov/whisper-tiny-hqq-4bit MODEL_CARD=docs/hqq_report_tiny.md' 'upload ONNX + card into the HQQ repo'
 	@printf '  %-52s # %s\n' 'make eval-baseline EVAL_DATASET=diabolocom/talkbank_4_stt EVAL_CONFIG=es EVAL_SPLIT=segment' 'talkbank telephone Spanish'
+	@printf '  %-52s # %s\n' 'make bench-matrix' 'run the full WER matrix (tiny+base+small) into build/'
 	@printf '  %-52s # %s\n' 'make test' 'fast unit tests'
 	@echo ""
 	@echo "Pipeline (foreign speech -> English speech; each stage prints JSON, jq extracts text):"
@@ -177,11 +178,11 @@ push: $(VENV)/.stamp ## Quantize and upload HQQ_OUT to HQQ_REPO (needs HF_TOKEN_
 
 eval-baseline: $(VENV)/.stamp ## Measure baseline WER (fp32 MODEL_ASR) on EVAL_DATASET/EVAL_CONFIG/EVAL_SPLIT (EVAL_LIMIT)
 	@MODEL_ASR=$(MODEL_ASR) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
-	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_baseline.json $(PY) eval_wer.py
+	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=evals/eval_baseline.json $(PY) eval_wer.py
 
 eval-hqq: $(VENV)/.stamp ## Measure HQQ WER (QUANT=hqq MODEL_ASR=HQQ_REPO) on EVAL_DATASET/EVAL_CONFIG/EVAL_SPLIT (EVAL_LIMIT)
 	@QUANT=hqq MODEL_ASR=$(HQQ_REPO) EVAL_DATASET=$(EVAL_DATASET) EVAL_CONFIG=$(EVAL_CONFIG) \
-	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=eval_hqq.json $(PY) eval_wer.py
+	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=evals/eval_hqq.json $(PY) eval_wer.py
 
 # ONNX targets. Runs in .venv-onnx (optimum/onnxruntime). Export reads the
 # HQQ weights from HQQ_REPO (HF repo id -> default HF cache) and writes the 3 .onnx
@@ -209,6 +210,18 @@ eval-onnx: $(VENV_ONNX)/.stamp ## Measure ONNX WER + exact-text gate vs the mani
 	 EVAL_SPLIT=$(EVAL_SPLIT) EVAL_LIMIT=$(EVAL_LIMIT) EVAL_OUT=$(EVAL_OUT) \
 	 HQQ_REFERENCE_MANIFEST=$(HQQ_REFERENCE_MANIFEST) $(PYONNX) eval_wer.py
 
+# Run the full WER benchmark matrix (tiny + base + small) into build/ (gitignored),
+# via scripts/run_*bench.sh. Output goes to OUT_DIR (default build/), kept separate
+# from the committed evals/ evidence: diff build/{multilingual,telephone} against
+# evals/ to verify reproduction, then `make clean` wipes build/. tiny + base run on
+# the CPU .venv; small runs on the A10 GPU (.venv-gpu, ASR_DEVICE=cuda), so this
+# target needs both venvs. To refresh the committed evals/ evidence instead, run
+# the scripts directly (bash scripts/run_bench.sh ...; default OUT_DIR=evals).
+bench-matrix: $(VENV)/.stamp $(VENV_GPU)/.stamp ## Run the full WER matrix (tiny+base+small) into build/ (gitignored; small needs .venv-gpu)
+	@OUT_DIR=$(BUILD) PATH=$(CURDIR)/$(VENV)/bin:$$PATH bash scripts/run_bench.sh
+	@OUT_DIR=$(BUILD) PATH=$(CURDIR)/$(VENV)/bin:$$PATH bash scripts/run_base_bench.sh
+	@OUT_DIR=$(BUILD) bash scripts/run_small_bench.sh
+
 # Upload the ONNX files (+ optional MODEL_CARD as README.md) into the HQQ repo
 # alongside qmodel.pt. Only .onnx/.onnx_data are uploaded; the repo's config /
 # processor / qmodel.pt stay. Needs HF_TOKEN_WRITE from ~/.api_keys.
@@ -229,5 +242,5 @@ clean: ## Remove Python bytecode cache (__pycache__, *.pyc) and the build/ artif
 	@rm -rf $(BUILD)
 	@echo "cleaned pyc noise and build/"
 
-clean-all: clean ## Also remove the local .venv (HF cache is left untouched)
-	rm -rf $(VENV)
+clean-all: clean ## Also remove all local venvs (.venv, .venv-gpu, .venv-onnx); HF cache is left untouched
+	rm -rf $(VENV) $(VENV_GPU) $(VENV_ONNX)

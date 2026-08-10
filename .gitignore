@@ -42,14 +42,13 @@ sweep_*/
 # Hugging Face cache dirs downloaded into the repo root
 models--*/
 # Eval run logs and intermediate local result (canonical results are
-# eval_baseline.json / eval_hqq.json, committed as evidence)
+# evals/eval_baseline.json / evals/eval_hqq.json, committed as evidence)
 eval_*.log
 eval_hqq_local.json
 # Per-language multilingual eval logs (the .json results are committed)
-eval_multilingual/*.log
+evals/multilingual/*.log
 # Telephone benchmark: commit the .json results, ignore the run logs.
-eval_telephone/*.log
-eval_telephone/run_*.sh
+evals/telephone/*.log
 # Misc lock dirs created during HF downloads
 .locks/
 

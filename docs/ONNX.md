@@ -9,7 +9,7 @@ Status: **all three flavors (tiny, base, small) pass both gates on the `onnx` br
 ## Goal
 
 ONNX Runtime on CPU reproduces the HQQ result. The canonical target for whisper-tiny is
-`eval_hqq.json`: WER **0.1367** on `google/fleurs` `en_us` `test`, n=100, CPU, auto-detect
+`evals/eval_hqq.json`: WER **0.1367** on `google/fleurs` `en_us` `test`, n=100, CPU, auto-detect
 language, with the post-hoc gzip loop guard in `eval_wer.py`.
 
 Two gates, kept separate:
@@ -20,7 +20,7 @@ Two gates, kept separate:
    absent, the exporter folded the dequant to dense at export time and the file is a dense
    export — WER may still pass, but the weights are no longer packed.
 2. **WER / text proof (functional)** — exact `output["text"]` match on all 100 samples vs a
-   full 100-sample reference manifest (`eval_hqq.json` stores only 5, so it cannot gate this);
+   full 100-sample reference manifest (`evals/eval_hqq.json` stores only 5, so it cannot gate this);
    WER == 0.1367 secondary. Logit/submodel tolerance `atol=1e-5, rtol=1e-5`; the text gate is
    exact.
 
@@ -61,7 +61,7 @@ across flavors; only the layer/linear counts differ.
 2. **WER / text proof (functional): PASS.** The ONNX run reproduces the HQQ result exactly.
    - Exact `output["text"]` match on all 100 samples vs the full 100-sample HQQ reference
      manifest (`hqq_reference.json`, written by `make hqq-reference`). Zero mismatches.
-   - WER **0.1367**, identical to the HQQ baseline (`eval_hqq.json`).
+   - WER **0.1367**, identical to the HQQ baseline (`evals/eval_hqq.json`).
 
 ### whisper-base
 

@@ -150,11 +150,11 @@ python quantize.py
 
 # 2. Measure baseline WER (fp32).
 EVAL_LIMIT=100 MODEL_ASR=openai/whisper-tiny EVAL_CONFIG=en_us \
-  EVAL_OUT=eval_baseline.json python eval_wer.py
+  EVAL_OUT=evals/eval_baseline.json python eval_wer.py
 
 # 3. Measure HQQ WER.
 EVAL_LIMIT=100 QUANT=hqq MODEL_ASR=./whisper-tiny-hqq-4bit EVAL_CONFIG=en_us \
-  EVAL_OUT=eval_hqq.json python eval_wer.py
+  EVAL_OUT=evals/eval_hqq.json python eval_wer.py
 
 # 4. Telephone benchmark (talkbank segment split).
 EVAL_DATASET=diabolocom/talkbank_4_stt EVAL_CONFIG=en EVAL_SPLIT=segment EVAL_LIMIT=100 \
@@ -181,5 +181,5 @@ Quantization config, config-sweep ablation, safetensors format, the full WER
 tables (multilingual `fleurs`, `talkbank` telephone, cross-reference), and the
 resident-RAM-by-component breakdown are in the repo
 [README](https://github.com/dkhokhlov/whisper-cascade#readme). Per-config WER
-evidence JSONs are committed under `eval_multilingual/` and `eval_telephone/`
+evidence JSONs are committed under `evals/multilingual/` and `evals/telephone/`
 in [`dkhokhlov/whisper-cascade`](https://github.com/dkhokhlov/whisper-cascade).

@@ -151,8 +151,17 @@ Per-eval runtime, the relative Delta % columns, and the full quantization
 reports are in [`hqq_report_tiny.md`](hqq_report_tiny.md) (the `whisper-tiny` card),
 [`hqq_report_base.md`](hqq_report_base.md) (the `whisper-base` card), and
 [`hqq_report_small.md`](hqq_report_small.md) (the `whisper-small` card).
-Evidence JSONs are committed under `eval_multilingual/` and `eval_telephone/`
+Evidence JSONs are committed under `evals/multilingual/` and `evals/telephone/`
 (base files are prefixed `base_`, small files are prefixed `small_`).
+
+Reproduce the matrix with `make bench-matrix`: it runs the
+`scripts/run_{bench,base_bench,small_bench}.sh` drivers and writes into the
+gitignored `build/` dir (so it does not touch the committed `evals/` evidence).
+Diff `build/{multilingual,telephone}` against `evals/` to verify your setup
+matches; `make clean` wipes `build/`. The `small` driver runs on the A10 GPU
+(`.venv-gpu`, `ASR_DEVICE=cuda`); `tiny` and `base` run on the CPU `.venv`. To
+refresh the committed `evals/` evidence directly, run the scripts by hand
+(`bash scripts/run_bench.sh ...`), which default `OUT_DIR=evals`.
 
 ### Size
 

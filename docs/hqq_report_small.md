@@ -191,6 +191,6 @@ Quantization config, config-sweep ablation, safetensors format, the full WER
 tables (multilingual `fleurs`, `talkbank` telephone, cross-reference), and the
 resident-RAM-by-component breakdown are in the repo
 [README](https://github.com/dkhokhlov/whisper-cascade#readme). Per-config WER
-evidence JSONs are committed under `eval_multilingual/` (prefix `small_`) and
-`eval_telephone/` (prefix `small_`) in
+evidence JSONs are committed under `evals/multilingual/` (prefix `small_`) and
+`evals/telephone/` (prefix `small_`) in
 [`dkhokhlov/whisper-cascade`](https://github.com/dkhokhlov/whisper-cascade).
