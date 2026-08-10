@@ -30,15 +30,22 @@ import hqq_asr
 HQQ_OUT = os.environ.get("HQQ_OUT", "whisper-tiny-hqq-4bit")
 
 
-def main() -> int:
+def export_safetensors(hqq_out: str) -> dict:
+    """Export `<hqq_out>/qmodel.pt` to `<hqq_out>/model.safetensors`.
+
+    Re-exports the saved HQQ weights as a single pickle-free safetensors file
+    (flat tensor map; see module docstring for the per-linear config encoding).
+    Returns a summary dict. qmodel.pt is left in place as the default loader
+    target; model.safetensors is the additional, host-tooling-consumable file.
+    """
     from hqq.core.quantize import HQQLinear
     from safetensors.torch import save_file
 
-    out = os.path.join(HQQ_OUT, "model.safetensors")
-    print(f"exporting {HQQ_OUT}/qmodel.pt -> {out}", file=sys.stderr)
+    out = os.path.join(hqq_out, "model.safetensors")
+    print(f"exporting {hqq_out}/qmodel.pt -> {out}", file=sys.stderr)
     # Load on CPU: the export only reads the packed weights, so no GPU is
     # needed and the output is device-independent.
-    model = hqq_asr.load_whisper_hqq(HQQ_OUT, device="cpu")
+    model = hqq_asr.load_whisper_hqq(hqq_out, device="cpu")
     model.eval()
     # Encode the per-linear HQQ config (scalars/strings/bools) as tensors so the
     # whole state_dict is safetensors-compatible (tensors only). load_state_dict
@@ -58,13 +65,20 @@ def main() -> int:
     state = model.state_dict()
     # safetensors requires CPU-contiguous tensors.
     flat = {k: v.detach().cpu().contiguous() for k, v in state.items()}
+    # proj_out is tied to the decoder embedding (same weight, shared storage).
+    # safetensors cannot store shared tensors, so drop the tied duplicate here;
+    # embed_tokens keeps the single copy, matching qmodel.pt's dedup. The
+    # safetensors loader (hqq_asr.load_weights) re-aliases proj_out to
+    # embed_tokens, and load_whisper_hqq re-ties them after from_quantized.
+    # WER-neutral: the tie is value-identical.
+    flat.pop("proj_out.weight", None)
     save_file(flat, out)
 
     dtypes = {}
     for t in flat.values():
         dtypes[str(t.dtype)] = dtypes.get(str(t.dtype), 0) + 1
-    summary = {
-        "out_dir": HQQ_OUT,
+    return {
+        "out_dir": hqq_out,
         "file": "model.safetensors",
         "size_bytes": os.path.getsize(out),
         "size_mb": round(os.path.getsize(out) / 1e6, 2),
@@ -72,6 +86,10 @@ def main() -> int:
         "n_hqq_linears": n_linear,
         "dtypes": dtypes,
     }
+
+
+def main() -> int:
+    summary = export_safetensors(HQQ_OUT)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 

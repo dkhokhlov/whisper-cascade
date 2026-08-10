@@ -23,6 +23,7 @@ import sys
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 import hqq_asr
+import export_safetensors
 
 MODEL_ASR = os.environ.get("MODEL_ASR", "openai/whisper-tiny")
 HQQ_OUT = os.environ.get("HQQ_OUT", "whisper-tiny-hqq-4bit")
@@ -124,6 +125,11 @@ def main() -> int:
             repo = HQQ_REPO if PUSH else HQQ_OUT
             fh.write(MODEL_CARD.replace("__REPO__", repo).replace("__MODEL__", MODEL_ASR))
 
+    # Export model.safetensors alongside qmodel.pt so the pushed repo is
+    # consumable from host tooling without a torch pickle loader. Generated for
+    # every quantize (so HQQ_OUT matches what `make push` uploads); see
+    # export_safetensors.py and docs/ASR.md#safetensors-format.
+    st_summary = export_safetensors.export_safetensors(HQQ_OUT)
     size = dir_size(HQQ_OUT)
     summary = {
         "source_model": MODEL_ASR,
@@ -139,6 +145,7 @@ def main() -> int:
         "size_bytes": size,
         "size_mb": round(size / 1e6, 2),
         "files": sorted(os.listdir(HQQ_OUT)),
+        "safetensors": st_summary,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

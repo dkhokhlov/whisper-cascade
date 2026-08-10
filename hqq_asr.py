@@ -104,6 +104,15 @@ class WhisperHQQModel(AutoHQQHFModel):
                 for key, tensor in flat.items():
                     module_name, _, field = key.rpartition(".")
                     weights.setdefault(module_name, {})[field] = tensor
+                # proj_out is tied to the decoder embedding and is dropped at
+                # safetensors export time (safetensors cannot store shared
+                # tensors). Re-alias it to embed_tokens here so HQQ's
+                # from_quantized finds proj_out.weight; load_whisper_hqq
+                # re-ties them (proj_out.weight = embed_tokens.weight) after.
+                if "proj_out" not in weights:
+                    etok = weights.get("model.decoder.embed_tokens", {}).get("weight")
+                    if etok is not None:
+                        weights["proj_out"] = {"weight": etok}
                 return weights
         return super().load_weights(save_dir, map_location)
 
