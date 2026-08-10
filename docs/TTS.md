@@ -45,3 +45,6 @@ The waveform is written with **`soundfile`** at
 - The TTS stage is **not quantized**; only the ASR stage is. It loads as
   float32 and its resident RAM (~145 MB) is the weights file size.
 - The model id appears in the JSON summary as `"model"`.
+- Inspect the VITS block graphs with `make viz` →
+  `build/viz/mms-tts-eng/{text_encoder,duration_predictor,flow,decoder,posterior_encoder}.svg`
+  (see the [repo README](../README.md#model-graphs)).

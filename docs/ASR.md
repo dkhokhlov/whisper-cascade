@@ -326,6 +326,13 @@ the non-quantized modules (embedding, convs, norms, `proj_out`) at fp16 and
 loading either format upcasts the fp16 weights to the compute dtype
 identically. **The two formats give the same WER (lossless round-trip).**
 
+The safetensors header carries metadata that records the `proj_out` tie. The
+key `proj_out.weight.tied_to` names `model.decoder.embed_tokens.weight`.
+Safetensors cannot store the shared tensor, so a host loader (C/C++/Rust, no
+torch) must read this metadata and alias `proj_out.weight` from the decoder
+embedding. The torch loader ignores header metadata and re-aliases
+`proj_out` in code (`hqq_asr.load_weights` + `load_whisper_hqq`).
+
 Load the safetensors with `HQQ_FORMAT=safetensors`; the default (no
 `HQQ_FORMAT`) loads `qmodel.pt`.
 
@@ -351,6 +358,9 @@ device-independent, so no GPU is needed.
   from C/C++/Rust for host tooling such as a deployment loader). Set
   `HQQ_FORMAT=safetensors` to load the safetensors; both formats give the same
   WER. See [safetensors format](#safetensors-format).
+- Inspect the Whisper block graphs with `make viz` →
+  `build/viz/whisper-tiny/encoder.svg` and `decoder.svg` (see the
+  [repo README](../README.md#model-graphs)).
 - `proj_out` and the embedding are fp16, not 4-bit. A smaller model is
   possible if the embedding is also quantized, but that raises the WER risk
   on the vocab projection and was not done here.

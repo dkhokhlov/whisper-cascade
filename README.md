@@ -132,6 +132,7 @@ Run `make` (no target) to print this help.
 | `make asr` | Transcribe audio to JSON (default multilingual samples, or `AUDIO=`). |
 | `make en` | Translate text to English (stdin/`TEXT=`; JSON with text + stats to stdout). |
 | `make tts` | Synthesize speech from text (stdin/`TEXT=`; writes `tts.wav`, `OUTPUT=` to override). |
+| `make viz` | Write per-block [TorchLens](https://pypi.org/project/torchlens/) SVGs for all three models into `build/viz/<slug>/` (no browser; override with `MODEL_ASR`/`MODEL_TRANSLATE`/`MODEL_TTS`). |
 | `make quantize` | Quantize `MODEL_ASR` with HQQ 4-bit to `HQQ_OUT` (`build/`). |
 | `make push` | Quantize and upload `HQQ_OUT` to `HQQ_REPO` (needs `HF_TOKEN_WRITE`). |
 | `make eval-baseline` | Measure baseline WER (fp32 `MODEL_ASR`) on `EVAL_DATASET`/`EVAL_CONFIG`/`EVAL_SPLIT` (`EVAL_LIMIT`). |
@@ -145,6 +146,31 @@ Run `make` (no target) to print this help.
 | `make test-integration` | Run the integration tests (load the real Whisper/MarianMT/VITS models). |
 | `make clean` | Remove bytecode cache + the `build/` artifact dir (incl. `bench-matrix` output); keeps `.venv`. |
 | `make clean-all` | Also remove all local venvs (`.venv`, `.venv-gpu`, `.venv-onnx`); HF cache is left untouched. |
+
+## Model graphs
+
+`make viz` writes one [TorchLens](https://pypi.org/project/torchlens/) block
+graph per high-level block for all three default models, into
+`build/viz/<slug>/` (one subfolder per model; `<slug>` is the last segment of
+the model id). It opens no browser. TorchLens is a dev dependency, so
+`make venv` installs it. Override the models with `MODEL_ASR`,
+`MODEL_TRANSLATE`, and `MODEL_TTS`:
+
+```bash
+make viz
+make viz MODEL_TTS=facebook/mms-tts-deu
+```
+
+Output (9 SVGs):
+
+| Model | Subfolder | Blocks |
+| --- | --- | --- |
+| `openai/whisper-tiny` | `build/viz/whisper-tiny/` | `encoder`, `decoder` |
+| `Helsinki-NLP/opus-mt-mul-en` | `build/viz/opus-mt-mul-en/` | `encoder`, `decoder` |
+| `facebook/mms-tts-eng` | `build/viz/mms-tts-eng/` | `text_encoder`, `duration_predictor`, `flow`, `decoder`, `posterior_encoder` |
+
+Each block runs one forward pass on dummy input, so a graph shows the model
+structure, not the trained weights.
 
 ## Pipeline
 

@@ -56,3 +56,6 @@ file.txt` (or `-` for stdin).
 - The MT stage is **not quantized**; only the ASR stage is. It loads as
   float32 and its resident RAM (~310 MB) is the weights file size.
 - The model id appears in the JSON output as `"model"`.
+- Inspect the MarianMT block graphs with `make viz` →
+  `build/viz/opus-mt-mul-en/encoder.svg` and `decoder.svg` (see the
+  [repo README](../README.md#model-graphs)).
