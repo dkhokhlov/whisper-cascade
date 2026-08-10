@@ -35,6 +35,8 @@ explicit = true
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    # TorchLens: model-graph visualization for `make viz` (inspection tool, not runtime).
+    "torchlens",
 ]
 
 [tool.pytest.ini_options]

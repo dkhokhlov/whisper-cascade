@@ -71,7 +71,7 @@ EVAL_CONFIG ?= en_us
 HQQ_COMPUTE_DTYPE ?= fp16
 export HQQ_COMPUTE_DTYPE
 
-.PHONY: help info venv gpu-venv onnx-venv samples asr en tts quantize push eval-baseline eval-hqq eval-onnx onnx hqq-reference bench-matrix push-onnx test test-integration clean clean-all
+.PHONY: help info venv gpu-venv onnx-venv samples asr en tts viz quantize push eval-baseline eval-hqq eval-onnx onnx hqq-reference bench-matrix push-onnx test test-integration clean clean-all
 
 help: ## Show available targets
 	@echo "whisper-cascade v$(VERSION)"
@@ -86,6 +86,8 @@ help: ## Show available targets
 	@printf '  %-52s # %s\n' "make asr AUDIO='*.flac'" 'a glob'
 	@printf '  %-52s # %s\n' 'make en TEXT="Hola"' 'translate text to English'
 	@printf '  %-52s # %s\n' 'make tts TEXT="Hello"' 'synthesize speech to tts.wav'
+	@printf '  %-52s # %s\n' 'make viz' 'TorchLens per-block SVGs for all 3 models -> build/viz/'
+	@printf '  %-52s # %s\n' 'make viz MODEL_TTS=facebook/mms-tts-deu' 'override one model id'
 	@printf '  %-52s # %s\n' 'make asr QUANT=hqq MODEL_ASR=dkhokhlov/whisper-tiny-hqq-4bit' 'HQQ 4-bit ASR from HF'
 	@printf '  %-52s # %s\n' 'make quantize' 'quantize whisper-tiny -> HQQ_OUT (build/)'
 	@printf '  %-52s # %s\n' 'make push' 'quantize + upload to HQQ_REPO (needs HF_TOKEN_WRITE)'
@@ -166,6 +168,9 @@ en: $(VENV)/.stamp ## Translate text to English (stdin/TEXT=; JSON to stdout, jq
 
 tts: $(VENV)/.stamp ## Synthesize speech from text (stdin/TEXT=; writes tts.wav, OUTPUT= to override)
 	@MODEL_TTS=$(MODEL_TTS) $(PY) tts.py
+
+viz: $(VENV)/.stamp ## TorchLens: render per-block SVGs for all 3 models into build/viz/ (no browser)
+	@MODEL_ASR=$(MODEL_ASR) MODEL_TRANSLATE=$(MODEL_TRANSLATE) MODEL_TTS=$(MODEL_TTS) $(PY) viz_torchlens.py
 
 quantize: $(VENV)/.stamp ## Quantize MODEL_ASR with HQQ 4-bit -> HQQ_OUT (local dir)
 	@MODEL_ASR=$(MODEL_ASR) HQQ_OUT=$(HQQ_OUT) HQQ_GROUP=$(HQQ_GROUP) HQQ_AXIS=$(HQQ_AXIS) \
