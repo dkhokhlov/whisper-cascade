@@ -193,9 +193,10 @@ non-quantized component**, so the quantization gain is bounded by the
 quantized linear-weight share, which grows with model size — for the small
 model the 8-bit-tier linears are the largest resident component overall.
 
-Resident weight RAM by component (HQQ 4-bit, fp16 storage + fp16 compute,
-MB, measured after load, deduplicated by storage pointer so the tied
-embedding counts once):
+#### Resident weight RAM by component
+
+HQQ 4-bit, fp16 storage + fp16 compute, MB, measured after load,
+deduplicated by storage pointer so the tied embedding counts once:
 
 | Component (dtype in RAM) | tiny | base | small |
 |---|---:|---:|---:|
