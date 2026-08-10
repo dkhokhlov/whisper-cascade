@@ -52,3 +52,6 @@ eval_telephone/*.log
 eval_telephone/run_*.sh
 # Misc lock dirs created during HF downloads
 .locks/
+
+# Local planning notes (personal, not for the public repo)
+plans/
