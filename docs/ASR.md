@@ -167,18 +167,17 @@ refresh the committed `evals/` evidence directly, run the scripts by hand
 
 Model size is **resident weight RAM**: the weight memory a host holds at run
 time. Both the unquantized original and the HQQ 4-bit model are measured
-in **fp16 storage + fp16 compute** (the deployment mode). **fp16 compute is
-WER-neutral** (measured within n=100 noise), so the deployment mode matches
-the published WER. The unquantized original is `openai/whisper-*` (fp32 on
+in **fp16 storage + fp16 compute** (the deployment mode). **fp16 compute shows no measured WER difference** (within n=100
+noise), so the deployment mode matches the published WER. The unquantized original is `openai/whisper-*` (fp32 on
 Hugging Face) loaded as fp16 (`torch_dtype=fp16`); whisper is trained in
 fp16, so this is near-lossless. The `proj_out` head and the decoder
 embedding are tied (one shared weight), held once.
 
 | model  | unquantized fp16 | HQQ 4-bit fp16 | reduction vs fp16 original |
 |--------|------------------|----------------|----------------------------|
-| tiny   | 75.52 MB         | 57.53 MB       | -23.8%                     |
-| base   | 145.19 MB        | 97.22 MB       | -33.0%                     |
-| small  | 483.47 MB        | 267.59 MB      | -44.6%                     |
+| tiny   | 75.52 MB         | 57.53 MB       | 23.8%                      |
+| base   | 145.19 MB        | 97.22 MB       | 33.0%                      |
+| small  | 483.47 MB        | 267.59 MB      | 44.6%                      |
 
 The HQQ model quantizes **only the linear weights** (the 4-bit and 8-bit
 tiers; see [Quantization config](#quantization-config)). Each quantized
@@ -218,10 +217,12 @@ tiers combined). `proj_out` (exempt) and the non-linear modules (embedding,
 convs, norms, positional embedding) are not quantized, so they are not in
 `W_q`; they appear in their own fp16 rows.
 
-The published WER benchmark runs fp32 compute (for cross-model
-comparability); its resident RAM is larger because the fp16 non-quantized
-weights upcast to fp32 at load time. fp16 compute is the deployment mode
-and is WER-neutral.
+The fp32 baseline (used for the published WER numbers) runs fp32 compute
+for cross-model comparability; its resident RAM is larger because the fp16
+non-quantized weights upcast to fp32 at load time. fp16 compute is the
+deployment mode, with no measured WER difference in the tested samples.
+The deployment loader is fp16-only; it never upcasts non-quantized weights
+to fp32.
 
 ## Quantization config
 
@@ -242,8 +243,9 @@ quantization is direct (grouped, `axis=1`).
   embedding — one shared weight, kept fp16), the embedding, `conv1`, `conv2`,
   layer norms, and the positional embedding (all stored fp16; whisper is
   trained in fp16, so this is near-lossless).
-- Compute dtype: fp32 for the published WER benchmark (cross-model
-  comparability); fp16 for deployment (WER-neutral). See [Size](#size).
+- Compute dtype: fp32 for the baseline (cross-model comparability); fp16
+  for deployment (no measured WER difference in the tested samples). See
+  [Size](#size).
 - `axis=1` groups along the input/reduction dim. It measured better than
   `axis=0` on `whisper-tiny` (0.1622 vs 0.2032 WER at `group_size=64`);
   `axis=0` targets GPU-optimized inference kernels. `axis=1` is kept for all
@@ -381,7 +383,7 @@ device-independent, so no GPU is needed.
 
 ## Citation
 
-If you use these HQQ models or the benchmark, cite this repository:
+If you use these HQQ models or the WER benchmark, cite this repository:
 
 ```bibtex
 @misc{khokhlov_whisper_cascade,
