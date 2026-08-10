@@ -148,9 +148,9 @@ config.** `whisper-base` beats `whisper-tiny` on every config except Hindi
 (both are not usable); `whisper-small` beats `whisper-base` on every config.
 
 Per-eval runtime, the relative Delta % columns, and the full quantization
-reports are in [`hqq_report_tiny.md`](../hqq_report_tiny.md) (the `whisper-tiny` card),
-[`hqq_report_base.md`](../hqq_report_base.md) (the `whisper-base` card), and
-[`hqq_report_small.md`](../hqq_report_small.md) (the `whisper-small` card).
+reports are in [`hqq_report_tiny.md`](hqq_report_tiny.md) (the `whisper-tiny` card),
+[`hqq_report_base.md`](hqq_report_base.md) (the `whisper-base` card), and
+[`hqq_report_small.md`](hqq_report_small.md) (the `whisper-small` card).
 Evidence JSONs are committed under `eval_multilingual/` and `eval_telephone/`
 (base files are prefixed `base_`, small files are prefixed `small_`).
 
@@ -336,7 +336,7 @@ device-independent, so no GPU is needed.
   evaluated on an NVIDIA A10 GPU for speed via an optional CUDA venv
   (`make gpu-venv`, `ASR_DEVICE=cuda`); the saved HQQ model is
   device-independent and loads on CPU or GPU. See
-  [`hqq_report_small.md`](../hqq_report_small.md).
+  [`hqq_report_small.md`](hqq_report_small.md).
 - Each published HQQ repo ships `qmodel.pt` (torch pickle, the default loader
   target) and `model.safetensors` (a flat tensor map, no pickle, parseable
   from C/C++/Rust for host tooling such as a deployment loader). Set
